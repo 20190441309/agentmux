@@ -6,6 +6,7 @@
 //! worktrees backing each workspace, [`config`] reads the TOML config file,
 //! and [`registry`] probes agent binaries on the filesystem.
 
+pub mod acp_conn;
 pub mod config;
 pub mod id;
 pub mod model;
@@ -13,6 +14,7 @@ pub mod registry;
 pub mod store;
 pub mod worktree;
 
+pub use acp_conn::AcpConn;
 pub use anyhow::Result;
 pub use config::Config;
 pub use id::{AgentId, ProjectId, SessionId, WorkspaceId};
