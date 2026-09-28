@@ -518,3 +518,106 @@ async fn resume_done_session_respawns_to_ready() {
         "resumed session should echo the new prompt"
     );
 }
+
+/// Merge-blocker regression: a session persisted in a non-terminal state
+/// is dead the moment the daemon process exits — its conn and fan-out
+/// died with it. Before the boot sweep, a post-restart `Ready` row could
+/// neither `prompt` ("not running") nor `resume` ("not terminal") — only
+/// `kill` → `resume` reached it, and nothing marked it dead. A fresh
+/// `Orchestrator` over the same data dir must sweep such rows to
+/// `Error`, keeping the seq counter continuous with the old log.
+#[tokio::test]
+async fn restart_sweeps_stale_sessions_to_error_and_resumable() {
+    let repo = init_repo();
+    let data = tempfile::tempdir().unwrap();
+
+    // First daemon lifetime: a live `Ready` session with a persisted
+    // event log. Dropping the orchestrator simulates the restart — the
+    // conn dies with it but the row stays `Ready`.
+    let sid;
+    {
+        let store = Store::open(data.path()).unwrap();
+        let project_id = ProjectId::new();
+        store
+            .insert_project(&Project {
+                id: project_id,
+                root_path: repo.path().to_path_buf(),
+                name: "test-project".into(),
+            })
+            .unwrap();
+        let cfg = Config {
+            agents: vec![mock_profile()],
+        };
+        let orch = Orchestrator::new(
+            store,
+            AgentRegistry::from_config(&cfg),
+            data.path().to_path_buf(),
+        );
+        let ws = orch
+            .create_workspace(project_id, "ws", "main")
+            .await
+            .unwrap();
+        sid = orch
+            .create_session(ws, &AgentId::new("mock"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            orch.get_session(sid).unwrap().unwrap().state,
+            SessionState::Ready
+        );
+    }
+
+    // Second daemon lifetime over the same data dir.
+    let cfg = Config {
+        agents: vec![mock_profile()],
+    };
+    let orch = Orchestrator::new(
+        Store::open(data.path()).unwrap(),
+        AgentRegistry::from_config(&cfg),
+        data.path().to_path_buf(),
+    );
+
+    // The stale `Ready` row was swept to `Error` at boot…
+    let state = orch.get_session(sid).unwrap().unwrap().state;
+    assert!(
+        matches!(&state, SessionState::Error(m) if m.contains("daemon restarted")),
+        "stale session must be swept to Error, got {state:?}"
+    );
+
+    // …with a persisted `Ready → Error` StateChanged whose seq continues
+    // the pre-restart log instead of restarting at 1.
+    let log = orch.read_events(sid).unwrap();
+    let sweep_seq = log
+        .iter()
+        .find(|e| {
+            matches!(
+                &e.kind,
+                EventKind::StateChanged {
+                    from: SessionState::Ready,
+                    to: SessionState::Error(_),
+                }
+            )
+        })
+        .map(|e| e.seq)
+        .expect("sweep must persist a Ready→Error StateChanged");
+    let max_before = log
+        .iter()
+        .filter(|e| e.seq < sweep_seq)
+        .map(|e| e.seq)
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        sweep_seq,
+        max_before + 1,
+        "the sweep event must continue the pre-restart seq: {log:?}"
+    );
+
+    // Recovery path: the swept session is resumable (Error is terminal),
+    // and kill → resume brings it back to Ready on a fresh conn.
+    orch.kill(sid).await.expect("kill on swept session");
+    orch.resume(sid).await.expect("resume on swept session");
+    assert_eq!(
+        orch.get_session(sid).unwrap().unwrap().state,
+        SessionState::Ready
+    );
+}

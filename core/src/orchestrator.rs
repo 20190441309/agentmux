@@ -179,10 +179,16 @@ impl EventSink {
     /// [`ingest`](Self::ingest) with the store lock already held.
     fn ingest_locked(&self, store: &Store, ev: &mut Event) {
         ev.seq = self.next_seq(ev.session_id);
-        let _ = store.append_event(ev);
-        // TODO(observability): append failures are dropped on the
-        // floor — route through a logger once the crate has one. The
-        // seq is consumed either way and the event still broadcasts.
+        if let Err(e) = store.append_event(ev) {
+            // Persistence is best-effort: a failed append must not wedge
+            // the fan-out — the seq is consumed either way and the event
+            // still broadcasts. No logger in the crate yet, so stderr is
+            // where the gap is at least observable.
+            eprintln!(
+                "agentmux: failed to persist event seq {} for session {}: {e:#}",
+                ev.seq, ev.session_id
+            );
+        }
         let _ = self.bus.send(ev.clone()); // lagging/no subscribers is fine
     }
 
@@ -340,9 +346,15 @@ pub struct Orchestrator {
 impl Orchestrator {
     /// Create an orchestrator. `data_dir` is where `store` lives and where
     /// session JSONL logs land (`<data_dir>/sessions/`).
+    ///
+    /// Boots with a sweep over the persisted session table: rows still in
+    /// a non-terminal state are leftovers from a previous daemon life —
+    /// their conn and fan-out died with the process — and are marked
+    /// `Error("daemon restarted")` so `prompt` doesn't wedge on a phantom
+    /// live session and `kill`/`resume` can reach them again.
     pub fn new(store: Store, registry: AgentRegistry, data_dir: PathBuf) -> Orchestrator {
         let (bus, _) = broadcast::channel(BUS_CAPACITY);
-        Orchestrator {
+        let orch = Orchestrator {
             sink: EventSink {
                 store: Arc::new(Mutex::new(store)),
                 bus,
@@ -351,6 +363,64 @@ impl Orchestrator {
             registry: Mutex::new(registry),
             sessions: Mutex::new(HashMap::new()),
             data_dir,
+        };
+        orch.sweep_restarted_sessions();
+        orch
+    }
+
+    /// Boot sweep over the persisted session table (see [`Self::new`]).
+    ///
+    /// Two repairs per row:
+    ///
+    /// - **seq seeding**: the per-session `seqs` counters start empty on
+    ///   boot while the JSONL logs persist across restarts — seed each
+    ///   counter from the log's max seq so post-restart events keep the
+    ///   log's monotonic ordering instead of reusing seqs.
+    /// - **zombie sweep**: a non-terminal state (`Ready`, `Prompting`,
+    ///   `Connecting`, `Created`, `WaitingPermission`) on disk can only
+    ///   describe a conn that no longer exists. Route through
+    ///   [`EventSink::transition`] so the fix is itself a persisted
+    ///   `StateChanged` event, then `kill`/`resume` work normally.
+    ///
+    /// Best-effort: a corrupt row or unreadable log is reported on stderr
+    /// and skipped — boot must not fail over one bad record.
+    fn sweep_restarted_sessions(&self) {
+        let sessions = {
+            let store = self.sink.store.lock().unwrap();
+            match store.list_all_sessions() {
+                Ok(sessions) => sessions,
+                Err(e) => {
+                    eprintln!("agentmux: startup session sweep failed: {e:#}");
+                    return;
+                }
+            }
+        };
+        for session in sessions {
+            match self.sink.store.lock().unwrap().read_events(session.id) {
+                Ok(events) => {
+                    let max = events.iter().map(|e| e.seq).max().unwrap_or(0);
+                    if max > 0 {
+                        self.sink.seqs.lock().unwrap().insert(session.id, max);
+                    }
+                }
+                Err(e) => eprintln!(
+                    "agentmux: unreadable event log for session {}: {e:#}",
+                    session.id
+                ),
+            }
+            if matches!(session.state, SessionState::Done | SessionState::Error(_)) {
+                continue;
+            }
+            if let Err(e) = self.sink.transition(
+                session.id,
+                SessionState::Error("daemon restarted".into()),
+                false,
+            ) {
+                eprintln!(
+                    "agentmux: failed to mark stale session {} dead at boot: {e:#}",
+                    session.id
+                );
+            }
         }
     }
 
@@ -1102,7 +1172,20 @@ fn spawn_fanout(
                         break;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    // The conn's 256-deep event channel overflowed
+                    // mid-burst — `n` adapter events are gone for good.
+                    // Persist a marker through the sink (real seq, JSONL
+                    // + bus like any other event) so the gap in the log
+                    // is explainable instead of silent.
+                    sink.emit(
+                        session_id,
+                        EventKind::Orchestrator(format!(
+                            "event channel lagged; dropped {n} adapter event(s) \
+                             (the burst exceeded the conn's buffer)"
+                        )),
+                    );
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
@@ -1135,5 +1218,86 @@ fn describe_event(ev: &Event) -> Option<String> {
         EventKind::Orchestrator(note) => Some(note.clone()),
         // summarize_event handled FileEdited above.
         EventKind::FileEdited { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_sink(data_dir: &Path) -> EventSink {
+        let (bus, _) = broadcast::channel(BUS_CAPACITY);
+        EventSink {
+            store: Arc::new(Mutex::new(Store::open(data_dir).unwrap())),
+            bus,
+            seqs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn burst_event(session_id: SessionId, i: usize) -> Event {
+        Event {
+            session_id,
+            seq: 0,
+            ts: Utc::now(),
+            kind: EventKind::Orchestrator(format!("burst {i}")),
+        }
+    }
+
+    /// Regression: the conn-side event channel is bounded (256 deep); an
+    /// adapter burst bigger than that makes the fan-out's `recv` return
+    /// `Lagged`. The fan-out must mark the loss with a persisted,
+    /// seq'd `EventKind::Orchestrator` note instead of silently
+    /// continuing — otherwise the JSONL log shows an inexplicable jump.
+    #[tokio::test]
+    async fn fanout_lagged_persists_orchestrator_note() {
+        let data = tempfile::tempdir().unwrap();
+        let sink = test_sink(data.path());
+        let session_id = SessionId::new();
+        let worktree = data.path().to_path_buf();
+
+        // Capacity-4 channel, 7 events queued before the fan-out starts:
+        // the oldest 3 are already overwritten → `Lagged(3)`.
+        let (tx, rx) = broadcast::channel(4);
+        for i in 0..7 {
+            tx.send(burst_event(session_id, i)).unwrap();
+        }
+        let handle = spawn_fanout(sink.clone(), session_id, rx, worktree, "mock-agent".into());
+        // The exit ends the fan-out; the no-session-row transition error
+        // is swallowed (`let _`) as designed.
+        tx.send(Event {
+            session_id,
+            seq: 0,
+            ts: Utc::now(),
+            kind: EventKind::AgentExited { code: Some(0) },
+        })
+        .unwrap();
+        handle.await.expect("fan-out should finish");
+
+        let events = sink.store.lock().unwrap().read_events(session_id).unwrap();
+        let note = events
+            .iter()
+            .find(|e| matches!(&e.kind, EventKind::Orchestrator(m) if m.contains("lagged")))
+            .expect("lag must leave a persisted Orchestrator note");
+        assert!(
+            note.seq > 0,
+            "the lag marker is seq'd like any other event: {note:?}"
+        );
+        // Retained burst events and the exit persisted too — the note
+        // sits *before* the retained burst in seq order, marking where
+        // the loss happened.
+        let retained: Vec<&Event> = events
+            .iter()
+            .filter(|e| matches!(&e.kind, EventKind::Orchestrator(m) if m.starts_with("burst")))
+            .collect();
+        assert!(
+            !retained.is_empty() && retained.iter().all(|e| e.seq > note.seq),
+            "retained events must follow the lag note: {events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e.kind, EventKind::AgentExited { .. })),
+            "the trailing AgentExited must persist: {events:?}"
+        );
     }
 }
