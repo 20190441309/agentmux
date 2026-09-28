@@ -85,6 +85,11 @@ enum Cmd {
 pub struct AcpConn {
     /// Broadcast channel for every [`Event`] this connection produces.
     event_tx: broadcast::Sender<Event>,
+    /// The channel's original receiver, which has been buffering events since
+    /// the channel was created (i.e. before the worker thread started).
+    /// Handed to the *first* [`AcpConn::events`] caller so early events — a
+    /// fast `AgentExited` is the realistic one — are not silently dropped.
+    first_rx: Mutex<Option<broadcast::Receiver<Event>>>,
     /// Internal session id stamped onto emitted events; the orchestrator uses
     /// it to correlate events with its own `Session` record.
     session_id: SessionId,
@@ -109,7 +114,7 @@ impl AcpConn {
         cwd: &Path,
     ) -> Result<AcpConn> {
         let session_id = SessionId::new();
-        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let (event_tx, first_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
 
@@ -136,6 +141,7 @@ impl AcpConn {
 
         Ok(AcpConn {
             event_tx,
+            first_rx: Mutex::new(Some(first_rx)),
             session_id,
             cmd_tx: Some(cmd_tx),
             thread: Some(thread),
@@ -196,7 +202,16 @@ impl AcpConn {
     }
 
     /// Subscribe to this connection's event stream.
+    ///
+    /// The *first* call returns the receiver that has been buffering since
+    /// `spawn`, so events emitted before anyone subscribed (e.g. an early
+    /// `AgentExited`) are replayed to that receiver instead of being lost.
+    /// Later calls get a receiver that sees only events from subscribe-time
+    /// onwards — standard broadcast semantics.
     pub fn events(&self) -> broadcast::Receiver<Event> {
+        if let Some(rx) = self.first_rx.lock().unwrap().take() {
+            return rx;
+        }
         self.event_tx.subscribe()
     }
 
@@ -214,9 +229,13 @@ impl AcpConn {
             // closed channel ends the worker loop.
         }
         if let Some(thread) = self.thread.take() {
-            // The worker already acknowledged shutdown (or died), so this
-            // join returns promptly.
-            let _ = thread.join();
+            // The worker already acknowledged shutdown (or died), so the join
+            // normally returns promptly — but joining a thread must never
+            // block the caller's executor, so it runs on the blocking pool.
+            // Without a runtime there is nothing to stall; detach instead.
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let _ = tokio::task::spawn_blocking(move || thread.join()).await;
+            }
         }
         Ok(())
     }
@@ -461,7 +480,7 @@ impl AcpClientHandler {
     /// both are normalised lexically, then checked again after resolving the
     /// deepest existing ancestor so symlinks cannot escape the cwd.
     fn resolve_in_cwd(&self, path: &Path) -> std::result::Result<PathBuf, acp::Error> {
-        let cwd = self.cwd.lock().unwrap().clone();
+        let cwd = normalize_lexical(&self.cwd.lock().unwrap());
         let candidate = if path.is_absolute() {
             normalize_lexical(path)
         } else {
@@ -475,31 +494,52 @@ impl AcpClientHandler {
             ))));
         }
         // Canonicalize the deepest *existing* ancestor and re-attach the
-        // (already normalized, so `..`-free) dangling tail. This catches
-        // symlink escapes even for paths that don't exist yet, e.g. write
-        // targets under a symlinked directory.
+        // (already normalized, so `..`-free) dangling tail.
+        //
+        // `symlink_metadata` is used (not `exists`, which follows links) so a
+        // symlink — including a *dangling* one, the classic escape vector for
+        // `fs/write` — counts as existing and gets checked by canonicalize
+        // below instead of being re-attached unchecked.
         let mut ancestor = candidate.clone();
         let mut tail = Vec::new();
-        while !ancestor.exists() {
+        while ancestor.symlink_metadata().is_err() {
             match ancestor.file_name() {
                 Some(name) => tail.push(name.to_os_string()),
                 None => break,
             }
             ancestor.pop();
         }
-        let resolved = match ancestor.canonicalize() {
-            Ok(mut canon) => {
-                for comp in tail.iter().rev() {
-                    canon.push(comp);
-                }
-                canon
-            }
-            Err(_) => candidate.clone(),
-        };
-        let base = cwd.canonicalize().unwrap_or_else(|_| cwd.clone());
+        // Fail closed: an unresolvable ancestor (dangling symlink, missing
+        // cwd, permission error) rejects the request rather than skipping the
+        // boundary check.
+        let mut resolved = ancestor.canonicalize().map_err(|e| {
+            acp::Error::invalid_params().data(serde_json::json!(format!(
+                "cannot safely resolve {}: {e}",
+                path.display()
+            )))
+        })?;
+        for comp in tail.iter().rev() {
+            resolved.push(comp);
+        }
+        let base = cwd.canonicalize().map_err(|e| {
+            acp::Error::invalid_params().data(serde_json::json!(format!(
+                "session cwd is not resolvable: {e}"
+            )))
+        })?;
         if !resolved.starts_with(&base) {
             return Err(acp::Error::invalid_params()
                 .data(serde_json::json!("resolved path escapes session cwd")));
+        }
+        // Defense in depth: a final path that is itself a symlink is refused
+        // outright (canonicalize already resolves links, so this only fires
+        // if the tail somehow re-attached one).
+        if resolved
+            .symlink_metadata()
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return Err(acp::Error::invalid_params()
+                .data(serde_json::json!("refusing to operate through a symlink")));
         }
         Ok(resolved)
     }
@@ -615,4 +655,88 @@ fn normalize_lexical(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_client_protocol::Client as _;
+
+    fn handler(cwd: &Path) -> AcpClientHandler {
+        AcpClientHandler {
+            session_id: SessionId::new(),
+            cwd: Arc::new(Mutex::new(cwd.to_path_buf())),
+            event_tx: broadcast::channel(1).0,
+        }
+    }
+
+    #[test]
+    fn resolve_accepts_in_cwd_paths_and_rejects_lexical_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub/real.txt"), "x").unwrap();
+
+        let h = handler(dir.path());
+        // Existing file, relative path, and not-yet-created write target.
+        assert!(h.resolve_in_cwd(&dir.path().join("sub/real.txt")).is_ok());
+        assert!(h.resolve_in_cwd(Path::new("new.txt")).is_ok());
+        // Lexical `..` escape is refused.
+        assert!(h.resolve_in_cwd(Path::new("../outside.txt")).is_err());
+    }
+
+    /// The core escape vector: a *dangling* symlink inside the cwd whose
+    /// target is outside it. `Path::exists` follows links and reports the
+    /// link as missing, so a naive check would re-attach the name unchecked
+    /// and `fs::write` would follow it out of the sandbox.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_through_dangling_symlink_is_rejected() {
+        let inside = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let victim = outside.path().join("pwned.txt");
+        std::os::unix::fs::symlink(&victim, inside.path().join("evil.txt")).unwrap();
+
+        let h = handler(inside.path());
+        // Both the raw resolver and the write handler must refuse…
+        assert!(h.resolve_in_cwd(&inside.path().join("evil.txt")).is_err());
+        let req = acp::WriteTextFileRequest::new("s", inside.path().join("evil.txt"), "owned");
+        assert!(h.write_text_file(req).await.is_err());
+        // …and the outside file must not have been created.
+        assert!(!victim.exists());
+    }
+
+    /// A live symlink pointing outside the cwd must not be readable either.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_through_symlink_escaping_cwd_is_rejected() {
+        let inside = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("secret.txt"),
+            inside.path().join("peek.txt"),
+        )
+        .unwrap();
+
+        let h = handler(inside.path());
+        let req = acp::ReadTextFileRequest::new("s", inside.path().join("peek.txt"));
+        assert!(h.read_text_file(req).await.is_err());
+    }
+
+    /// A symlink chain inside the cwd pointing back inside is still served —
+    /// the sandbox boundary is about escape, not about links per se.
+    #[cfg(unix)]
+    #[test]
+    fn symlink_within_cwd_is_allowed() {
+        let inside = tempfile::tempdir().unwrap();
+        std::fs::write(inside.path().join("real.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(
+            inside.path().join("real.txt"),
+            inside.path().join("link.txt"),
+        )
+        .unwrap();
+
+        let h = handler(inside.path());
+        assert!(h.resolve_in_cwd(&inside.path().join("link.txt")).is_ok());
+    }
 }

@@ -53,17 +53,16 @@ fn spawn_fails_for_missing_command() {
 async fn spawn_applies_env_and_cwd_and_reports_child_exit() {
     let dir = tempfile::tempdir().unwrap();
     let env = BTreeMap::from([("AGENTMUX_ENV_PROBE".to_string(), "hello-acp".to_string())]);
-    // The trailing `sleep` keeps the child alive long enough for the events
-    // receiver to subscribe before `AgentExited` is broadcast — a broadcast
-    // event emitted before subscription would be dropped.
     let args = vec![
         "-c".to_string(),
-        "printf %s \"$AGENTMUX_ENV_PROBE\" > probe.txt; sleep 0.2".to_string(),
+        "printf %s \"$AGENTMUX_ENV_PROBE\" > probe.txt".to_string(),
     ];
 
     let mut conn = AcpConn::spawn(Path::new("/bin/sh"), &args, &env, dir.path()).unwrap();
 
-    // The events receiver must be alive immediately after spawn.
+    // The child may exit before we subscribe: the *first* `events()` call
+    // returns the receiver that has been buffering since spawn, so the early
+    // `AgentExited` is replayed rather than dropped.
     let mut rx = conn.events();
 
     // The child writes a file in its cwd using the env we injected, then
@@ -93,11 +92,18 @@ async fn spawn_applies_env_and_cwd_and_reports_child_exit() {
 #[tokio::test(start_paused = true)]
 async fn initialize_times_out_when_agent_never_responds() {
     let dir = tempfile::tempdir().unwrap();
-    // `/bin/cat` echoes our request back but never sends a valid ACP
-    // response, so `initialize` must fail with the internal timeout
-    // (10s of *virtual* time — elapses instantly under the paused clock).
-    let mut conn =
-        AcpConn::spawn(Path::new("/bin/cat"), &[], &BTreeMap::new(), dir.path()).unwrap();
+    // `sleep` never writes to stdout, so there is no way for `initialize` to
+    // resolve except via the internal timeout (10s of *virtual* time, which
+    // elapses instantly under the paused clock). `cat` would be wrong here:
+    // it echoes the request back, and the parsed echo can resolve the pending
+    // request with a protocol error instead of a timeout.
+    let mut conn = AcpConn::spawn(
+        Path::new("/bin/sleep"),
+        &["60".to_string()],
+        &BTreeMap::new(),
+        dir.path(),
+    )
+    .unwrap();
 
     let err = conn.initialize().await.unwrap_err();
     assert!(
