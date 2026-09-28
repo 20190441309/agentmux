@@ -18,6 +18,7 @@ mod ui;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use agentmux_client::DaemonClient;
 use agentmux_core::{AgentId, Event, SessionId, WorkspaceId};
@@ -131,13 +132,18 @@ async fn snapshot(client: &mut DaemonClient) -> Result<App, Box<dyn Error>> {
     Ok(App::new(workspaces, views, agents))
 }
 
+/// How often the loop polls [`DaemonClient::is_closed`]. The event
+/// stream itself never ends (the broadcast sender is held by the
+/// client), so disconnect detection has to go through the flag.
+const DISCONNECT_POLL: Duration = Duration::from_millis(250);
+
 /// The render/input loop: daemon events, terminal keys and spawned-call
-/// results merged over `tokio::select!`. `_client` is held open — the
-/// event stream is pumped by its reader task.
+/// results merged over `tokio::select!`. `client` is held open — the
+/// event stream is pumped by its reader task — and polled for liveness.
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     app: &mut App,
-    _client: &DaemonClient,
+    client: &DaemonClient,
     events: &mut (impl Stream<Item = Event> + Unpin),
     ui_tx: &mpsc::Sender<UiMsg>,
     ui_rx: &mut mpsc::Receiver<UiMsg>,
@@ -145,18 +151,25 @@ async fn event_loop(
 ) -> Result<(), Box<dyn Error>> {
     let mut term_events = EventStream::new();
     let mut daemon_live = true;
+    let mut liveness = tokio::time::interval(DISCONNECT_POLL);
+    liveness.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         terminal.draw(|frame| ui::draw(frame, app))?;
         tokio::select! {
-            maybe_event = events.next(), if daemon_live => match maybe_event {
-                Some(ev) => app.handle_event(ev),
-                // The daemon closed our subscription connection — report
-                // it, but keep the UI alive so the user quits cleanly.
-                None => {
+            // `events.next()` can never yield None while `client` holds
+            // the broadcast sender — dead-connection detection is the
+            // liveness arm below, not stream exhaustion.
+            maybe_event = events.next(), if daemon_live => {
+                if let Some(ev) = maybe_event {
+                    app.handle_event(ev);
+                }
+            }
+            _ = liveness.tick(), if daemon_live => {
+                if client.is_closed() {
                     daemon_live = false;
                     app.set_status("daemon disconnected — event stream ended (q to quit)");
                 }
-            },
+            }
             term = term_events.next() => match term {
                 Some(Ok(TermEvent::Key(key))) => {
                     if dispatch(app.handle_key(key), app, ui_tx, socket_path) {

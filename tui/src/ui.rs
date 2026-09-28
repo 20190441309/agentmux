@@ -168,9 +168,16 @@ fn draw_events(frame: &mut Frame, app: &App, area: Rect) {
         None => "events".to_string(),
     };
     let inner_height = area.height.saturating_sub(2) as usize;
-    let lines: Vec<Line> = app.events_for_selected().map(event_line).collect();
+    // Bound per-frame work to the visible region: scan the log backwards
+    // and stop after `2×viewport` matching events (wrap can at worst
+    // double the rendered line count — cheaper than building `Line`s for
+    // the whole log every frame). The scroll offset below bottom-anchors
+    // whatever was collected.
+    let keep = inner_height.max(1) * 2;
+    let mut events: Vec<&Event> = app.events_for_selected().rev().take(keep).collect();
+    events.reverse();
+    let lines: Vec<Line> = events.iter().map(|ev| event_line(ev)).collect();
     // Bottom-anchor: hide the oldest lines, keep the newest visible.
-    // `scroll` applies before wrapping, so long lines still wrap below.
     let scroll = lines.len().saturating_sub(inner_height) as u16;
     let paragraph = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(title))
@@ -395,6 +402,33 @@ mod tests {
         let text = buffer_text(terminal.backend());
         assert!(text.contains("no sessions"), "{text}");
         assert!(text.contains("events"));
+    }
+
+    /// A nil-session-id Orchestrator notice (the client's lag warning)
+    /// renders in the event pane even though it belongs to no session.
+    #[test]
+    fn draw_shows_nil_id_global_notice() {
+        let ws = workspace("w");
+        let s = session(ws.id, SessionState::Ready);
+        let app_views = vec![SessionView {
+            session: s,
+            agent_name: "claude".into(),
+            workspace_name: "w".into(),
+        }];
+        let mut app = App::new(vec![ws], app_views, vec![]);
+        app.handle_event(Event {
+            session_id: SessionId(uuid::Uuid::nil()),
+            seq: 0,
+            ts: Utc::now(),
+            kind: EventKind::Orchestrator("client event stream lagged".into()),
+        });
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        assert!(
+            buffer_text(terminal.backend()).contains("client event stream lagged"),
+            "global notice must render in the event pane"
+        );
     }
 
     #[test]

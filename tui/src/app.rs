@@ -155,12 +155,17 @@ impl App {
         self.selected_session().map(|v| v.session.id)
     }
 
-    /// Events belonging to the selected session, oldest first.
-    pub fn events_for_selected(&self) -> impl Iterator<Item = &Event> {
+    /// Events the right pane shows: the selected session's events plus
+    /// global notices — daemon-side lag warnings and the client's own
+    /// lag notice carry the nil session id and would otherwise be
+    /// invisible (they belong to no session).
+    /// `DoubleEndedIterator` so the renderer can scan backwards from the
+    /// newest events and stop early (viewport-bounded draw).
+    pub fn events_for_selected(&self) -> impl DoubleEndedIterator<Item = &Event> {
         let selected = self.selected_session_id();
         self.events
             .iter()
-            .filter(move |ev| Some(ev.session_id) == selected)
+            .filter(move |ev| Some(ev.session_id) == selected || ev.session_id.0.is_nil())
     }
 
     /// Insert a session keeping the list grouped by workspace: it lands
@@ -286,6 +291,23 @@ mod tests {
         assert_eq!(app.events_for_selected().count(), 1);
         app.selected = 1;
         assert_eq!(app.events_for_selected().count(), 1);
+    }
+
+    #[test]
+    fn nil_id_global_notices_are_visible() {
+        let mut app = app_with_sessions(&[SessionState::Ready]);
+        // The client's lag notice convention: nil session id.
+        let nil_id = SessionId(uuid::Uuid::nil());
+        app.handle_event(event(
+            nil_id,
+            EventKind::Orchestrator("client event stream lagged".into()),
+        ));
+        let visible: Vec<_> = app.events_for_selected().collect();
+        assert_eq!(visible.len(), 1, "nil-id notice must render");
+        // Still visible with no session selected at all.
+        let mut empty = App::new(vec![], vec![], vec![]);
+        empty.handle_event(event(nil_id, EventKind::Orchestrator("x".into())));
+        assert_eq!(empty.events_for_selected().count(), 1);
     }
 
     // --- Normal-mode keys ------------------------------------------------

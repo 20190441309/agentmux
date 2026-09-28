@@ -259,6 +259,15 @@ impl DaemonClient {
         &self.socket_path
     }
 
+    /// Whether the connection's reader task has torn down (EOF, socket
+    /// error, or unrecoverable framing). Liveness signal for UIs: the
+    /// [`subscribe_events`](Self::subscribe_events) stream pends forever
+    /// once the daemon is gone — the broadcast sender lives on `self` —
+    /// so consumers must poll this to detect disconnects.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
     /// Per-request deadline for subsequent [`call`]s. `None` (the
     /// default) waits forever — required for `session/prompt`, whose
     /// response only arrives once the whole turn has run.

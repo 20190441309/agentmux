@@ -501,3 +501,32 @@ async fn rpc_error_maps_to_typed_client_error() {
     let mut td = td;
     td.wait_exited();
 }
+
+/// ⑤ Liveness flag: `is_closed()` is false on a live connection and
+/// flips true once the peer is gone (reader task hits EOF). The TUI
+/// polls this to detect daemon disconnects — the event broadcast never
+/// yields `None` while a `DaemonClient` holds the sender.
+#[tokio::test]
+async fn is_closed_flips_when_the_peer_drops() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("peer.sock");
+    let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+
+    let mut client = DaemonClient::connect_existing(&sock).await.unwrap();
+    assert!(!client.is_closed(), "fresh connection should be live");
+    let (server_side, _) = listener.accept().await.unwrap();
+
+    drop(server_side); // peer EOF
+    let deadline = Instant::now() + TIMEOUT;
+    while !client.is_closed() {
+        assert!(
+            Instant::now() < deadline,
+            "reader never noticed the dropped peer"
+        );
+        tokio::time::sleep(POLL).await;
+    }
+
+    // A call on the dead socket fails fast instead of hanging.
+    let err = client.server_status().await.unwrap_err();
+    assert!(matches!(err, ClientError::Transport(_)), "{err}");
+}
