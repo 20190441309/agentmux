@@ -351,6 +351,20 @@ impl Store {
         collect_rows(rows)
     }
 
+    /// Every session across all workspaces, in insertion order — the
+    /// orchestrator's boot sweep needs the whole table, not one
+    /// workspace's slice of it.
+    pub fn list_all_sessions(&self) -> Result<Vec<Session>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workspace_id, agent_id, state, acp_session_id, refs, created_at
+             FROM sessions ORDER BY rowid",
+        )?;
+        let rows = stmt
+            .query_map([], session_from_row)
+            .context("failed to list sessions")?;
+        collect_rows(rows)
+    }
+
     // ----- event log ------------------------------------------------------
 
     /// Append `ev` to `<data_dir>/sessions/<session_id>.jsonl`.
