@@ -5,6 +5,8 @@
 //! returned as an [`AppAction`] for `main.rs` to execute against the
 //! daemon. This is what makes the app unit-testable without a TTY.
 
+use std::collections::HashSet;
+
 use agentmux_core::{
     AgentId, AgentProfile, Event, EventKind, Project, Session, SessionId, SessionState, Workspace,
 };
@@ -173,6 +175,10 @@ pub struct App {
     /// Right pane shows the touched-files list instead of the event
     /// stream (`Tab` toggles).
     pub show_diff: bool,
+    /// Sessions that received events while not selected — the list marks
+    /// them `•` until the selection lands on them (cleared by
+    /// [`mark_selected_viewed`](Self::mark_selected_viewed)).
+    pub unread: HashSet<SessionId>,
 }
 
 /// Upper bound on the in-memory event log — a safety valve so a long
@@ -202,6 +208,7 @@ impl App {
             wizard: None,
             permission: None,
             show_diff: false,
+            unread: HashSet::new(),
         }
     }
 
@@ -235,11 +242,24 @@ impl App {
                 self.mode = InputMode::Permission;
             }
         }
+        // Activity on a non-selected session is unread until viewed;
+        // nil-id global notices belong to no session and never mark one.
+        if !ev.session_id.0.is_nil() && Some(ev.session_id) != self.selected_session_id() {
+            self.unread.insert(ev.session_id);
+        }
         self.events.push(ev);
         // Bound the log so a long-lived session can't grow it forever;
         // the daemon's JSONL event log stays authoritative.
         if self.events.len() >= MAX_EVENTS {
             self.events.drain(..MAX_EVENTS / 4);
+        }
+    }
+
+    /// Clear the unread marker of the highlighted session — called
+    /// wherever `selected` moves (`j`/`k`, relay finish, creation).
+    pub fn mark_selected_viewed(&mut self) {
+        if let Some(id) = self.selected_session_id() {
+            self.unread.remove(&id);
         }
     }
 
@@ -264,12 +284,14 @@ impl App {
     pub(crate) fn select_next(&mut self) {
         if !self.sessions.is_empty() {
             self.selected = (self.selected + 1).min(self.sessions.len() - 1);
+            self.mark_selected_viewed();
         }
     }
 
     /// `k`/Up: move the highlight one session up, clamped.
     pub(crate) fn select_prev(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+        self.mark_selected_viewed();
     }
 
     /// The highlighted session, if any.
@@ -340,7 +362,13 @@ impl App {
             self.mode = InputMode::Normal;
             return;
         };
-        let Some(target) = self.sessions.get(pick.session_cursor) else {
+        // Copy what we need up front — the borrow must end before the
+        // mutations below (selection move clears the unread marker).
+        let Some((target_id, target_name)) = self
+            .sessions
+            .get(pick.session_cursor)
+            .map(|v| (v.session.id, v.agent_name.clone()))
+        else {
             self.mode = InputMode::Normal;
             self.set_status("relay aborted — no target session");
             return;
@@ -370,15 +398,16 @@ impl App {
         self.pending_relays.push(PendingRelay {
             source: source.session_id,
             seq: source.seq,
-            target: target.session.id,
+            target: target_id,
         });
         self.selected = pick.session_cursor;
+        self.mark_selected_viewed();
         self.relay = None;
         self.mode = InputMode::Editing;
         self.set_status(format!(
             "relay → {}·{}",
-            target.agent_name,
-            short_id(&target.session.id.to_string())
+            target_name,
+            short_id(&target_id.to_string())
         ));
     }
 
@@ -519,8 +548,9 @@ fn truncate(text: String, max: usize) -> String {
 
 /// Render a `permission-request` payload (`RequestPermissionRequest`
 /// JSON, camelCase) as a one-line notice. Best-effort: an unparseable
-/// payload degrades to a truncated raw dump.
-fn permission_summary(payload: &str) -> String {
+/// payload degrades to a truncated raw dump. `ui` reuses it for the
+/// banner line the same event leaves in the stream.
+pub(crate) fn permission_summary(payload: &str) -> String {
     let payload = payload.trim();
     let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
         return truncate(format!("permission requested: {payload}"), 120);

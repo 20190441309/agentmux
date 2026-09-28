@@ -1,29 +1,48 @@
 //! Layout + drawing. Reads [`App`](crate::app::App) only — never mutates.
 //!
 //! ```text
-//! ┌ sessions ──┬─ events ───────────────────────────┐
-//! │ ▸ alpha    │  12:01:03 ●→◐ prompting            │  body
-//! │  ● claude… │  12:01:04 hello world              │
-//! ├────────────┴────────────────────────────────────┤
-//! │ normal  q quit · j/k select · i prompt …        │  status bar
-//! ├─────────────────────────────────────────────────┤
-//! │ prompt  …                                       │  input box
-//! └─────────────────────────────────────────────────┘
+//! ╭─ sessions ──────╮─ claude·a1b2c3d4 · ready ───╮
+//! │ ▸ alpha         │  ● claude          12:01:04 │
+//! │   ● claude·…    │    hello world              │
+//! │   ◐ codex·…  •  │  12:01:05 ⚙ edit — completed│
+//! │ ▸ beta          │    src/lib.rs               │
+//! ╰─────────────────┴─────────────────────────────╯
+//! │ ● normal                        hints · · ·   │  status bar
+//! ╰───────────────────────────────────────────────╯
+//! ╭ prompt ───────────────────────────────────────╮
+//! │                                               │
+//! ╰───────────────────────────────────────────────╯
 //! ```
+//!
+//! All color lives in [`crate::theme`] — this file only names roles
+//! (`THEME.accent`, `THEME.faint`, …), never raw `Color`s.
 
-use agentmux_core::{Event, EventKind, SessionState};
+use agentmux_core::{Event, EventKind};
+use chrono::{DateTime, Utc};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 use ratatui::Frame;
 
-use crate::app::{short_id, App, InputMode, RelayStage, SessionView};
+use crate::app::{
+    permission_summary, short_id, App, InputMode, RelayStage, SessionView, PERMISSION_PREFIX,
+};
 use crate::newsession::WizardStep;
+use crate::theme::THEME;
+use ratatui::style::Style;
 
 /// Width of the left session-list column — wide enough for
-/// `● agent·id prompting` plus borders and the highlight symbol.
+/// `● agent·id state` plus borders and the highlight symbol.
 const LIST_WIDTH: u16 = 36;
+
+/// Indent of message bodies and tool-call detail lines.
+const BODY_INDENT: &str = "  ";
+
+/// Upper bound on the lines a single event block may emit — a giant
+/// diff or paste can't flood the viewport-bound scan.
+const MAX_BLOCK_LINES: usize = 48;
 
 /// Render the whole UI.
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -41,12 +60,28 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_status(frame, app, vertical[1]);
     draw_input(frame, app, vertical[2]);
 
-    // Modal overlays draw last, on top of the panes.
+    // Modal overlays draw last, on top of a dimmed UI.
     match app.mode {
         InputMode::NewSession => draw_wizard(frame, app),
         InputMode::Permission => draw_permission(frame, app),
         _ => {}
     }
+}
+
+/// A bordered pane with the house style: rounded corners, faint border,
+/// dim title text.
+fn pane<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(THEME.border)
+        .title(title)
+}
+
+/// Wash the whole frame in the backdrop shade — the cheap "dim" behind
+/// modal overlays (bg-only style merges over the drawn UI).
+fn draw_backdrop(frame: &mut Frame) {
+    frame.render_widget(Block::default().style(THEME.backdrop), frame.area());
 }
 
 /// The right pane: relay event picker, touched-files list, or the
@@ -65,6 +100,8 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     draw_events(frame, app, area);
 }
 
+// --- sessions (left pane) ---------------------------------------------------
+
 /// Left pane: session list grouped by workspace, state badge per row.
 ///
 /// During the relay pick's `Session` stage the highlight follows the
@@ -81,6 +118,9 @@ fn draw_sessions(frame: &mut Frame, app: &App, area: Rect) {
         }
         _ => app.selected,
     };
+    // `•` marks activity on sessions that aren't being viewed.
+    let unread =
+        |i: usize| -> bool { i != highlight && app.unread.contains(&app.sessions[i].session.id) };
 
     for ws in &app.workspaces {
         let mut header = false;
@@ -96,7 +136,7 @@ fn draw_sessions(frame: &mut Frame, app: &App, area: Rect) {
             if i == highlight {
                 selected_row = Some(items.len());
             }
-            items.push(session_line(view));
+            items.push(session_line(view, unread(i)));
         }
         // Workspaces with no sessions still render — `n` can land there.
         if !header {
@@ -125,106 +165,611 @@ fn draw_sessions(frame: &mut Frame, app: &App, area: Rect) {
             if i == highlight {
                 selected_row = Some(items.len());
             }
-            items.push(session_line(&app.sessions[i]));
+            items.push(session_line(&app.sessions[i], unread(i)));
         }
     }
 
     if items.is_empty() {
-        items.push(ListItem::new(Line::from(Span::styled(
-            "  no sessions — press n",
-            Style::default().fg(Color::DarkGray),
-        ))));
+        for l in [
+            Line::from(Span::styled("  no sessions yet", THEME.dim)),
+            Line::default(),
+            Line::from(vec![
+                Span::styled("  n", THEME.accent),
+                Span::styled("  new session", THEME.faint),
+            ]),
+            Line::from(vec![
+                Span::styled("  q", THEME.accent),
+                Span::styled("  quit", THEME.faint),
+            ]),
+        ] {
+            items.push(ListItem::new(l));
+        }
     }
 
     let title = match (app.mode, app.relay.as_ref()) {
         (InputMode::RelayPick, Some(pick)) if pick.stage == RelayStage::Session => {
-            "sessions — pick relay target"
+            Line::from(Span::styled(" relay — pick target ", THEME.special))
         }
-        _ => "sessions",
+        _ => Line::from(Span::styled(" sessions ", THEME.title)),
     };
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .block(pane(title))
+        .highlight_style(THEME.selection)
         .highlight_symbol("›");
     let mut state = ListState::default();
     state.select(selected_row);
     frame.render_stateful_widget(list, area, &mut state);
 }
 
+/// `▸ workspace` — a quiet section label, not a competing accent.
 fn workspace_header(name: &str) -> ListItem<'static> {
-    ListItem::new(Line::from(Span::styled(
-        format!("▸ {name}"),
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )))
-}
-
-fn session_line(view: &SessionView) -> ListItem<'static> {
-    let (glyph, label) = App::badge(&view.session.state);
-    let id = view.session.id.to_string();
     ListItem::new(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(glyph.to_string(), badge_color(&view.session.state)),
-        Span::raw(format!(" {}·{} ", view.agent_name, short_id(&id))),
-        Span::styled(label, Style::default().fg(Color::DarkGray)),
+        Span::styled(" ▸ ", THEME.faint),
+        Span::styled(name.to_string(), THEME.section),
     ]))
 }
 
-fn badge_color(state: &SessionState) -> Style {
-    let color = match state {
-        SessionState::Created => Color::DarkGray,
-        SessionState::Connecting => Color::Yellow,
-        SessionState::Ready => Color::Green,
-        SessionState::Prompting => Color::Yellow,
-        SessionState::WaitingPermission => Color::Magenta,
-        SessionState::Done => Color::Blue,
-        SessionState::Error(_) => Color::Red,
-    };
-    Style::default().fg(color)
+/// `● agent·id state [•]` — badge color is the state, name is text,
+/// the state label stays secondary.
+fn session_line(view: &SessionView, unread: bool) -> ListItem<'static> {
+    let (glyph, label) = App::badge(&view.session.state);
+    let id = view.session.id.to_string();
+    let mut spans = vec![
+        Span::raw("  "),
+        Span::styled(glyph.to_string(), THEME.badge(&view.session.state)),
+        Span::styled(format!(" {}", view.agent_name), THEME.text),
+        Span::styled(format!("·{} ", short_id(&id)), THEME.faint),
+        Span::styled(label, THEME.dim),
+    ];
+    if unread {
+        spans.push(Span::styled("  •", THEME.accent));
+    }
+    ListItem::new(Line::from(spans))
 }
+
+// --- event stream (right pane) ----------------------------------------------
 
 /// Right pane: the selected session's event stream, bottom-anchored.
 fn draw_events(frame: &mut Frame, app: &App, area: Rect) {
-    let title = match app.selected_session() {
+    let agent = app
+        .selected_session()
+        .map(|v| v.agent_name.as_str())
+        .unwrap_or("agentmux");
+    let title: Line = match app.selected_session() {
         Some(view) => {
             let (glyph, label) = App::badge(&view.session.state);
-            format!(
-                "{} {}·{} ({})",
-                glyph,
-                view.agent_name,
-                short_id(&view.session.id.to_string()),
-                label
-            )
+            Line::from(vec![
+                Span::styled(format!(" {glyph}"), THEME.badge(&view.session.state)),
+                Span::styled(format!(" {}", view.agent_name), THEME.title),
+                Span::styled(
+                    format!("·{}", short_id(&view.session.id.to_string())),
+                    THEME.faint,
+                ),
+                Span::styled(format!("  {label} "), THEME.faint),
+            ])
         }
-        None => "events".to_string(),
+        None => Line::from(Span::styled(" events ", THEME.title)),
     };
     let inner_width = area.width.saturating_sub(2).max(1) as usize;
-    let inner_height = area.height.saturating_sub(2) as usize;
+    let inner_height = area.height.saturating_sub(2).max(1) as usize;
+
     // Bound per-frame work to the visible region: scan the log backwards
-    // and stop once the collected lines cover the viewport in *wrapped*
-    // rows — each event contributes at least one.
-    let mut rows = 0usize;
-    let mut lines: Vec<Line> = Vec::new();
+    // and stop once the collected events cover the viewport in wrapped
+    // rows. The per-event estimate counts a message's header even though
+    // merging may drop it later — never an under-count of its own body,
+    // so the scan still collects enough.
+    let mut est = 0usize;
+    let mut blocks: Vec<EventBlock> = Vec::new();
     for ev in app.events_for_selected().rev() {
-        let line = event_line(ev);
-        rows += wrapped_rows(&line, inner_width);
-        lines.push(line);
-        if rows >= inner_height.max(1) {
+        let block = event_block(ev);
+        est += block_rows(&block, inner_width);
+        blocks.push(block);
+        if est >= inner_height {
             break;
         }
     }
-    lines.reverse();
+    blocks.reverse();
+    let lines = render_blocks(blocks, agent);
+
     // Bottom-anchor in wrapped rows: `.scroll` offsets count *post-wrap*
     // rows, so subtracting `lines.len()` (source lines) under-scrolls
     // whenever any line wraps and the newest events end up below the
-    // fold. `rows` is the wrapped-row estimate instead.
-    let scroll = rows.saturating_sub(inner_height) as u16;
+    // fold. `rows` is the true wrapped-row count instead.
+    let rows: usize = lines.iter().map(|l| wrapped_rows(l, inner_width)).sum();
+    let scroll = u16::try_from(rows.saturating_sub(inner_height)).unwrap_or(u16::MAX);
+
+    let lines = if lines.is_empty() {
+        events_empty_lines(app)
+    } else {
+        lines
+    };
     let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(pane(title))
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// The event pane when it has nothing to show — a hint, not a void.
+fn events_empty_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::default()];
+    if app.selected_session().is_none() {
+        lines.extend([
+            Line::from(Span::styled("  no session selected", THEME.dim)),
+            Line::from(vec![
+                Span::styled("  n", THEME.accent),
+                Span::styled("  new session", THEME.faint),
+            ]),
+        ]);
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  waiting for output…",
+            THEME.faint_italic,
+        )));
+    }
+    lines
+}
+
+// --- event rendering ---------------------------------------------------------
+
+/// Which prose role a `session/update` message chunk plays — drives the
+/// header styling and whether consecutive chunks merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MsgRole {
+    /// `agent_message_chunk` — the agent's visible reply.
+    Agent,
+    /// `agent_thought_chunk` — internal reasoning, rendered dimmer.
+    Thought,
+    /// `user_message_chunk` — the operator's side of the stream.
+    User,
+}
+
+/// One event, as renderable material. `Msg` stays un-rendered so a run
+/// of consecutive same-role chunks can coalesce under one header.
+enum EventBlock {
+    Msg {
+        role: MsgRole,
+        ts: DateTime<Utc>,
+        text: String,
+    },
+    Static(Vec<Line<'static>>),
+}
+
+/// The wrapped rows `block` will occupy — the scan bound. `Msg` counts
+/// its header plus per-source-line body wrap, an over-estimate of the
+/// merged contribution (merging only ever drops header lines).
+fn block_rows(block: &EventBlock, width: usize) -> usize {
+    match block {
+        EventBlock::Static(lines) => lines.iter().map(|l| wrapped_rows(l, width)).sum(),
+        EventBlock::Msg { text, .. } => {
+            1 + text
+                .lines()
+                .map(|l| wrapped_rows(&Line::from(l), width))
+                .sum::<usize>()
+                .max(1)
+        }
+    }
+}
+
+/// Render collected blocks to lines, coalescing consecutive same-role
+/// message chunks into one header + flowing prose body (agents stream
+/// replies as many small chunks — one header each would drown the text).
+fn render_blocks(blocks: Vec<EventBlock>, agent: &str) -> Vec<Line<'static>> {
+    let mut out: Vec<Line> = Vec::new();
+    let mut pending: Option<(MsgRole, DateTime<Utc>, String)> = None;
+    for block in blocks {
+        match block {
+            EventBlock::Msg { role, ts, text } => match &mut pending {
+                Some((r, _, buf)) if *r == role => {
+                    buf.push_str(&text);
+                }
+                _ => {
+                    flush_msg(&mut out, pending.take(), agent);
+                    pending = Some((role, ts, text));
+                }
+            },
+            EventBlock::Static(lines) => {
+                flush_msg(&mut out, pending.take(), agent);
+                out.extend(lines);
+            }
+        }
+    }
+    flush_msg(&mut out, pending.take(), agent);
+    out
+}
+
+/// Emit a coalesced message run: `● agent  HH:MM:SS` header, then the
+/// prose body indented (with diff detection for pasted patches).
+fn flush_msg(
+    out: &mut Vec<Line<'static>>,
+    pending: Option<(MsgRole, DateTime<Utc>, String)>,
+    agent: &str,
+) {
+    let Some((role, ts, text)) = pending else {
+        return;
+    };
+    if text.trim().is_empty() {
+        return;
+    }
+    let ts = ts.format("%H:%M:%S").to_string();
+    let header = match role {
+        MsgRole::Agent => vec![
+            Span::styled("● ", THEME.accent),
+            Span::styled(agent.to_string(), THEME.accent_bold),
+            Span::styled(format!("  {ts}"), THEME.faint),
+        ],
+        MsgRole::Thought => vec![
+            Span::styled("◌ ", THEME.faint),
+            Span::styled(format!("{agent} thinking"), THEME.dim_italic),
+            Span::styled(format!("  {ts}"), THEME.faint),
+        ],
+        MsgRole::User => vec![
+            Span::styled("○ ", THEME.special),
+            Span::styled("you", THEME.special_bold),
+            Span::styled(format!("  {ts}"), THEME.faint),
+        ],
+    };
+    out.push(Line::from(header));
+    let body_style = match role {
+        MsgRole::Thought => THEME.dim_italic,
+        _ => THEME.text,
+    };
+    out.extend(body_lines(&text, body_style));
+}
+
+/// One event → its renderable block (timestamped; `Msg` defers text).
+fn event_block(ev: &Event) -> EventBlock {
+    match &ev.kind {
+        EventKind::SessionUpdate(v) => session_update_block(ev, v),
+        EventKind::StateChanged { from, to } => {
+            let (_, from_label) = App::badge(from);
+            let (_, to_label) = App::badge(to);
+            EventBlock::Static(vec![Line::from(vec![
+                ts_span(ev),
+                Span::styled("· ", THEME.faint),
+                Span::styled(format!("{from_label} → {to_label}"), THEME.badge(to)),
+            ])])
+        }
+        EventKind::FileEdited { path } => EventBlock::Static(vec![Line::from(vec![
+            ts_span(ev),
+            Span::styled("✎ ", THEME.accent),
+            Span::styled("edited ", THEME.dim),
+            Span::styled(path.display().to_string(), THEME.text),
+        ])]),
+        EventKind::AgentExited { code } => EventBlock::Static(vec![Line::from(vec![
+            ts_span(ev),
+            Span::styled("✗ ", THEME.error),
+            Span::styled(format!("agent exited (code {code:?})"), THEME.error),
+        ])]),
+        EventKind::Orchestrator(msg) => EventBlock::Static(vec![orchestrator_line(ev, msg)]),
+    }
+}
+
+/// An orchestrator notice: permission requests become warning banners,
+/// everything else a quiet prefixed line.
+fn orchestrator_line(ev: &Event, msg: &str) -> Line<'static> {
+    if let Some(payload) = msg.strip_prefix(PERMISSION_PREFIX) {
+        return Line::from(vec![
+            ts_span(ev),
+            Span::styled("⚠ ", THEME.warning),
+            Span::styled(
+                format!("permission requested — {}", permission_summary(payload)),
+                THEME.warning_bold,
+            ),
+        ]);
+    }
+    Line::from(vec![
+        ts_span(ev),
+        Span::styled("· ", THEME.faint),
+        Span::styled(msg.to_string(), THEME.dim_italic),
+    ])
+}
+
+/// `session/update` payloads → blocks: message chunks stay `Msg` for
+/// coalescing; tool calls and friends render as structured cards.
+fn session_update_block(ev: &Event, value: &serde_json::Value) -> EventBlock {
+    let update = value.get("update").unwrap_or(value);
+    let text = || {
+        update
+            .pointer("/content/text")
+            .or_else(|| update.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    match update.get("sessionUpdate").and_then(|t| t.as_str()) {
+        Some("agent_message_chunk") => EventBlock::Msg {
+            role: MsgRole::Agent,
+            ts: ev.ts,
+            text: text(),
+        },
+        Some("agent_thought_chunk") => EventBlock::Msg {
+            role: MsgRole::Thought,
+            ts: ev.ts,
+            text: text(),
+        },
+        Some("user_message_chunk") => EventBlock::Msg {
+            role: MsgRole::User,
+            ts: ev.ts,
+            text: text(),
+        },
+        Some("tool_call") | Some("tool_call_update") => {
+            EventBlock::Static(tool_call_lines(ev, update))
+        }
+        Some("plan") => EventBlock::Static(plan_lines(ev, update)),
+        Some("available_commands_update") => {
+            EventBlock::Static(vec![available_commands_line(ev, update)])
+        }
+        Some("current_mode_update") => EventBlock::Static(vec![Line::from(vec![
+            ts_span(ev),
+            Span::styled("⇄ ", THEME.special),
+            Span::styled("mode → ", THEME.dim),
+            Span::styled(
+                update
+                    .get("currentModeId")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("?")
+                    .to_string(),
+                THEME.text,
+            ),
+        ])]),
+        _ => EventBlock::Static(vec![fallback_update_line(ev, update)]),
+    }
+}
+
+/// `HH:MM:SS ` in the faint gutter color — the shared line prefix.
+fn ts_span(ev: &Event) -> Span<'static> {
+    Span::styled(format!("{} ", ev.ts.format("%H:%M:%S")), THEME.faint)
+}
+
+/// A `tool_call`/`tool_call_update` as a card: `⚙ title · status`
+/// header, then locations, diff hunks and text content underneath.
+fn tool_call_lines(ev: &Event, update: &serde_json::Value) -> Vec<Line<'static>> {
+    let title = update
+        .get("title")
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            update
+                .get("toolCallId")
+                .and_then(|t| t.as_str())
+                .map(short_id)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "tool call".to_string());
+    let status = update.get("status").and_then(|s| s.as_str());
+
+    // `kind` is deliberately not prefixed — agent titles already read
+    // like "Edit src/x.rs"; the status chip is the second semantic datum.
+    let mut header = vec![ts_span(ev), Span::styled("⚙ ", THEME.accent)];
+    header.push(Span::styled(title, THEME.text));
+    if let Some(status) = status {
+        header.push(Span::styled(
+            format!("  {status}"),
+            THEME.tool_status(Some(status)),
+        ));
+    } else if update.get("sessionUpdate").and_then(|t| t.as_str()) == Some("tool_call_update") {
+        header.push(Span::styled("  update", THEME.faint));
+    }
+    let mut lines = vec![Line::from(header)];
+
+    if let Some(locations) = update.get("locations").and_then(|l| l.as_array()) {
+        for loc in locations {
+            let Some(path) = loc.get("path").and_then(|p| p.as_str()) else {
+                continue;
+            };
+            let line_no = loc.get("line").and_then(|l| l.as_u64());
+            let target = match line_no {
+                Some(n) => format!("{path}:{n}"),
+                None => path.to_string(),
+            };
+            lines.push(Line::from(vec![
+                Span::raw(BODY_INDENT),
+                Span::styled("⌄ ", THEME.faint),
+                Span::styled(target, THEME.dim),
+            ]));
+        }
+    }
+
+    if let Some(content) = update.get("content").and_then(|c| c.as_array()) {
+        for item in content {
+            match item.get("type").and_then(|t| t.as_str()) {
+                Some("diff") => {
+                    let path = item.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+                    lines.extend(diff_lines(
+                        path,
+                        item.get("oldText").and_then(|t| t.as_str()),
+                        item.get("newText").and_then(|t| t.as_str()).unwrap_or(""),
+                    ));
+                }
+                Some("content") => {
+                    if let Some(text) = item.pointer("/content/text").and_then(|t| t.as_str()) {
+                        lines.extend(body_lines(text, THEME.dim));
+                    }
+                }
+                Some("terminal") => lines.push(Line::from(vec![
+                    Span::raw(BODY_INDENT),
+                    Span::styled("terminal ", THEME.faint),
+                    Span::styled(
+                        item.get("terminalId")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("?")
+                            .to_string(),
+                        THEME.dim,
+                    ),
+                ])),
+                _ => {}
+            }
+        }
+    }
+    cap_lines(lines)
+}
+
+/// A `plan` update: header plus one status-glyph row per entry.
+fn plan_lines(ev: &Event, update: &serde_json::Value) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![
+        ts_span(ev),
+        Span::styled("◇ ", THEME.accent),
+        Span::styled("plan", THEME.title),
+    ])];
+    if let Some(entries) = update.get("entries").and_then(|e| e.as_array()) {
+        for entry in entries {
+            let status = entry.get("status").and_then(|s| s.as_str()).unwrap_or("");
+            let (glyph, style) = match status {
+                "completed" => ("✓", THEME.success),
+                "in_progress" => ("◐", THEME.warning),
+                _ => ("○", THEME.faint),
+            };
+            let text = entry
+                .get("content")
+                .or_else(|| entry.get("title"))
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            lines.push(Line::from(vec![
+                Span::raw(BODY_INDENT),
+                Span::styled(format!("{glyph} "), style),
+                Span::styled(text.to_string(), THEME.dim),
+            ]));
+        }
+    }
+    cap_lines(lines)
+}
+
+/// `available_commands_update` → one dim summary line.
+fn available_commands_line(ev: &Event, update: &serde_json::Value) -> Line<'static> {
+    let names: Vec<&str> = update
+        .get("availableCommands")
+        .and_then(|c| c.as_array())
+        .map(|cmds| {
+            cmds.iter()
+                .filter_map(|c| c.get("name").and_then(|n| n.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let shown: Vec<&str> = names.iter().take(6).copied().collect();
+    let more = if names.len() > 6 {
+        format!(" +{}", names.len() - 6)
+    } else {
+        String::new()
+    };
+    Line::from(vec![
+        ts_span(ev),
+        Span::styled("⌘ ", THEME.special),
+        Span::styled(
+            format!("commands: {}{}", shown.join(" · "), more),
+            THEME.dim,
+        ),
+    ])
+}
+
+/// Unknown payloads: a terse, truncated summary — never a JSON wall.
+fn fallback_update_line(ev: &Event, update: &serde_json::Value) -> Line<'static> {
+    Line::from(vec![
+        ts_span(ev),
+        Span::styled(session_update_text(update), THEME.faint),
+    ])
+}
+
+/// Prose body lines: `BODY_INDENT`-indented in `style`, or diff-colored
+/// when the text looks like a patch.
+fn body_lines(text: &str, style: Style) -> Vec<Line<'static>> {
+    if looks_like_diff(text) {
+        return patch_lines(text);
+    }
+    let mut lines: Vec<Line> = text
+        .lines()
+        .map(|l| {
+            Line::from(vec![
+                Span::raw(BODY_INDENT),
+                Span::styled(l.to_string(), style),
+            ])
+        })
+        .collect();
+    if lines.is_empty() && !text.is_empty() {
+        lines.push(Line::from(Span::styled(text.to_string(), style)));
+    }
+    cap_lines(lines)
+}
+
+/// Whether a text block is a unified-diff-shaped patch: an explicit
+/// `diff --git`/`@@`/`Index:` marker, or the `---`/`+++` header pair
+/// (a lone `---` is more likely a markdown rule, so it needs its mate).
+fn looks_like_diff(text: &str) -> bool {
+    let mut saw_old = false;
+    let mut saw_new = false;
+    for l in text.lines() {
+        if l.starts_with("diff --git") || l.starts_with("@@") || l.starts_with("Index:") {
+            return true;
+        }
+        saw_old |= l.starts_with("--- ");
+        saw_new |= l.starts_with("+++ ");
+    }
+    saw_old && saw_new
+}
+
+/// Render a unified-diff-ish text block: `+` lines green, `-` lines red,
+/// `@@`/`diff`/`index`/`---`/`+++` headers accent/faint, context dim.
+fn patch_lines(text: &str) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for l in text.lines() {
+        let style = if l.starts_with("+++") || l.starts_with("---") {
+            THEME.faint
+        } else if l.starts_with('+') {
+            THEME.success
+        } else if l.starts_with('-') {
+            THEME.error
+        } else if l.starts_with("@@") || l.starts_with("diff --git") || l.starts_with("index ") {
+            THEME.accent
+        } else {
+            THEME.dim
+        };
+        lines.push(Line::from(vec![
+            Span::raw(BODY_INDENT),
+            Span::styled(l.to_string(), style),
+        ]));
+    }
+    cap_lines(lines)
+}
+
+/// An ACP `diff` content item: highlighted path header, then `-` old
+/// lines and `+` new lines (a pseudo-diff — ACP ships old/new text, not
+/// a unified patch, so line-level +/- is the honest rendering).
+fn diff_lines(path: &str, old: Option<&str>, new: &str) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(vec![
+        Span::raw(BODY_INDENT),
+        Span::styled("± ", THEME.special),
+        Span::styled(path.to_string(), THEME.accent),
+    ])];
+    if let Some(old) = old {
+        for l in old.lines() {
+            lines.push(Line::from(vec![
+                Span::raw(BODY_INDENT),
+                Span::styled(format!("-{l}"), THEME.error),
+            ]));
+        }
+    }
+    for l in new.lines() {
+        lines.push(Line::from(vec![
+            Span::raw(BODY_INDENT),
+            Span::styled(format!("+{l}"), THEME.success),
+        ]));
+    }
+    lines
+}
+
+/// Bound a block's height — a paste/diff beyond `MAX_BLOCK_LINES` ends
+/// with a dim ellipsis note.
+fn cap_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    if lines.len() > MAX_BLOCK_LINES {
+        let more = lines.len() - MAX_BLOCK_LINES;
+        lines.truncate(MAX_BLOCK_LINES);
+        lines.push(Line::from(vec![
+            Span::raw(BODY_INDENT),
+            Span::styled(format!("… {more} more lines"), THEME.faint),
+        ]));
+    }
+    lines
 }
 
 /// Rows `line` occupies under `Wrap { trim: false }` at `width` columns —
@@ -256,6 +801,34 @@ fn wrapped_rows(line: &Line, width: usize) -> usize {
     rows.max(line.width().div_ceil(width))
 }
 
+/// A compact one-line rendering of an event — for the relay picker's
+/// highlightable list (one list row per event).
+fn event_line(ev: &Event) -> Line<'static> {
+    match event_block(ev) {
+        EventBlock::Static(mut lines) => {
+            if lines.is_empty() {
+                Line::default()
+            } else {
+                lines.remove(0)
+            }
+        }
+        EventBlock::Msg { role, text, .. } => {
+            let (glyph, style) = match role {
+                MsgRole::Agent => ("●", THEME.accent),
+                MsgRole::Thought => ("◌", THEME.faint),
+                MsgRole::User => ("○", THEME.special),
+            };
+            let first = text.lines().next().unwrap_or("");
+            let first: String = first.chars().take(120).collect();
+            Line::from(vec![
+                ts_span(ev),
+                Span::styled(format!("{glyph} "), style),
+                Span::styled(first, THEME.dim),
+            ])
+        }
+    }
+}
+
 /// RelayPick stage `Event`: the selected session's event log as a
 /// highlightable list (newest at the bottom, cursor pre-placed there).
 fn draw_relay_events(frame: &mut Frame, app: &App, area: Rect, cursor: usize) {
@@ -266,18 +839,17 @@ fn draw_relay_events(frame: &mut Frame, app: &App, area: Rect, cursor: usize) {
     let items = if items.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "  no events yet",
-            Style::default().fg(Color::DarkGray),
+            THEME.dim,
         )))]
     } else {
         items
     };
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("relay — pick event to reference · enter · esc"),
-        )
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .block(pane(Line::from(Span::styled(
+            " relay — pick event · enter next · esc abort ",
+            THEME.special,
+        ))))
+        .highlight_style(THEME.selection)
         .highlight_symbol("›");
     let mut state = ListState::default();
     state.select(Some(cursor));
@@ -286,39 +858,43 @@ fn draw_relay_events(frame: &mut Frame, app: &App, area: Rect, cursor: usize) {
 
 /// `Tab` diff/files panel: paths the selected session touched
 /// (`FileEdited` events + `tool_call` locations), first-touch order.
-/// v1: path list only — no real diff highlighting.
 fn draw_files(frame: &mut Frame, app: &App, area: Rect) {
     let files = app.touched_files();
-    let title = match app.selected_session() {
-        Some(view) => format!(
-            "files touched — {}·{}",
-            view.agent_name,
-            short_id(&view.session.id.to_string())
-        ),
-        None => "files touched".to_string(),
+    let title: Line = match app.selected_session() {
+        Some(view) => Line::from(vec![
+            Span::styled(" files touched — ", THEME.title),
+            Span::styled(
+                format!(
+                    "{}·{}",
+                    view.agent_name,
+                    short_id(&view.session.id.to_string())
+                ),
+                THEME.faint,
+            ),
+            Span::styled(" ", THEME.faint),
+        ]),
+        None => Line::from(Span::styled(" files touched ", THEME.title)),
     };
     let items: Vec<ListItem> = if files.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             "  no file activity yet",
-            Style::default().fg(Color::DarkGray),
+            THEME.dim,
         )))]
     } else {
         files
             .iter()
             .map(|f| {
                 ListItem::new(Line::from(vec![
-                    Span::styled("  ✎ ", Style::default().fg(Color::Blue)),
-                    Span::raw(f.clone()),
+                    Span::styled("  ✎ ", THEME.accent),
+                    Span::styled(f.clone(), THEME.text),
                 ]))
             })
             .collect()
     };
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .title_bottom(" tab — back to events "),
-    );
+    let list = List::new(items).block(pane(title).title_bottom(Line::from(Span::styled(
+        " tab — back to events ",
+        THEME.faint,
+    ))));
     frame.render_widget(list, area);
 }
 
@@ -346,7 +922,6 @@ fn draw_wizard(frame: &mut Frame, app: &App) {
     let Some(wiz) = &app.wizard else {
         return;
     };
-    let plain = Style::default().fg(Color::DarkGray);
     let (title, items, cursor): (&str, Vec<ListItem>, Option<usize>) = match wiz.step {
         WizardStep::Project => (
             "pick project",
@@ -354,8 +929,8 @@ fn draw_wizard(frame: &mut Frame, app: &App) {
                 .iter()
                 .map(|p| {
                     ListItem::new(Line::from(vec![
-                        Span::raw(format!("  {}", p.name)),
-                        Span::styled(format!("  {}", p.root_path.display()), plain),
+                        Span::styled(format!("  {}", p.name), THEME.text),
+                        Span::styled(format!("  {}", p.root_path.display()), THEME.faint),
                     ]))
                 })
                 .collect(),
@@ -364,24 +939,29 @@ fn draw_wizard(frame: &mut Frame, app: &App) {
         WizardStep::Workspace => {
             let mut items: Vec<ListItem> = wiz
                 .workspace_options(app)
-                .map(|w| ListItem::new(Line::from(format!("  {}", w.name))))
+                .map(|w| {
+                    ListItem::new(Line::from(Span::styled(
+                        format!("  {}", w.name),
+                        THEME.text,
+                    )))
+                })
                 .collect();
-            items.push(ListItem::new(Line::from(Span::styled(
-                "  + create new workspace…",
-                Style::default().fg(Color::Cyan),
-            ))));
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled("  + ", THEME.accent),
+                Span::styled("create new workspace…", THEME.accent),
+            ])));
             ("pick workspace", items, Some(wiz.workspace_cursor))
         }
         WizardStep::WorkspaceName => (
             "name the new workspace",
             vec![
                 ListItem::new(Line::from(vec![
-                    Span::styled("  name: ", plain),
-                    Span::raw(format!("{}▌", wiz.name)),
+                    Span::styled("  name: ", THEME.dim),
+                    Span::styled(format!("{}▌", wiz.name), THEME.text),
                 ])),
                 ListItem::new(Line::from(Span::styled(
                     "  (git worktree under the project)",
-                    plain,
+                    THEME.faint,
                 ))),
             ],
             None,
@@ -391,8 +971,8 @@ fn draw_wizard(frame: &mut Frame, app: &App) {
             wiz.agent_options(app)
                 .map(|a| {
                     ListItem::new(Line::from(vec![
-                        Span::raw(format!("  {}", a.name)),
-                        Span::styled(format!("  ({})", a.id), plain),
+                        Span::styled(format!("  {}", a.name), THEME.text),
+                        Span::styled(format!("  ({})", a.id), THEME.faint),
                     ]))
                 })
                 .collect(),
@@ -401,15 +981,21 @@ fn draw_wizard(frame: &mut Frame, app: &App) {
     };
     let height = (items.len() as u16 + 4).min(frame.area().height.saturating_sub(2));
     let rect = centered(frame.area(), 52, height.max(5));
+    draw_backdrop(frame);
     frame.render_widget(Clear, rect);
     let list = List::new(items)
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" new session — {title} "))
-                .title_bottom(" enter select · esc back "),
+            pane(Line::from(Span::styled(
+                format!(" new session — {title} "),
+                THEME.title,
+            )))
+            .border_style(THEME.border_focus)
+            .title_bottom(Line::from(Span::styled(
+                " enter select · esc back ",
+                THEME.faint,
+            ))),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_style(THEME.selection)
         .highlight_symbol("›");
     let mut state = ListState::default();
     state.select(cursor);
@@ -424,72 +1010,36 @@ fn draw_permission(frame: &mut Frame, app: &App) {
     let Some(notice) = &app.permission else {
         return;
     };
-    let dim = Style::default().fg(Color::DarkGray);
     let lines = vec![
-        Line::from(Span::styled(
-            notice.summary.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
+        Line::from(vec![
+            Span::styled("⚠ ", THEME.warning),
+            Span::styled(notice.summary.clone(), THEME.warning_bold),
+        ]),
+        Line::default(),
         Line::from(Span::styled(
             "the daemon auto-denied this request (v1 is observe-only)",
-            dim,
+            THEME.dim,
         )),
-        Line::from(Span::styled("press any key to dismiss", dim)),
+        Line::from(Span::styled("press any key to dismiss", THEME.faint)),
     ];
     let rect = centered(frame.area(), 60, 7);
+    draw_backdrop(frame);
     frame.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(
-            " permission requested — session {} ",
+    let block = pane(Line::from(Span::styled(
+        format!(
+            " permission requested — {} ",
             short_id(&notice.session_id.to_string())
-        ))
-        .border_style(Style::default().fg(Color::Magenta));
+        ),
+        THEME.title,
+    )))
+    .border_style(THEME.warning);
     frame.render_widget(Paragraph::new(lines).block(block), rect);
-}
-
-/// One event → one rendered line (wrapping handles overflow).
-fn event_line(ev: &Event) -> Line<'static> {
-    let ts = Span::styled(
-        ev.ts.format("%H:%M:%S").to_string(),
-        Style::default().fg(Color::DarkGray),
-    );
-    let body: Vec<Span> = match &ev.kind {
-        EventKind::StateChanged { from, to } => {
-            let (from_g, _) = App::badge(from);
-            let (to_g, to_label) = App::badge(to);
-            vec![
-                Span::styled(format!("{from_g}→{to_g}"), badge_color(to)),
-                Span::styled(format!(" {to_label}"), Style::default().fg(Color::DarkGray)),
-            ]
-        }
-        EventKind::SessionUpdate(v) => {
-            vec![Span::raw(session_update_text(v))]
-        }
-        EventKind::FileEdited { path } => vec![
-            Span::styled("edited ", Style::default().fg(Color::Blue)),
-            Span::raw(path.display().to_string()),
-        ],
-        EventKind::AgentExited { code } => vec![Span::styled(
-            format!("agent exited (code {code:?})"),
-            Style::default().fg(Color::Red),
-        )],
-        EventKind::Orchestrator(msg) => vec![Span::styled(
-            msg.clone(),
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::ITALIC),
-        )],
-    };
-    let mut spans = vec![ts, Span::raw(" ")];
-    spans.extend(body);
-    Line::from(spans)
 }
 
 /// Pull human-readable text out of an opaque ACP `session/update` JSON
 /// blob: known shapes get their `text` payload, everything else falls
-/// back to a compact, truncated dump.
+/// back to a compact, truncated dump. (Kept for the compact/relay path
+/// and tests; the rich renderer lives in [`session_update_block`].)
 fn session_update_text(value: &serde_json::Value) -> String {
     let update = value.get("update").unwrap_or(value);
     let tag = update.get("sessionUpdate").and_then(|t| t.as_str());
@@ -513,14 +1063,15 @@ fn session_update_text(value: &serde_json::Value) -> String {
     }
 }
 
-/// Status bar: mode indicator + transient status message or key hints.
+/// Status bar: mode chip left, transient status message, key hints
+/// parked at the right edge — all deliberately quiet.
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    let (mode_label, mode_color) = match app.mode {
-        InputMode::Normal => ("normal", Color::Green),
-        InputMode::Editing => ("editing", Color::Yellow),
-        InputMode::RelayPick => ("relay", Color::Magenta),
-        InputMode::NewSession => ("new session", Color::Cyan),
-        InputMode::Permission => ("permission", Color::Magenta),
+    let mode_label = match app.mode {
+        InputMode::Normal => "normal",
+        InputMode::Editing => "editing",
+        InputMode::RelayPick => "relay",
+        InputMode::NewSession => "new",
+        InputMode::Permission => "permission",
     };
     let hints = match app.mode {
         InputMode::Normal => {
@@ -534,29 +1085,41 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         InputMode::NewSession => "enter select · esc back",
         InputMode::Permission => "auto-denied by the daemon · any key dismisses",
     };
+
     let mut spans = vec![
-        Span::styled(
-            format!(" {mode_label} "),
-            Style::default()
-                .fg(Color::Black)
-                .bg(mode_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
+        Span::styled(" ● ", THEME.mode(app.mode)),
+        Span::styled(mode_label, THEME.dim),
     ];
-    match &app.status {
-        Some(status) => spans.push(Span::styled(
-            status.clone(),
-            Style::default().fg(Color::Yellow),
-        )),
-        None => spans.push(Span::styled(hints, Style::default().fg(Color::DarkGray))),
+    if let Some(status) = &app.status {
+        spans.push(Span::styled("  │ ", THEME.faint));
+        spans.push(Span::styled(status.clone(), THEME.warning));
     }
+    // Right-align the hints: pad the gap after the left-side spans;
+    // a saturated pad still needs one space or label and hints collide.
+    let left: Line = Line::from(spans.clone());
+    let hint = Span::styled(hints, THEME.faint);
+    let pad = (area.width as usize)
+        .saturating_sub(left.width() + hint.width() + 1)
+        .max(1);
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(hint);
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Bottom input box; shows the editing cursor in `Editing` mode.
+/// Bottom input box; title + border track the mode (focused while
+/// `Editing`), and the buffer tail-scrolls so the cursor stays visible.
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default().borders(Borders::ALL).title("prompt");
+    let focused = app.mode == InputMode::Editing;
+    let agent = app.selected_session().map(|v| v.agent_name.as_str());
+    let title = match agent {
+        Some(name) => format!(" prompt → {name} "),
+        None => " prompt ".to_string(),
+    };
+    let block = pane(Line::from(Span::styled(title, THEME.title))).border_style(if focused {
+        THEME.border_focus
+    } else {
+        THEME.border
+    });
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -570,8 +1133,20 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         app.input.clone()
     };
-    frame.render_widget(Paragraph::new(shown.as_str()), inner);
-    if app.mode == InputMode::Editing {
+    if shown.is_empty() {
+        let hint = if focused {
+            "type a prompt…"
+        } else {
+            "i — write a prompt"
+        };
+        frame.render_widget(Paragraph::new(Span::styled(hint, THEME.faint)), inner);
+    } else {
+        frame.render_widget(
+            Paragraph::new(Span::styled(shown.as_str(), THEME.text)),
+            inner,
+        );
+    }
+    if focused {
         frame.set_cursor_position(Position::new(
             inner.x + shown.chars().count() as u16,
             inner.y,
@@ -584,10 +1159,12 @@ mod tests {
     use super::*;
     use crate::app::PermissionNotice;
     use agentmux_core::{
-        AgentId, AgentProfile, Project, ProjectId, Session, SessionId, Workspace, WorkspaceId,
+        AgentId, AgentProfile, Project, ProjectId, Session, SessionId, SessionState, Workspace,
+        WorkspaceId,
     };
     use chrono::Utc;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Color;
     use ratatui::Terminal;
 
     fn project(name: &str) -> Project {
@@ -647,6 +1224,21 @@ mod tests {
             .collect()
     }
 
+    /// Foreground color of the cell where `needle` first appears —
+    /// lets render tests assert on *style*, not just text.
+    fn fg_at(backend: &TestBackend, needle: &str) -> Option<Color> {
+        let buf = backend.buffer();
+        let w = buf.area.width as usize;
+        for row in buf.content.chunks(w) {
+            let line: String = row.iter().map(|c| c.symbol()).collect();
+            if let Some(pos) = line.find(needle) {
+                let cell_off = line[..pos].chars().count();
+                return Some(row[cell_off].fg);
+            }
+        }
+        None
+    }
+
     /// Ratatui `TestBackend` buffer assertion: rendered UI contains the
     /// workspace groups, badge glyphs and the event text.
     #[test]
@@ -701,7 +1293,36 @@ mod tests {
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(terminal.backend());
         assert!(text.contains("no sessions"), "{text}");
+        assert!(text.contains("new session"), "empty hint keys: {text}");
+        assert!(text.contains("quit"), "empty hint keys: {text}");
         assert!(text.contains("events"));
+        assert!(
+            text.contains("no session selected"),
+            "event pane hint: {text}"
+        );
+    }
+
+    /// A selected session with an empty log gets a waiting hint, not a
+    /// blank pane.
+    #[test]
+    fn draw_empty_events_shows_waiting() {
+        let ws = workspace("w");
+        let s = session(ws.id, SessionState::Ready);
+        let app = App::new(
+            vec![],
+            vec![ws],
+            vec![SessionView {
+                session: s,
+                agent_name: "claude".into(),
+                workspace_name: "w".into(),
+            }],
+            vec![],
+        );
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend());
+        assert!(text.contains("waiting for output"), "{text}");
     }
 
     /// A nil-session-id Orchestrator notice (the client's lag warning)
@@ -744,7 +1365,7 @@ mod tests {
         assert!(session_update_text(&wrapped).contains("[tool_call]"));
     }
 
-    // --- Task 14 panes/overlays ----------------------------------------------
+    // --- structured event rendering --------------------------------------
 
     /// One session of workspace `w`, its events preloaded.
     fn app_with_events(kinds: Vec<EventKind>) -> App {
@@ -767,6 +1388,180 @@ mod tests {
         }
         app
     }
+
+    /// Message chunks render as prose under an agent header — and a run
+    /// of consecutive chunks coalesces into ONE header (streamed chunks
+    /// are fragments, not messages).
+    #[test]
+    fn message_chunks_render_prose_under_one_header() {
+        let app = app_with_events(vec![
+            EventKind::SessionUpdate(serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "hello "}
+            })),
+            EventKind::SessionUpdate(serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "world"}
+            })),
+        ]);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend());
+        assert!(text.contains("hello world"), "merged prose: {text}");
+        // The agent name + double-space + timestamp header appears once:
+        // the two chunks coalesced under a single header.
+        assert_eq!(
+            text.matches("claude  ").count(),
+            1,
+            "one header for the merged chunk run: {text}"
+        );
+    }
+
+    /// A `tool_call` update becomes a card: `⚙` header with title, and
+    /// the status word carries the status color (completed → success).
+    #[test]
+    fn tool_call_renders_status_colored_card() {
+        let app = app_with_events(vec![EventKind::SessionUpdate(serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-1",
+            "title": "mock edit of src/lib.rs",
+            "kind": "edit",
+            "status": "completed",
+            "locations": [{"path": "src/lib.rs"}]
+        }))]);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend());
+        assert!(text.contains("⚙"), "tool card glyph: {text}");
+        assert!(text.contains("mock edit of src/lib.rs"), "{text}");
+        assert!(text.contains("completed"), "{text}");
+        assert!(text.contains("src/lib.rs"), "location line: {text}");
+        assert_eq!(
+            fg_at(terminal.backend(), "completed"),
+            THEME.success.fg,
+            "completed status in the success hue"
+        );
+    }
+
+    /// A `diff` content item paints `-` old lines in the error hue and
+    /// `+` new lines in the success hue, under a highlighted path.
+    #[test]
+    fn diff_payload_colors_plus_minus_lines() {
+        let app = app_with_events(vec![EventKind::SessionUpdate(serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-2",
+            "title": "Edit src/lib.rs",
+            "status": "completed",
+            "content": [{
+                "type": "diff",
+                "path": "src/lib.rs",
+                "oldText": "let x = 1;",
+                "newText": "let x = 2;"
+            }]
+        }))]);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend());
+        assert!(text.contains("-let x = 1;"), "{text}");
+        assert!(text.contains("+let x = 2;"), "{text}");
+        assert_eq!(fg_at(terminal.backend(), "+let"), THEME.success.fg);
+        assert_eq!(fg_at(terminal.backend(), "-let"), THEME.error.fg);
+    }
+
+    /// Unified-diff-looking *text* also gets +/- coloring — agents paste
+    /// patches into messages all the time.
+    #[test]
+    fn pasted_patch_text_colors_diff_lines() {
+        let app = app_with_events(vec![EventKind::SessionUpdate(serde_json::json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new"}
+        }))]);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        assert_eq!(fg_at(terminal.backend(), "+new"), THEME.success.fg);
+        assert_eq!(fg_at(terminal.backend(), "-old"), THEME.error.fg);
+    }
+
+    /// State transitions read as small dim `from → to` lines.
+    #[test]
+    fn state_change_renders_transition_line() {
+        let app = app_with_events(vec![EventKind::StateChanged {
+            from: SessionState::Ready,
+            to: SessionState::Prompting,
+        }]);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend());
+        assert!(text.contains("ready → prompting"), "{text}");
+    }
+
+    /// A permission-request orchestrator note becomes a warning banner,
+    /// not raw JSON.
+    #[test]
+    fn permission_event_renders_warning_banner() {
+        let app = app_with_events(vec![EventKind::Orchestrator(
+            r#"permission-request: {"toolCall":{"title":"Write src/x.rs"},"options":[{"name":"reject"}]}"#
+                .into(),
+        )]);
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend());
+        assert!(text.contains("permission requested"), "{text}");
+        assert!(!text.contains("toolCall"), "no raw JSON: {text}");
+        assert_eq!(
+            fg_at(terminal.backend(), "permission requested"),
+            THEME.warning.fg,
+        );
+    }
+
+    /// Activity on a non-selected session marks it `•` until viewed.
+    #[test]
+    fn unread_marker_on_inactive_sessions() {
+        let ws = workspace("w");
+        let a = session(ws.id, SessionState::Ready);
+        let b = session(ws.id, SessionState::Ready);
+        let b_id = b.id;
+        let mut app = App::new(
+            vec![],
+            vec![ws],
+            vec![
+                SessionView {
+                    session: a,
+                    agent_name: "claude".into(),
+                    workspace_name: "w".into(),
+                },
+                SessionView {
+                    session: b,
+                    agent_name: "codex".into(),
+                    workspace_name: "w".into(),
+                },
+            ],
+            vec![],
+        );
+        app.handle_event(Event {
+            session_id: b_id,
+            seq: 1,
+            ts: Utc::now(),
+            kind: EventKind::Orchestrator("ping".into()),
+        });
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend());
+        assert!(text.contains("•"), "unread marker: {text}");
+
+        // Selecting it clears the marker.
+        app.select_next();
+        assert!(!app.unread.contains(&b_id));
+    }
+
+    // --- Task 14 panes/overlays ----------------------------------------------
 
     #[test]
     fn wizard_overlay_lists_projects() {
@@ -827,7 +1622,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(terminal.backend());
-        assert!(text.contains("files touched"), "{text}");
+        assert!(text.contains("files"), "{text}");
         assert!(text.contains("src/lib.rs"), "{text}");
     }
 
@@ -876,5 +1671,166 @@ mod tests {
             text.contains("NEWEST-TAIL"),
             "newest event must be visible: {text}"
         );
+    }
+
+    /// Perf bound: a 10k-event log must not make drawing expensive — the
+    /// reverse scan stops once the viewport is covered. Generous time
+    /// ceiling; the point is catching a regression to O(log) work.
+    #[test]
+    fn events_pane_scan_stays_viewport_bounded() {
+        let ws = workspace("w");
+        let s = session(ws.id, SessionState::Ready);
+        let sid = s.id;
+        let mut app = App::new(
+            vec![],
+            vec![ws],
+            vec![SessionView {
+                session: s,
+                agent_name: "claude".into(),
+                workspace_name: "w".into(),
+            }],
+            vec![],
+        );
+        for i in 0..10_000 {
+            app.handle_event(Event {
+                session_id: sid,
+                seq: i,
+                ts: Utc::now(),
+                kind: EventKind::SessionUpdate(serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": format!("chunk {i} lorem ipsum dolor sit amet")}
+                })),
+            });
+        }
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            terminal.draw(|f| draw(f, &app)).unwrap();
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "10 draws over a 10k-event log took {elapsed:?} — viewport bound regressed"
+        );
+        let text = buffer_text(terminal.backend());
+        assert!(text.contains("chunk 9999"), "newest chunk renders: {text}");
+    }
+
+    /// Scratch: eyeball a representative frame.
+    #[test]
+    #[ignore]
+    fn print_frame() {
+        let ws = workspace("alpha");
+        let ws2 = workspace("beta");
+        let s1 = session(ws.id, SessionState::Ready);
+        let s2 = session(ws.id, SessionState::Prompting);
+        let s3 = session(ws2.id, SessionState::Done);
+        let sid = s1.id;
+        let sid2 = s2.id;
+        let sid3 = s3.id;
+        let mut app = App::new(
+            vec![],
+            vec![ws, ws2],
+            vec![
+                SessionView {
+                    session: s1,
+                    agent_name: "claude".into(),
+                    workspace_name: "alpha".into(),
+                },
+                SessionView {
+                    session: s2,
+                    agent_name: "codex".into(),
+                    workspace_name: "alpha".into(),
+                },
+                SessionView {
+                    session: s3,
+                    agent_name: "pi".into(),
+                    workspace_name: "beta".into(),
+                },
+            ],
+            vec![],
+        );
+        let kinds = vec![
+            EventKind::StateChanged {
+                from: SessionState::Ready,
+                to: SessionState::Prompting,
+            },
+            EventKind::SessionUpdate(serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "I'll refactor the renderer to use "}
+            })),
+            EventKind::SessionUpdate(serde_json::json!({
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "a bounded reverse scan."}
+            })),
+            EventKind::SessionUpdate(serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-1", "title": "Edit tui/src/ui.rs",
+                "kind": "edit", "status": "in_progress",
+                "locations": [{"path": "tui/src/ui.rs", "line": 42}],
+            })),
+            EventKind::SessionUpdate(serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-2", "title": "Write theme.rs",
+                "status": "completed",
+                "content": [{"type": "diff", "path": "tui/src/theme.rs",
+                    "oldText": "const FG: u8 = 1;", "newText": "const FG: u8 = 2;"}]
+            })),
+            EventKind::Orchestrator("permission-request: {\"toolCall\":{\"title\":\"Write src/x.rs\"},\"options\":[{\"name\":\"reject\"}]}".into()),
+            EventKind::Orchestrator("event stream lagged, skipped 3".into()),
+        ];
+        for (seq, kind) in kinds.into_iter().enumerate() {
+            app.handle_event(Event {
+                session_id: sid,
+                seq: seq as u64 + 1,
+                ts: Utc::now(),
+                kind,
+            });
+        }
+        app.permission = None;
+        app.mode = InputMode::Normal;
+        // Activity on other sessions → unread markers.
+        app.handle_event(Event {
+            session_id: sid2,
+            seq: 9,
+            ts: Utc::now(),
+            kind: EventKind::Orchestrator("bg".into()),
+        });
+        app.handle_event(Event {
+            session_id: sid3,
+            seq: 9,
+            ts: Utc::now(),
+            kind: EventKind::Orchestrator("bg2".into()),
+        });
+
+        let backend = TestBackend::new(90, 26);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let w = buf.area.width as usize;
+        for row in buf.content.chunks(w) {
+            let line: String = row.iter().map(|c| c.symbol()).collect();
+            println!("{line}");
+        }
+    }
+
+    /// Scratch: eyeball the wizard overlay.
+    #[test]
+    #[ignore]
+    fn print_wizard() {
+        let proj = project("smoke");
+        let ws = workspace_in(proj.id, "ws1");
+        let mut app = App::new(vec![proj], vec![ws], vec![], vec![agent("mock")]);
+        app.start_wizard();
+        let backend = TestBackend::new(90, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let w = buf.area.width as usize;
+        for row in buf.content.chunks(w) {
+            let line: String = row.iter().map(|c| c.symbol()).collect();
+            println!("{line}");
+        }
     }
 }

@@ -14,6 +14,7 @@
 mod app;
 mod input;
 mod newsession;
+mod theme;
 mod ui;
 
 use std::error::Error;
@@ -396,6 +397,7 @@ fn apply_msg(app: &mut App, msg: UiMsg) {
             }
             let index = app.add_session(*view);
             app.selected = index;
+            app.mark_selected_viewed();
             app.set_status("session created");
         }
     }
