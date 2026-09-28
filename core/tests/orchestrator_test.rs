@@ -130,7 +130,7 @@ fn setup() -> TestEnv {
 }
 
 /// `create_workspace` + `create_session` against the mock agent.
-async fn new_session(env: &mut TestEnv, workspace_name: &str) -> (WorkspaceId, SessionId) {
+async fn new_session(env: &TestEnv, workspace_name: &str) -> (WorkspaceId, SessionId) {
     let ws = env
         .orch
         .create_workspace(env.project_id, workspace_name, "main")
@@ -233,8 +233,8 @@ fn chunk_text(e: &Event, session_id: SessionId) -> Option<&str> {
 /// session id and a nonzero seq), and the session ends back at `Ready`.
 #[tokio::test]
 async fn prompt_roundtrip_streams_updates_and_returns_to_ready() {
-    let mut env = setup();
-    let (_ws, sid) = new_session(&mut env, "ws1").await;
+    let env = setup();
+    let (_ws, sid) = new_session(&env, "ws1").await;
     assert_eq!(
         env.orch.get_session(sid).unwrap().unwrap().state,
         SessionState::Ready
@@ -285,8 +285,8 @@ async fn prompt_roundtrip_streams_updates_and_returns_to_ready() {
 /// lock; a second `prompt` fails fast with `session busy`.
 #[tokio::test]
 async fn second_prompt_while_prompting_is_session_busy() {
-    let mut env = setup();
-    let (_ws, sid) = new_session(&mut env, "ws1").await;
+    let env = setup();
+    let (_ws, sid) = new_session(&env, "ws1").await;
     let orch = Arc::new(env.orch);
     // `env.data`/`env._repo` keep the tempdirs alive to scope end.
 
@@ -320,8 +320,8 @@ async fn second_prompt_while_prompting_is_session_busy() {
 /// `unless_terminal`).
 #[tokio::test]
 async fn kill_during_prompt_ends_done_and_is_never_resurrected() {
-    let mut env = setup();
-    let (_ws, sid) = new_session(&mut env, "ws1").await;
+    let env = setup();
+    let (_ws, sid) = new_session(&env, "ws1").await;
     let orch = Arc::new(env.orch);
 
     // "hang" keeps the prompt in flight while `kill` lands.
@@ -366,8 +366,8 @@ async fn kill_during_prompt_ends_done_and_is_never_resurrected() {
 /// JSONL event log exists with content.
 #[tokio::test]
 async fn crash_prompt_marks_error_and_persists_events() {
-    let mut env = setup();
-    let (_ws, sid) = new_session(&mut env, "ws1").await;
+    let env = setup();
+    let (_ws, sid) = new_session(&env, "ws1").await;
 
     let mut rx = env.orch.subscribe();
     let result = prompt(&env.orch, sid, "please crash now").await;
@@ -411,7 +411,7 @@ async fn crash_prompt_marks_error_and_persists_events() {
 /// preamble — visible in the mock's echo of the prompt text.
 #[tokio::test]
 async fn sibling_prompt_includes_shared_context_preamble() {
-    let mut env = setup();
+    let env = setup();
     let ws = env
         .orch
         .create_workspace(env.project_id, "shared", "main")
@@ -457,7 +457,7 @@ async fn sibling_prompt_includes_shared_context_preamble() {
 /// agent that was probed unavailable.
 #[tokio::test]
 async fn create_session_rejects_unknown_or_unavailable_agent() {
-    let mut env = setup();
+    let env = setup();
     let ws = env
         .orch
         .create_workspace(env.project_id, "ws1", "main")
@@ -489,8 +489,8 @@ async fn create_session_rejects_unknown_or_unavailable_agent() {
 /// session to `Ready`, and it accepts prompts again.
 #[tokio::test]
 async fn resume_done_session_respawns_to_ready() {
-    let mut env = setup();
-    let (_ws, sid) = new_session(&mut env, "ws1").await;
+    let env = setup();
+    let (_ws, sid) = new_session(&env, "ws1").await;
 
     env.orch.kill(sid).await.expect("kill should succeed");
     assert_eq!(

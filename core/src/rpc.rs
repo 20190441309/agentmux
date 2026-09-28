@@ -183,6 +183,8 @@ pub struct RpcError {
 impl RpcError {
     /// Invalid JSON was received by the server.
     pub const PARSE_ERROR: i64 = -32700;
+    /// The JSON is valid but the value is not a valid Request object.
+    pub const INVALID_REQUEST: i64 = -32600;
     /// The method does not exist / is not available.
     pub const METHOD_NOT_FOUND: i64 = -32601;
     /// Invalid method parameter(s).
@@ -199,6 +201,10 @@ impl RpcError {
 
     pub fn parse_error(message: impl Into<String>) -> Self {
         Self::new(Self::PARSE_ERROR, message)
+    }
+
+    pub fn invalid_request(message: impl Into<String>) -> Self {
+        Self::new(Self::INVALID_REQUEST, message)
     }
 
     pub fn method_not_found(method: &str) -> Self {
@@ -515,6 +521,7 @@ mod tests {
     #[test]
     fn rpc_error_roundtrips_and_standard_codes_match_jsonrpc() {
         assert_eq!(RpcError::PARSE_ERROR, -32700);
+        assert_eq!(RpcError::INVALID_REQUEST, -32600);
         assert_eq!(RpcError::METHOD_NOT_FOUND, -32601);
         assert_eq!(RpcError::INVALID_PARAMS, -32602);
         assert_eq!(RpcError::INTERNAL_ERROR, -32603);

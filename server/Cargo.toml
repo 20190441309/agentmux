@@ -1,0 +1,21 @@
+[package]
+name = "agentmux-server"
+version = "0.1.0"
+edition.workspace = true
+description = "agentmux daemon: newline-delimited JSON-RPC 2.0 over a unix socket, fronting the orchestrator"
+
+[dependencies]
+agentmux-core = { path = "../core" }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = "1"
+serde_json = "1"
+# rt-multi-thread for `#[tokio::main]`'s default flavor — the daemon
+# wants it anyway (concurrent connections + the blocking pool behind the
+# orchestrator's adapter spawns).
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }

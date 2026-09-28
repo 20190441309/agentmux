@@ -47,19 +47,33 @@ impl AgentRegistry {
         self.profiles.iter().find(|p| &p.id == id)
     }
 
+    /// Insert or update a profile at runtime (`agent/register`).
+    ///
+    /// Duplicate ids collapse last-wins at their first-seen position — the
+    /// same rule [`from_config`](Self::from_config) applies.
+    pub fn register(&mut self, profile: AgentProfile) {
+        match self.profiles.iter_mut().find(|p| p.id == profile.id) {
+            Some(slot) => *slot = profile,
+            None => self.profiles.push(profile),
+        }
+    }
+
+    /// A copy of `profile` with `available` set by probing its adapter's
+    /// `command` — the single-profile version of [`probe`](Self::probe).
+    pub fn probe_profile(profile: &AgentProfile) -> AgentProfile {
+        AgentProfile {
+            available: command_exists(adapter_command(&profile.adapter)),
+            ..profile.clone()
+        }
+    }
+
     /// A copy of the registry's profiles with `available` set by probing each
     /// adapter's `command`.
     ///
     /// Probing is a pure filesystem lookup — no agent process is spawned, so
     /// it cannot hang or produce side effects.
     pub fn probe(&self) -> Vec<AgentProfile> {
-        self.profiles
-            .iter()
-            .map(|p| AgentProfile {
-                available: command_exists(adapter_command(&p.adapter)),
-                ..p.clone()
-            })
-            .collect()
+        self.profiles.iter().map(Self::probe_profile).collect()
     }
 }
 

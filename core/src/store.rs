@@ -102,6 +102,21 @@ impl Store {
             .context("failed to read project")
     }
 
+    /// Delete a project row. Returns `false` when no project with that id
+    /// existed. Fails with a foreign-key error while workspaces still
+    /// reference it — callers should remove workspaces first (the
+    /// orchestrator checks this and produces a friendlier message).
+    pub fn delete_project(&self, id: ProjectId) -> Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM projects WHERE id = ?1",
+                params![id.to_string()],
+            )
+            .with_context(|| format!("failed to delete project {id}"))?;
+        Ok(n == 1)
+    }
+
     /// All projects, in insertion order.
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let mut stmt = self
@@ -165,6 +180,37 @@ impl Store {
             .query_map(params![project_id.to_string()], workspace_from_row)
             .context("failed to list workspaces")?;
         collect_rows(rows)
+    }
+
+    /// Delete a workspace row. Returns `false` when no workspace with that
+    /// id existed. Fails with a foreign-key error while sessions still
+    /// reference it — the orchestrator deletes session rows first.
+    pub fn delete_workspace(&self, id: WorkspaceId) -> Result<bool> {
+        let n = self
+            .conn
+            .execute(
+                "DELETE FROM workspaces WHERE id = ?1",
+                params![id.to_string()],
+            )
+            .with_context(|| format!("failed to delete workspace {id}"))?;
+        Ok(n == 1)
+    }
+
+    /// Delete every session row of `workspace_id`, returning their ids so
+    /// the caller can drop the per-session JSONL logs.
+    pub fn delete_workspace_sessions(&self, workspace_id: WorkspaceId) -> Result<Vec<SessionId>> {
+        let ids = self
+            .list_sessions(workspace_id)?
+            .into_iter()
+            .map(|s| s.id)
+            .collect::<Vec<_>>();
+        self.conn
+            .execute(
+                "DELETE FROM sessions WHERE workspace_id = ?1",
+                params![workspace_id.to_string()],
+            )
+            .with_context(|| format!("failed to delete sessions of workspace {workspace_id}"))?;
+        Ok(ids)
     }
 
     // ----- agent profiles -------------------------------------------------
@@ -379,6 +425,17 @@ impl Store {
         }
         events.sort_by_key(|e| e.seq);
         Ok(events)
+    }
+
+    /// Remove `session_id`'s JSONL event log, if present. A missing log is
+    /// not an error (a session may have produced no events).
+    pub fn delete_event_log(&self, session_id: SessionId) -> Result<()> {
+        let path = self.event_log_path(session_id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("failed to remove {}", path.display())),
+        }
     }
 
     /// Path of `session_id`'s JSONL log.

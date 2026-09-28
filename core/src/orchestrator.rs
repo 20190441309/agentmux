@@ -49,7 +49,8 @@ use tokio::task::JoinHandle;
 use crate::collab;
 use crate::id::{AgentId, ProjectId, SessionId, WorkspaceId};
 use crate::model::{
-    AdapterKind, AgentProfile, Event, EventKind, Session, SessionRef, SessionState, Workspace,
+    AdapterKind, AgentProfile, Event, EventKind, Project, Session, SessionRef, SessionState,
+    Workspace,
 };
 use crate::registry::AgentRegistry;
 use crate::store::Store;
@@ -252,6 +253,35 @@ impl EventSink {
         self.ingest_locked(&store, &mut ev);
         Ok(true)
     }
+
+    /// Transition only while the session is still `Done`/`Error` — one
+    /// atomic "still resumable" check-and-set under the store lock. This
+    /// is what lets `resume` leave a terminal state *without* opening a
+    /// TOCTOU window a racing `kill` could be clobbered by.
+    fn transition_out_of_terminal(&self, session_id: SessionId, to: SessionState) -> Result<bool> {
+        let store = self.store.lock().unwrap();
+        let session = store
+            .get_session(session_id)?
+            .ok_or_else(|| anyhow!("no such session {session_id}"))?;
+        if !matches!(session.state, SessionState::Done | SessionState::Error(_)) {
+            return Ok(false);
+        }
+        if session.state == to {
+            return Ok(true);
+        }
+        store.update_session_state(session_id, &to)?;
+        let mut ev = Event {
+            session_id,
+            seq: 0,
+            ts: Utc::now(),
+            kind: EventKind::StateChanged {
+                from: session.state,
+                to,
+            },
+        };
+        self.ingest_locked(&store, &mut ev);
+        Ok(true)
+    }
 }
 
 /// A session's live connection plus its adapter-level session id —
@@ -280,6 +310,18 @@ struct SessionSlot {
     agent_name: String,
 }
 
+impl SessionSlot {
+    fn new(worktree_path: PathBuf, agent_name: String) -> SessionSlot {
+        SessionSlot {
+            conn: Mutex::new(None),
+            prompt_lock: AsyncMutex::new(()),
+            fanout: Mutex::new(None),
+            worktree_path,
+            agent_name,
+        }
+    }
+}
+
 /// The agentmux session orchestrator.
 ///
 /// Cheap to hold behind `Arc`: all shared state is already
@@ -288,7 +330,9 @@ struct SessionSlot {
 /// safe to call concurrently.
 pub struct Orchestrator {
     sink: EventSink,
-    registry: AgentRegistry,
+    /// `Mutex` so `agent/register` can add profiles at runtime through
+    /// `&self`. Held for map operations only, never across `.await`.
+    registry: Mutex<AgentRegistry>,
     sessions: Mutex<HashMap<SessionId, Arc<SessionSlot>>>,
     data_dir: PathBuf,
 }
@@ -304,7 +348,7 @@ impl Orchestrator {
                 bus,
                 seqs: Arc::new(Mutex::new(HashMap::new())),
             },
-            registry,
+            registry: Mutex::new(registry),
             sessions: Mutex::new(HashMap::new()),
             data_dir,
         }
@@ -341,6 +385,132 @@ impl Orchestrator {
         self.sink.store.lock().unwrap().read_events(session_id)
     }
 
+    /// Number of sessions with a live slot — the `sessions` field of
+    /// `server/status`.
+    pub fn session_count(&self) -> usize {
+        self.sessions.lock().unwrap().len()
+    }
+
+    /// Register `root_path` as a [`Project`] (`project/register`).
+    ///
+    /// `root_path` must be an existing directory; `name` defaults to the
+    /// directory's final component (or the whole path when it has none,
+    /// e.g. `/`).
+    pub fn register_project(&self, root_path: PathBuf, name: Option<String>) -> Result<Project> {
+        ensure!(
+            root_path.is_dir(),
+            "project root {} is not an existing directory",
+            root_path.display()
+        );
+        let name = name
+            .or_else(|| {
+                root_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| root_path.display().to_string());
+        let project = Project {
+            id: ProjectId::new(),
+            root_path,
+            name,
+        };
+        self.sink.store.lock().unwrap().insert_project(&project)?;
+        Ok(project)
+    }
+
+    /// All registered projects (`project/list`).
+    pub fn list_projects(&self) -> Result<Vec<Project>> {
+        self.sink.store.lock().unwrap().list_projects()
+    }
+
+    /// Remove a project (`project/remove`). Fails while it still owns
+    /// workspaces — remove them first via [`remove_workspace`](Self::remove_workspace).
+    /// Returns `false` when no project with that id existed.
+    pub fn remove_project(&self, project_id: ProjectId) -> Result<bool> {
+        let store = self.sink.store.lock().unwrap();
+        let workspaces = store.list_workspaces(project_id)?;
+        ensure!(
+            workspaces.is_empty(),
+            "project {project_id} still has {} workspace(s); remove them first",
+            workspaces.len()
+        );
+        store.delete_project(project_id)
+    }
+
+    /// All workspaces of a project (`workspace/list`).
+    pub fn list_workspaces(&self, project_id: ProjectId) -> Result<Vec<Workspace>> {
+        self.sink.store.lock().unwrap().list_workspaces(project_id)
+    }
+
+    /// Remove a workspace (`workspace/remove`): tears down any remaining
+    /// session slots, deletes session rows + event logs, removes the git
+    /// worktree, then deletes the workspace record.
+    ///
+    /// Refuses while any of its sessions is live (not `Done`/`Error`) —
+    /// kill them first. Returns `false` when no workspace with that id
+    /// existed. Worktree removal runs after the record checks so a git
+    /// failure leaves the record intact and retryable.
+    pub fn remove_workspace(&self, workspace_id: WorkspaceId) -> Result<bool> {
+        let (workspace, sessions) = {
+            let store = self.sink.store.lock().unwrap();
+            let Some(workspace) = store.get_workspace(workspace_id)? else {
+                return Ok(false);
+            };
+            (workspace, store.list_sessions(workspace_id)?)
+        };
+        let live: Vec<&Session> = sessions
+            .iter()
+            .filter(|s| !matches!(s.state, SessionState::Done | SessionState::Error(_)))
+            .collect();
+        ensure!(
+            live.is_empty(),
+            "workspace {workspace_id} still has {} live session(s); kill them first",
+            live.len()
+        );
+
+        // Detach any lingering slots (e.g. a dead conn an Error session
+        // never closed) before deleting the rows out from under them.
+        for session in &sessions {
+            if let Some(slot) = self.sessions.lock().unwrap().remove(&session.id) {
+                Self::teardown_slot(&slot);
+            }
+        }
+
+        let repo_root = {
+            let store = self.sink.store.lock().unwrap();
+            store
+                .get_project(workspace.project_id)?
+                .ok_or_else(|| anyhow!("project {} is gone", workspace.project_id))?
+                .root_path
+        };
+        WorktreeManager::remove(&repo_root, &workspace.worktree_path)?;
+
+        let store = self.sink.store.lock().unwrap();
+        for session_id in store.delete_workspace_sessions(workspace_id)? {
+            let _ = store.delete_event_log(session_id); // best-effort
+        }
+        store.delete_workspace(workspace_id)
+    }
+
+    /// All configured agents with availability freshly probed
+    /// (`agent/list`).
+    pub fn list_agents(&self) -> Vec<AgentProfile> {
+        self.registry.lock().unwrap().probe()
+    }
+
+    /// Register (or update) an agent profile (`agent/register`).
+    ///
+    /// `available` is recomputed by probing `command` — the value the
+    /// caller supplied is ignored. The profile is also upserted into the
+    /// store so a restart could rehydrate it (config files remain the
+    /// primary source on boot).
+    pub fn register_agent(&self, profile: AgentProfile) -> Result<AgentProfile> {
+        let probed = AgentRegistry::probe_profile(&profile);
+        self.registry.lock().unwrap().register(probed.clone());
+        self.sink.store.lock().unwrap().upsert_agent(&probed)?;
+        Ok(probed)
+    }
+
     /// Look up a session's live slot.
     fn slot(&self, session_id: SessionId) -> Result<Arc<SessionSlot>> {
         self.sessions
@@ -355,7 +525,7 @@ impl Orchestrator {
     /// record. On failure after the worktree exists, it is removed so a
     /// failed workspace leaves no residue.
     pub async fn create_workspace(
-        &mut self,
+        &self,
         project_id: ProjectId,
         name: &str,
         base: &str,
@@ -397,16 +567,18 @@ impl Orchestrator {
     /// killed best-effort and the session record is left in `Error` state
     /// rather than deleted, so the failure is inspectable/resumable.
     pub async fn create_session(
-        &mut self,
+        &self,
         workspace_id: WorkspaceId,
         agent_id: &AgentId,
         prompt: Option<String>,
     ) -> Result<SessionId> {
         let profile = self
             .registry
+            .lock()
+            .unwrap()
             .get(agent_id)
-            .ok_or_else(|| anyhow!("unknown agent {agent_id}"))?
-            .clone();
+            .cloned()
+            .ok_or_else(|| anyhow!("unknown agent {agent_id}"))?;
         ensure!(profile.available, "agent {agent_id} is not available");
         let workspace = self
             .get_workspace(workspace_id)?
@@ -425,27 +597,40 @@ impl Orchestrator {
         {
             self.sink.store.lock().unwrap().insert_session(&session)?;
         }
-        let slot = Arc::new(SessionSlot {
-            conn: Mutex::new(None),
-            prompt_lock: AsyncMutex::new(()),
-            fanout: Mutex::new(None),
-            worktree_path: workspace.worktree_path.clone(),
-            agent_name: profile.name.clone(),
-        });
+        let slot = Arc::new(SessionSlot::new(
+            workspace.worktree_path.clone(),
+            profile.name.clone(),
+        ));
         self.sessions
             .lock()
             .unwrap()
             .insert(session_id, slot.clone());
 
-        self.sink
-            .transition(session_id, SessionState::Connecting, false)?;
+        // `unless_terminal`: an in-process `kill` racing setup owns `Done`
+        // already — don't start the connect at all (unreachable via the
+        // wire, where the id only exists after this method returns).
+        if !self
+            .sink
+            .transition(session_id, SessionState::Connecting, true)?
+        {
+            self.sessions.lock().unwrap().remove(&session_id);
+            bail!("session {session_id} was killed during setup");
+        }
         match self
             .connect(&profile, &workspace.worktree_path, session_id, &slot)
             .await
         {
             Ok(()) => {
-                self.sink
-                    .transition(session_id, SessionState::Ready, false)?;
+                // `unless_terminal`: a `kill` landing during `connect`
+                // already owns `Done` — tear the fresh conn down instead
+                // of resurrecting the session.
+                if !self
+                    .sink
+                    .transition(session_id, SessionState::Ready, true)?
+                {
+                    Self::teardown_slot(&slot);
+                    return Ok(session_id);
+                }
                 if let Some(text) = prompt {
                     // Errors from the initial prompt propagate — the
                     // session record (in `Error` or a settled state) is
@@ -665,6 +850,18 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Stop a slot's fan-out and close its conn — the shared teardown used
+    /// by `kill`, `resume` and the post-`connect` kill-race cleanup.
+    /// Idempotent; a slot may hold neither.
+    fn teardown_slot(slot: &SessionSlot) {
+        if let Some(handle) = slot.fanout.lock().unwrap().take() {
+            handle.abort();
+        }
+        if let Some(live) = slot.conn.lock().unwrap().take() {
+            live.conn.close();
+        }
+    }
+
     /// Terminate a session: mark it `Done`, then stop the fan-out and
     /// close the connection (the child dies via `kill_on_drop`).
     ///
@@ -684,12 +881,7 @@ impl Orchestrator {
 
         let transition = self.sink.transition(session_id, SessionState::Done, false);
         if let Ok(slot) = self.slot(session_id) {
-            if let Some(handle) = slot.fanout.lock().unwrap().take() {
-                handle.abort();
-            }
-            if let Some(live) = slot.conn.lock().unwrap().take() {
-                live.conn.close();
-            }
+            Self::teardown_slot(&slot);
         }
         // Propagate the store error only after teardown ran.
         transition?;
@@ -706,7 +898,7 @@ impl Orchestrator {
     /// session's history is not lost: it persists in the JSONL log,
     /// `seq` continues increasing, and clients can re-inject context via
     /// `prompt`'s `refs`.
-    pub async fn resume(&mut self, session_id: SessionId) -> Result<()> {
+    pub async fn resume(&self, session_id: SessionId) -> Result<()> {
         let (session, workspace) = {
             let store = self.sink.store.lock().unwrap();
             let session = store
@@ -723,9 +915,11 @@ impl Orchestrator {
         }
         let profile = self
             .registry
+            .lock()
+            .unwrap()
             .get(&session.agent_id)
-            .ok_or_else(|| anyhow!("agent {} is no longer configured", session.agent_id))?
-            .clone();
+            .cloned()
+            .ok_or_else(|| anyhow!("agent {} is no longer configured", session.agent_id))?;
         ensure!(
             profile.available,
             "agent {} is not available",
@@ -736,13 +930,10 @@ impl Orchestrator {
             // Defensive: a session row always gets a slot at creation, but
             // after a daemon restart only the store remains — recreate the
             // slot so resume works on rehydrated sessions too.
-            let slot = Arc::new(SessionSlot {
-                conn: Mutex::new(None),
-                prompt_lock: AsyncMutex::new(()),
-                fanout: Mutex::new(None),
-                worktree_path: workspace.worktree_path.clone(),
-                agent_name: profile.name.clone(),
-            });
+            let slot = Arc::new(SessionSlot::new(
+                workspace.worktree_path.clone(),
+                profile.name.clone(),
+            ));
             self.sessions
                 .lock()
                 .unwrap()
@@ -753,15 +944,16 @@ impl Orchestrator {
 
         // Best-effort teardown of whatever the slot still holds (an Error
         // session's dead conn, a Done session's leftover handle).
-        if let Some(handle) = slot.fanout.lock().unwrap().take() {
-            handle.abort();
-        }
-        if let Some(live) = slot.conn.lock().unwrap().take() {
-            live.conn.close();
-        }
+        Self::teardown_slot(&slot);
 
-        self.sink
-            .transition(session_id, SessionState::Connecting, false)?;
+        // Atomic "still terminal" check-and-set: a `kill` landing between
+        // the state check above and here must not be clobbered.
+        if !self
+            .sink
+            .transition_out_of_terminal(session_id, SessionState::Connecting)?
+        {
+            bail!("session {session_id} left a resumable state mid-resume");
+        }
         match self
             .connect(&profile, &workspace.worktree_path, session_id, &slot)
             .await
@@ -776,8 +968,15 @@ impl Orchestrator {
                             .into(),
                     ),
                 );
-                self.sink
-                    .transition(session_id, SessionState::Ready, false)?;
+                // `unless_terminal`: a `kill` racing the `connect` await
+                // owns the terminal state — tear the fresh conn down
+                // rather than resurrect.
+                if !self
+                    .sink
+                    .transition(session_id, SessionState::Ready, true)?
+                {
+                    Self::teardown_slot(&slot);
+                }
                 Ok(())
             }
             Err(e) => {
