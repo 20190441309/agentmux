@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "mock-agent", "server", "client"]
+members = ["core", "mock-agent", "server", "client", "tui"]
 
 [workspace.package]
 edition = "2021"
