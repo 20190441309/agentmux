@@ -162,22 +162,36 @@ struct EventSink {
 
 impl EventSink {
     /// Assign `ev.seq`, append it to the session's JSONL log and broadcast
-    /// it. Persistence is best-effort: a failed append must not wedge the
+    /// it — all under one store-lock hold so the JSONL/bus order of
+    /// concurrent writers can never invert vs. the order their state
+    /// writes landed (same critical section [`transition`] uses).
+    /// Persistence is best-effort: a failed append must not wedge the
     /// fan-out — the event still reaches bus subscribers.
+    ///
+    /// Lock order: `store` is always the outer lock; `seqs` is only ever
+    /// taken inside it (via [`Self::next_seq`]).
     fn ingest(&self, ev: &mut Event) {
-        ev.seq = {
-            let mut seqs = self.seqs.lock().unwrap();
-            let next = seqs.entry(ev.session_id).or_insert(0);
-            *next += 1;
-            *next
-        };
-        {
-            let _ = self.store.lock().unwrap().append_event(ev);
-            // TODO(observability): append failures are dropped on the
-            // floor — route through a logger once the crate has one. The
-            // seq is consumed either way and the event still broadcasts.
-        }
+        let store = self.store.lock().unwrap();
+        self.ingest_locked(&store, ev);
+    }
+
+    /// [`ingest`](Self::ingest) with the store lock already held.
+    fn ingest_locked(&self, store: &Store, ev: &mut Event) {
+        ev.seq = self.next_seq(ev.session_id);
+        let _ = store.append_event(ev);
+        // TODO(observability): append failures are dropped on the
+        // floor — route through a logger once the crate has one. The
+        // seq is consumed either way and the event still broadcasts.
         let _ = self.bus.send(ev.clone()); // lagging/no subscribers is fine
+    }
+
+    /// Next per-session seq. Only called while holding `store`, so
+    /// `seqs` is always the inner lock.
+    fn next_seq(&self, session_id: SessionId) -> u64 {
+        let mut seqs = self.seqs.lock().unwrap();
+        let next = seqs.entry(session_id).or_insert(0);
+        *next += 1;
+        *next
     }
 
     /// Build + ingest an orchestrator-produced event.
@@ -195,30 +209,48 @@ impl EventSink {
     /// Update the session's persisted state and emit a `StateChanged`
     /// event when the state actually changed.
     ///
+    /// Returns `true` when the session is in `to` afterwards (transition
+    /// applied, or it already was) and `false` when the transition was
+    /// skipped.
+    ///
     /// `unless_terminal`: skip the transition entirely when the session is
     /// already `Done`/`Error` — used by async epilogues (`prompt`, the
     /// fan-out's `AgentExited` handling) so a racing `kill` or a crash is
     /// never clobbered back to a live state.
+    ///
+    /// The DB write, seq assignment, JSONL append and the bus send all
+    /// happen inside the single store-lock hold: racing `&self`
+    /// transitions can never appear out of order on the bus or in the
+    /// event log vs. the order the state writes landed.
     fn transition(
         &self,
         session_id: SessionId,
         to: SessionState,
         unless_terminal: bool,
-    ) -> Result<()> {
-        let from = {
-            let store = self.store.lock().unwrap();
-            let session = store
-                .get_session(session_id)?
-                .ok_or_else(|| anyhow!("no such session {session_id}"))?;
-            let terminal = matches!(session.state, SessionState::Done | SessionState::Error(_));
-            if session.state == to || (unless_terminal && terminal) {
-                return Ok(());
-            }
-            store.update_session_state(session_id, &to)?;
-            session.state
+    ) -> Result<bool> {
+        let store = self.store.lock().unwrap();
+        let session = store
+            .get_session(session_id)?
+            .ok_or_else(|| anyhow!("no such session {session_id}"))?;
+        if session.state == to {
+            return Ok(true);
+        }
+        let terminal = matches!(session.state, SessionState::Done | SessionState::Error(_));
+        if unless_terminal && terminal {
+            return Ok(false);
+        }
+        store.update_session_state(session_id, &to)?;
+        let mut ev = Event {
+            session_id,
+            seq: 0,
+            ts: Utc::now(),
+            kind: EventKind::StateChanged {
+                from: session.state,
+                to,
+            },
         };
-        self.emit(session_id, EventKind::StateChanged { from, to });
-        Ok(())
+        self.ingest_locked(&store, &mut ev);
+        Ok(true)
     }
 }
 
@@ -535,8 +567,15 @@ impl Orchestrator {
             .ok_or_else(|| anyhow!("session {session_id} has no live connection"))?;
         let text = self.compose_prompt(&session, &text, &refs)?;
 
-        self.sink
-            .transition(session_id, SessionState::Prompting, false)?;
+        // `unless_terminal`: a `kill` landing between the liveness check
+        // and here already owns the terminal state — a `Prompting`
+        // transition must never resurrect it.
+        if !self
+            .sink
+            .transition(session_id, SessionState::Prompting, true)?
+        {
+            bail!("session {session_id} was terminated");
+        }
         let result = live.conn.prompt(&live.acp_session_id, text).await;
         match &result {
             Ok(()) => {
@@ -626,8 +665,13 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Terminate a session: stop the fan-out, mark the session `Done`,
-    /// then close the connection (the child dies via `kill_on_drop`).
+    /// Terminate a session: mark it `Done`, then stop the fan-out and
+    /// close the connection (the child dies via `kill_on_drop`).
+    ///
+    /// The `Done` transition runs first and teardown is unconditional:
+    /// a failing store write must not strand a live child process with
+    /// no fan-out draining it, and a conn spawned by a racing setup can
+    /// never survive past the kill.
     ///
     /// A caller-initiated kill produces no `AgentExited` from the conn —
     /// the worker is torn down before its exit watcher can report — so we
@@ -638,18 +682,17 @@ impl Orchestrator {
         self.get_session(session_id)?
             .ok_or_else(|| anyhow!("no such session {session_id}"))?;
 
+        let transition = self.sink.transition(session_id, SessionState::Done, false);
         if let Ok(slot) = self.slot(session_id) {
             if let Some(handle) = slot.fanout.lock().unwrap().take() {
                 handle.abort();
             }
-        }
-        self.sink
-            .transition(session_id, SessionState::Done, false)?;
-        if let Ok(slot) = self.slot(session_id) {
             if let Some(live) = slot.conn.lock().unwrap().take() {
                 live.conn.close();
             }
         }
+        // Propagate the store error only after teardown ran.
+        transition?;
         Ok(())
     }
 

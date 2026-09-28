@@ -313,6 +313,54 @@ async fn second_prompt_while_prompting_is_session_busy() {
     wait_state(&orch, sid, |s| matches!(s, SessionState::Done)).await;
 }
 
+/// Review-round-1 regression test: `kill` landing while a prompt is in
+/// flight must end in terminal `Done` — the interrupted turn errors out,
+/// but `Done` is never clobbered back to `Prompting`/`Error` (both the
+/// `prompt` path's `Prompting` transition and its error epilogue honour
+/// `unless_terminal`).
+#[tokio::test]
+async fn kill_during_prompt_ends_done_and_is_never_resurrected() {
+    let mut env = setup();
+    let (_ws, sid) = new_session(&mut env, "ws1").await;
+    let orch = Arc::new(env.orch);
+
+    // "hang" keeps the prompt in flight while `kill` lands.
+    let o2 = orch.clone();
+    let hanging = tokio::spawn(async move { o2.prompt(sid, "hang".into(), vec![]).await });
+    wait_state(&orch, sid, |s| matches!(s, SessionState::Prompting)).await;
+
+    orch.kill(sid).await.expect("kill should succeed");
+
+    // The interrupted turn surfaces an error — its conn is gone.
+    assert!(hanging.await.expect("prompt task panicked").is_err());
+
+    // Let the whole event pipeline settle, then pin the terminal state.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        orch.get_session(sid).unwrap().unwrap().state,
+        SessionState::Done,
+        "a killed session must stay Done — never Error, never resurrected"
+    );
+
+    // The persisted trail shows the `→ Done`, and nothing ever leaves
+    // it (no `Done → Prompting`, no `Done → Error` clobber).
+    let log = orch.read_events(sid).unwrap();
+    assert!(
+        log.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::StateChanged { to, .. } if matches!(to, SessionState::Done)
+        )),
+        "expected a → Done transition in {log:?}"
+    );
+    assert!(
+        !log.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::StateChanged { from, .. } if matches!(from, SessionState::Done)
+        )),
+        "no transition may leave Done: {log:?}"
+    );
+}
+
 /// ③ The `"crash"` trigger kills the agent mid-turn: the prompt errors,
 /// `AgentExited` reaches the bus, the session lands in `Error`, and the
 /// JSONL event log exists with content.
