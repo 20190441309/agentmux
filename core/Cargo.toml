@@ -1,0 +1,12 @@
+[package]
+name = "agentmux-core"
+version = "0.1.0"
+edition = "2021"
+description = "Shared domain model for agentmux: projects, workspaces, agent profiles, sessions and events"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
