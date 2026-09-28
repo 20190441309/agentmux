@@ -10,11 +10,13 @@ pub mod acp_conn;
 pub mod config;
 pub mod id;
 pub mod model;
+pub mod pi_rpc;
 pub mod registry;
 pub mod store;
 pub mod worktree;
 
 pub use acp_conn::AcpConn;
+pub use pi_rpc::PiConn;
 pub use anyhow::Result;
 pub use config::Config;
 pub use id::{AgentId, ProjectId, SessionId, WorkspaceId};
