@@ -12,13 +12,13 @@ pub mod collab;
 pub mod config;
 pub mod id;
 pub mod model;
+pub mod orchestrator;
 pub mod pi_rpc;
 pub mod registry;
 pub mod store;
 pub mod worktree;
 
 pub use acp_conn::AcpConn;
-pub use pi_rpc::PiConn;
 pub use anyhow::Result;
 pub use config::Config;
 pub use id::{AgentId, ProjectId, SessionId, WorkspaceId};
@@ -26,6 +26,8 @@ pub use model::{
     AdapterKind, AgentProfile, Event, EventKind, Project, Session, SessionRef, SessionState,
     Workspace,
 };
+pub use orchestrator::{Orchestrator, SpawnedConn};
+pub use pi_rpc::PiConn;
 pub use registry::AgentRegistry;
 pub use store::Store;
 pub use worktree::WorktreeManager;

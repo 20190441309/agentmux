@@ -27,7 +27,11 @@ const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn fake_pi_args() -> Vec<String> {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_pi.py");
-    assert!(script.is_file(), "fake pi stub missing at {}", script.display());
+    assert!(
+        script.is_file(),
+        "fake pi stub missing at {}",
+        script.display()
+    );
     vec![script.to_string_lossy().into_owned()]
 }
 
@@ -136,7 +140,9 @@ fn translate_line_with_u2028_u2029_in_payload_does_not_split() {
 fn translate_bash_execution_update_with_id_is_an_event() {
     let line = r#"{"type":"bash_execution_update","id":"agentmux-9","delta":"total 48\n"}"#;
     let event = translate_line(line).expect("bash update is an event");
-    assert!(matches!(event.kind, EventKind::SessionUpdate(v) if v["type"] == "bash_execution_update"));
+    assert!(
+        matches!(event.kind, EventKind::SessionUpdate(v) if v["type"] == "bash_execution_update")
+    );
 }
 
 /// Blank, non-JSON, and non-object lines produce no event.
@@ -214,9 +220,11 @@ async fn prompt_streams_events_and_resolves_on_agent_settled() {
         .await
         .expect("prompt should resolve once the run settles");
 
-    let events = recv_until(&mut rx, EVENT_TIMEOUT, |k| {
-        matches!(k, EventKind::SessionUpdate(v) if v["type"] == "agent_settled")
-    })
+    let events = recv_until(
+        &mut rx,
+        EVENT_TIMEOUT,
+        |k| matches!(k, EventKind::SessionUpdate(v) if v["type"] == "agent_settled"),
+    )
     .await;
     let kinds: Vec<&serde_json::Value> = events
         .iter()
@@ -227,10 +235,7 @@ async fn prompt_streams_events_and_resolves_on_agent_settled() {
         .collect();
 
     // Every pi event arrives as an opaque SessionUpdate in send order.
-    let types: Vec<&str> = kinds
-        .iter()
-        .filter_map(|v| v["type"].as_str())
-        .collect();
+    let types: Vec<&str> = kinds.iter().filter_map(|v| v["type"].as_str()).collect();
     assert_eq!(
         types,
         vec![
@@ -269,9 +274,11 @@ async fn u2028_in_payload_is_not_split() {
         .await
         .expect("prompt should settle");
 
-    let events = recv_until(&mut rx, EVENT_TIMEOUT, |k| {
-        matches!(k, EventKind::SessionUpdate(v) if v["type"] == "agent_settled")
-    })
+    let events = recv_until(
+        &mut rx,
+        EVENT_TIMEOUT,
+        |k| matches!(k, EventKind::SessionUpdate(v) if v["type"] == "agent_settled"),
+    )
     .await;
     let deltas: Vec<&serde_json::Value> = events
         .iter()
@@ -304,13 +311,10 @@ async fn prompt_resolves_after_high_event_count_turn() {
     conn.initialize().await.unwrap();
     let session_id = conn.new_session(dir.path()).await.unwrap();
 
-    tokio::time::timeout(
-        EVENT_TIMEOUT,
-        conn.prompt(&session_id, "burst".to_string()),
-    )
-    .await
-    .expect("prompt hung: settle was lost with the broadcast overflow")
-    .expect("burst prompt should settle successfully");
+    tokio::time::timeout(EVENT_TIMEOUT, conn.prompt(&session_id, "burst".to_string()))
+        .await
+        .expect("prompt hung: settle was lost with the broadcast overflow")
+        .expect("burst prompt should settle successfully");
 
     // The lagging consumer receiver skipped events — expected — but the
     // retained tail (which includes the final agent_settled) still shows
@@ -422,7 +426,9 @@ async fn cancel_aborts_in_flight_run_and_connection_survives() {
     }
 
     // pi's `abort` waits for the session to go idle, then responds.
-    conn.cancel(&session_id).await.expect("abort should succeed");
+    conn.cancel(&session_id)
+        .await
+        .expect("abort should succeed");
 
     // The connection is healthy for the next turn.
     conn.prompt(&session_id, "after abort".to_string())

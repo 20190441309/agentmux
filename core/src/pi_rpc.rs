@@ -152,10 +152,7 @@ fn classify_line(line: &str) -> Classified {
     }
     if value.get("type").and_then(|t| t.as_str()) == Some("response") {
         return Classified::Response {
-            id: value
-                .get("id")
-                .and_then(|i| i.as_str())
-                .map(str::to_owned),
+            id: value.get("id").and_then(|i| i.as_str()).map(str::to_owned),
             command: value
                 .get("command")
                 .and_then(|c| c.as_str())
@@ -300,7 +297,11 @@ pub struct PiConn {
     /// Internal session id stamped onto emitted events.
     session_id: SessionId,
     /// Channel to the worker thread; `None` after shutdown.
-    cmd_tx: Option<mpsc::UnboundedSender<Cmd>>,
+    ///
+    /// Interior-mutable so [`PiConn::close`]/[`PiConn::shutdown`] work on
+    /// `&self`: an `Arc`'d connection shared with an in-flight prompt must
+    /// still be stoppable (the orchestrator's kill path).
+    cmd_tx: Mutex<Option<mpsc::UnboundedSender<Cmd>>>,
     /// Worker thread driving the child process io.
     thread: Option<JoinHandle<()>>,
 }
@@ -349,7 +350,7 @@ impl PiConn {
             event_tx,
             first_rx: Mutex::new(Some(first_rx)),
             session_id,
-            cmd_tx: Some(cmd_tx),
+            cmd_tx: Mutex::new(Some(cmd_tx)),
             thread: Some(thread),
         })
     }
@@ -364,7 +365,11 @@ impl PiConn {
     /// yielding the initial session state. Times out after 10s.
     ///
     /// Resolves to the response's `data` (an `RpcSessionState` object).
-    pub async fn initialize(&mut self) -> Result<Value> {
+    ///
+    /// All request methods take `&self`: they only forward a command over
+    /// the worker channel, so a shared (`Arc`) connection supports e.g.
+    /// `cancel` while a `prompt` is in flight.
+    pub async fn initialize(&self) -> Result<Value> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::Initialize(tx))?;
         tokio::time::timeout(INIT_TIMEOUT, rx)
@@ -377,7 +382,7 @@ impl PiConn {
     /// resolving to the pi session id (`data.sessionId`). `cwd` is
     /// accepted for signature parity with `AcpConn` but unused — pi's
     /// working directory is fixed at spawn.
-    pub async fn new_session(&mut self, cwd: &Path) -> Result<String> {
+    pub async fn new_session(&self, cwd: &Path) -> Result<String> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::NewSession {
             cwd: cwd.to_path_buf(),
@@ -399,7 +404,7 @@ impl PiConn {
     /// session. A stray `agent_settled` emitted between this call and
     /// the run's start — e.g. a concurrent `abort` — can resolve the
     /// wait early; pi events carry no run id to disambiguate.
-    pub async fn prompt(&mut self, session_id: &str, text: String) -> Result<()> {
+    pub async fn prompt(&self, session_id: &str, text: String) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::Prompt {
             session_id: session_id.to_string(),
@@ -412,7 +417,7 @@ impl PiConn {
 
     /// Send `abort` for an in-flight run; pi waits for the session to go
     /// idle before responding. `session_id` is unused.
-    pub async fn cancel(&mut self, session_id: &str) -> Result<()> {
+    pub async fn cancel(&self, session_id: &str) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::Cancel {
             session_id: session_id.to_string(),
@@ -435,10 +440,26 @@ impl PiConn {
         self.event_tx.subscribe()
     }
 
+    /// Force-close the command channel: the worker loop ends and runtime
+    /// teardown kills the child (`kill_on_drop`). Synchronous, instant and
+    /// idempotent — the orchestrator's kill path, usable on a shared
+    /// (`Arc`) connection even while a prompt is in flight. Pending
+    /// requests resolve with an error once the worker exits.
+    ///
+    /// Unlike [`PiConn::shutdown`] this does not wait for the worker to
+    /// acknowledge or join its thread; use `shutdown` when a clean,
+    /// awaited teardown is wanted and `&mut` access is available.
+    pub fn close(&self) {
+        self.cmd_tx.lock().unwrap().take();
+    }
+
     /// Shut the connection down: the worker thread exits and the child
     /// process is killed (`kill_on_drop`). Idempotent.
     pub async fn shutdown(&mut self) -> Result<()> {
-        if let Some(cmd_tx) = self.cmd_tx.take() {
+        // Take the sender in a statement of its own — the guard must drop
+        // before awaiting, otherwise the lock is held across `.await`.
+        let cmd_tx = self.cmd_tx.lock().unwrap().take();
+        if let Some(cmd_tx) = cmd_tx {
             let (tx, rx) = oneshot::channel();
             if cmd_tx.send(Cmd::Shutdown(tx)).is_ok() {
                 // Best-effort wait for the worker to acknowledge; a dead
@@ -463,6 +484,8 @@ impl PiConn {
 
     fn send(&self, cmd: Cmd) -> Result<()> {
         self.cmd_tx
+            .lock()
+            .unwrap()
             .as_ref()
             .ok_or_else(|| anyhow!("pi connection is shut down"))?
             .send(cmd)
@@ -476,7 +499,11 @@ impl Drop for PiConn {
         // teardown on that thread then kills the child (kill_on_drop).
         // The join handle is intentionally detached — `drop` must not
         // block an async executor.
-        self.cmd_tx.take();
+        // (Even if the lock were poisoned, field destruction would drop the
+        // sender anyway, closing the channel — this just does it early.)
+        if let Ok(mut cmd_tx) = self.cmd_tx.lock() {
+            cmd_tx.take();
+        }
     }
 }
 
@@ -740,9 +767,7 @@ fn handle_record(
                     None => emit(
                         event_tx,
                         session_id,
-                        EventKind::Orchestrator(format!(
-                            "pi response for unknown id {id}"
-                        )),
+                        EventKind::Orchestrator(format!("pi response for unknown id {id}")),
                     ),
                 }
             }
@@ -829,9 +854,7 @@ async fn handle_cmd(core: RpcCore, cmd: Cmd) {
                 .await
             {
                 Err(e) => Err(e),
-                Ok(data)
-                    if data.get("cancelled").and_then(|c| c.as_bool()) == Some(true) =>
-                {
+                Ok(data) if data.get("cancelled").and_then(|c| c.as_bool()) == Some(true) => {
                     Err(anyhow!("pi new_session was cancelled by an extension"))
                 }
                 Ok(_) => match core.request(serde_json::json!({"type": "get_state"})).await {
@@ -848,10 +871,10 @@ async fn handle_cmd(core: RpcCore, cmd: Cmd) {
             reply,
         } => {
             let _ = session_id; // parity arg; pi tracks one session per process
-            // Snapshot the settle generation *before* the request so only
-            // a settle from our own run can resolve the wait — settles
-            // already in history are excluded (see `wait_for_settled` for
-            // the documented concurrent-abort caveat).
+                                // Snapshot the settle generation *before* the request so only
+                                // a settle from our own run can resolve the wait — settles
+                                // already in history are excluded (see `wait_for_settled` for
+                                // the documented concurrent-abort caveat).
             let since = core.watch.snapshot();
             let result = match core
                 .request(serde_json::json!({"type": "prompt", "message": text}))
@@ -860,10 +883,7 @@ async fn handle_cmd(core: RpcCore, cmd: Cmd) {
                 Err(e) => Err(e),
                 // `handled` means an extension consumed the prompt — no
                 // run starts, so waiting for `agent_settled` would hang.
-                Ok(data)
-                    if data.get("disposition").and_then(|d| d.as_str())
-                        == Some("handled") =>
-                {
+                Ok(data) if data.get("disposition").and_then(|d| d.as_str()) == Some("handled") => {
                     Ok(())
                 }
                 // `started`/`queued`/unspecified: a run is (or will be)
@@ -872,12 +892,9 @@ async fn handle_cmd(core: RpcCore, cmd: Cmd) {
             };
             let _ = reply.send(result);
         }
-        Cmd::Cancel {
-            session_id,
-            reply,
-        } => {
+        Cmd::Cancel { session_id, reply } => {
             let _ = session_id; // parity arg; pi tracks one session per process
-            // `abort` waits for the session to go idle before responding.
+                                // `abort` waits for the session to go idle before responding.
             let result = core
                 .request(serde_json::json!({"type": "abort"}))
                 .await
@@ -901,9 +918,17 @@ mod tests {
             .as_bytes()
             .to_vec();
         let r1 = take_record(&mut buf).unwrap();
-        assert_eq!(r1, "{\"a\":\"x\u{2028}y\"}".as_bytes(), "CR stripped, U+2028 kept");
+        assert_eq!(
+            r1,
+            "{\"a\":\"x\u{2028}y\"}".as_bytes(),
+            "CR stripped, U+2028 kept"
+        );
         let r2 = take_record(&mut buf).unwrap();
-        assert_eq!(r2, "{\"b\":\"z\u{2029}w\"}".as_bytes(), "U+2029 kept inside record");
+        assert_eq!(
+            r2,
+            "{\"b\":\"z\u{2029}w\"}".as_bytes(),
+            "U+2029 kept inside record"
+        );
         // "rest" has no LF yet — it must wait.
         assert!(take_record(&mut buf).is_none());
         buf.extend_from_slice(b"\n");

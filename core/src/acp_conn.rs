@@ -94,7 +94,11 @@ pub struct AcpConn {
     /// it to correlate events with its own `Session` record.
     session_id: SessionId,
     /// Channel to the worker thread; `None` after shutdown.
-    cmd_tx: Option<mpsc::UnboundedSender<Cmd>>,
+    ///
+    /// Interior-mutable so [`AcpConn::close`]/[`AcpConn::shutdown`] work on
+    /// `&self`: an `Arc`'d connection shared with an in-flight prompt must
+    /// still be stoppable (the orchestrator's kill path).
+    cmd_tx: Mutex<Option<mpsc::UnboundedSender<Cmd>>>,
     /// Worker thread driving the `!Send` ACP machinery.
     thread: Option<JoinHandle<()>>,
 }
@@ -143,7 +147,7 @@ impl AcpConn {
             event_tx,
             first_rx: Mutex::new(Some(first_rx)),
             session_id,
-            cmd_tx: Some(cmd_tx),
+            cmd_tx: Mutex::new(Some(cmd_tx)),
             thread: Some(thread),
         })
     }
@@ -158,7 +162,11 @@ impl AcpConn {
     ///
     /// Resolves to the serialized `InitializeResponse` so callers can inspect
     /// agent capabilities without depending on the ACP crate's types.
-    pub async fn initialize(&mut self) -> Result<serde_json::Value> {
+    ///
+    /// All request methods take `&self`: they only forward a command over
+    /// the worker channel, so a shared (`Arc`) connection supports e.g.
+    /// `cancel` while a `prompt` is in flight.
+    pub async fn initialize(&self) -> Result<serde_json::Value> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::Initialize(tx))?;
         tokio::time::timeout(INIT_TIMEOUT, rx)
@@ -168,7 +176,7 @@ impl AcpConn {
     }
 
     /// Create a new ACP session rooted at `cwd`; returns the acp session id.
-    pub async fn new_session(&mut self, cwd: &Path) -> Result<String> {
+    pub async fn new_session(&self, cwd: &Path) -> Result<String> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::NewSession {
             cwd: cwd.to_path_buf(),
@@ -179,7 +187,7 @@ impl AcpConn {
     }
 
     /// Send a user prompt; resolves when the agent finishes its turn.
-    pub async fn prompt(&mut self, session_id: &str, text: String) -> Result<()> {
+    pub async fn prompt(&self, session_id: &str, text: String) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::Prompt {
             session_id: session_id.to_string(),
@@ -191,7 +199,7 @@ impl AcpConn {
     }
 
     /// Send `session/cancel` for an in-flight prompt turn.
-    pub async fn cancel(&mut self, session_id: &str) -> Result<()> {
+    pub async fn cancel(&self, session_id: &str) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::Cancel {
             session_id: session_id.to_string(),
@@ -215,10 +223,26 @@ impl AcpConn {
         self.event_tx.subscribe()
     }
 
+    /// Force-close the command channel: the worker loop ends and runtime
+    /// teardown kills the child (`kill_on_drop`). Synchronous, instant and
+    /// idempotent — the orchestrator's kill path, usable on a shared
+    /// (`Arc`) connection even while a prompt is in flight. Pending
+    /// requests resolve with an error once the worker exits.
+    ///
+    /// Unlike [`AcpConn::shutdown`] this does not wait for the worker to
+    /// acknowledge or join its thread; use `shutdown` when a clean,
+    /// awaited teardown is wanted and `&mut` access is available.
+    pub fn close(&self) {
+        self.cmd_tx.lock().unwrap().take();
+    }
+
     /// Shut the connection down: the worker thread exits and the child
     /// process is killed (`kill_on_drop`). Idempotent.
     pub async fn shutdown(&mut self) -> Result<()> {
-        if let Some(cmd_tx) = self.cmd_tx.take() {
+        // Take the sender in a statement of its own — the guard must drop
+        // before awaiting, otherwise the lock is held across `.await`.
+        let cmd_tx = self.cmd_tx.lock().unwrap().take();
+        if let Some(cmd_tx) = cmd_tx {
             let (tx, rx) = oneshot::channel();
             if cmd_tx.send(Cmd::Shutdown(tx)).is_ok() {
                 // Best-effort wait for the worker to acknowledge; a dead
@@ -242,6 +266,8 @@ impl AcpConn {
 
     fn send(&self, cmd: Cmd) -> Result<()> {
         self.cmd_tx
+            .lock()
+            .unwrap()
             .as_ref()
             .ok_or_else(|| anyhow!("acp connection is shut down"))?
             .send(cmd)
@@ -255,7 +281,11 @@ impl Drop for AcpConn {
         // on that thread then kills the child (kill_on_drop). The join handle
         // is intentionally detached — `drop` must not block an async
         // executor, and the worker exits promptly once the channel closes.
-        self.cmd_tx.take();
+        // (Even if the lock were poisoned, field destruction would drop the
+        // sender anyway, closing the channel — this just does it early.)
+        if let Ok(mut cmd_tx) = self.cmd_tx.lock() {
+            cmd_tx.take();
+        }
     }
 }
 

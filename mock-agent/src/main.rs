@@ -20,11 +20,14 @@
 //!        (the echo lets tests correlate a turn with its prompt),
 //!     2. `tool_call` with `kind = "edit"` and location `src/lib.rs`,
 //!        then responds with `stop_reason = "end_turn"`.
-//! - Prompt text containing `crash` → `std::process::exit(1)`.
-//! - Prompt text containing `exit42` → `std::process::exit(42)`
+//! - Prompt text containing the token `crash` → `std::process::exit(1)`.
+//! - Prompt text containing the token `exit42` → `std::process::exit(42)`
 //!   (distinct code for `AgentExited` coverage).
-//! - Prompt text containing `hang` → the prompt future never resolves
-//!   (for timeout/cancel tests); the agent process stays alive.
+//! - Prompt text containing the token `hang` → the prompt future never
+//!   resolves (for timeout/cancel tests); the agent process stays alive.
+//!
+//! Trigger matching is by whole token (see [`has_trigger`]), not raw
+//! substring — so "changed" doesn't accidentally mean "hang".
 
 use std::cell::Cell;
 
@@ -67,6 +70,17 @@ impl MockAgent {
             .map_err(|_| acp::Error::internal_error())?;
         rx.await.map_err(|_| acp::Error::internal_error())
     }
+}
+
+/// Whether `text` contains `word` as a whole token (bounded by
+/// non-alphanumeric characters).
+///
+/// Triggers are matched by token, not substring: prose like "changed" or
+/// "exchanging" must not trip the `hang` trigger — e.g. the
+/// orchestrator's shared-context preamble legitimately contains both.
+fn has_trigger(text: &str, word: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric())
+        .any(|w| w == word)
 }
 
 /// Flatten the prompt's text blocks into one string for the trigger
@@ -112,13 +126,13 @@ impl acp::Agent for MockAgent {
         let text = prompt_text(&args.prompt);
 
         // Trigger words first — a crashing/hung agent sends no updates.
-        if text.contains("crash") {
+        if has_trigger(&text, "crash") {
             std::process::exit(1);
         }
-        if text.contains("exit42") {
+        if has_trigger(&text, "exit42") {
             std::process::exit(42);
         }
-        if text.contains("hang") {
+        if has_trigger(&text, "hang") {
             // Never resolves: the request stays pending until the client
             // gives up or kills us. Cancel cannot unwedge it, which is
             // exactly what the timeout tests exercise.

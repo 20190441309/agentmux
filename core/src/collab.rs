@@ -98,7 +98,14 @@ pub fn summarize_event(kind: &EventKind) -> Option<String> {
 
 /// Best-effort summary of a raw `session/update` JSON payload. Only
 /// `tool_call` updates carry an obvious action; everything else is `None`.
+///
+/// Accepts both the bare update object (`{"sessionUpdate": "tool_call",
+/// ...}`) and the full notification envelope adapters actually emit
+/// (`{"sessionId": ..., "update": {...}}`).
 fn summarize_session_update(update: &serde_json::Value) -> Option<String> {
+    // Unwrap the notification envelope when present; a bare update object
+    // has no `"update"` key of its own, so this is unambiguous.
+    let update = update.get("update").unwrap_or(update);
     if update.get("sessionUpdate").and_then(|u| u.as_str()) != Some("tool_call") {
         return None;
     }
