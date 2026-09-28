@@ -69,7 +69,7 @@ async fn main() {
     let paths = ServerPaths::resolve(socket, data_dir, config);
     let code = match mode {
         Mode::Serve => serve(paths).await,
-        Mode::Daemon => daemonize(&paths),
+        Mode::Daemon => daemonize(&paths).await,
     };
     if code != 0 {
         exit(code);
@@ -116,7 +116,12 @@ async fn serve(paths: ServerPaths) -> i32 {
 
 /// `--daemon`: detached spawn of `self --serve` (daemonize-lite — see the
 /// module docs). Prints the child pid and socket path for the caller.
-fn daemonize(paths: &ServerPaths) -> i32 {
+///
+/// The child's stderr goes to /dev/null, so init failures are silent —
+/// after `spawn` we poll-connect to the socket for up to 3s (failing
+/// early if the child has already exited) and only report success once
+/// it is actually accepting connections.
+async fn daemonize(paths: &ServerPaths) -> i32 {
     let exe = match env::current_exe() {
         Ok(e) => e,
         Err(e) => {
@@ -141,18 +146,50 @@ fn daemonize(paths: &ServerPaths) -> i32 {
         // New process group: the daemon survives the TUI/terminal exiting.
         cmd.process_group(0);
     }
-    match cmd.spawn() {
-        Ok(child) => {
-            println!(
-                "agentmux-server: daemonized (pid {}) on {}",
-                child.id(),
-                paths.socket_path.display()
-            );
-            0
-        }
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
         Err(e) => {
             eprintln!("agentmux-server: daemon spawn failed: {e}");
-            1
+            return 1;
+        }
+    };
+    let pid = child.id();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match tokio::net::UnixStream::connect(&paths.socket_path).await {
+            Ok(_) => {
+                println!(
+                    "agentmux-server: daemonized (pid {pid}) on {}",
+                    paths.socket_path.display()
+                );
+                return 0;
+            }
+            Err(e) => {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        eprintln!(
+                            "agentmux-server: daemon exited during startup ({status}); \
+                             socket {} never came up",
+                            paths.socket_path.display()
+                        );
+                        return 1;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("agentmux-server: cannot check daemon status: {e}");
+                        return 1;
+                    }
+                }
+                if std::time::Instant::now() >= deadline {
+                    eprintln!(
+                        "agentmux-server: daemon (pid {pid}) did not start listening on \
+                         {} within 3s: {e}",
+                        paths.socket_path.display()
+                    );
+                    return 1;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         }
     }
 }

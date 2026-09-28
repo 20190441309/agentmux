@@ -170,13 +170,25 @@ fn home_dir() -> PathBuf {
 }
 
 /// Build a [`Daemon`] from resolved paths: open the store, load the
-/// config, build the registry + orchestrator.
+/// config, build a **probed** registry + the orchestrator.
+///
+/// `AgentRegistry::probed` probes each adapter's `command` once at boot —
+/// config-loaded profiles are all `available: false`, and
+/// `create_session`/`resume` gate on that flag. `list_agents` re-probes
+/// on every call (writing back), so runtime installs get picked up.
 pub fn build_daemon(paths: &ServerPaths) -> Result<Arc<Daemon>> {
     let store = Store::open(&paths.data_dir)?;
+    // The data dir holds session logs + the socket — keep other local
+    // users out (`create_dir_all` inherits the umask).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&paths.data_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
     let config = Config::load(&paths.config_path)?;
     let orch = Orchestrator::new(
         store,
-        AgentRegistry::from_config(&config),
+        AgentRegistry::probed(&config),
         paths.data_dir.clone(),
     );
     Ok(Daemon::new(orch))
@@ -198,7 +210,7 @@ pub async fn bind_unix_listener(path: &Path) -> io::Result<UnixListener> {
         std::fs::create_dir_all(parent)?;
     }
     match UnixListener::bind(path) {
-        Ok(listener) => Ok(listener),
+        Ok(listener) => tighten_socket_perms(path).map(|()| listener),
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
             match UnixStream::connect(path).await {
                 Ok(_) => Err(e), // live daemon owns the socket
@@ -226,12 +238,27 @@ pub async fn bind_unix_listener(path: &Path) -> io::Result<UnixListener> {
                         ));
                     }
                     std::fs::remove_file(path)?;
-                    UnixListener::bind(path)
+                    let listener = UnixListener::bind(path)?;
+                    tighten_socket_perms(path).map(|()| listener)
                 }
             }
         }
         Err(e) => Err(e),
     }
+}
+
+/// `0600` on the socket file — the daemon's RPC surface can spawn
+/// arbitrary commands, so other local users must not be able to connect.
+/// No-op on non-unix (no unix sockets there anyway).
+#[cfg(unix)]
+fn tighten_socket_perms(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+}
+
+#[cfg(not(unix))]
+fn tighten_socket_perms(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -387,25 +414,33 @@ enum LineRead {
 
 /// Read one `\n`-terminated line bounded to [`MAX_LINE_BYTES`]. An
 /// overlong line is drained to its newline so framing stays aligned.
+///
+/// Byte-oriented (`read_until`, not `read_line`): a line that isn't
+/// valid UTF-8 comes back as bytes and is rejected downstream as a
+/// `-32700` parse error instead of surfacing here as an I/O error that
+/// would silently drop the connection.
 async fn read_limited_line(
     reader: &mut BufReader<OwnedReadHalf>,
-    out: &mut String,
+    out: &mut Vec<u8>,
 ) -> io::Result<LineRead> {
-    // `take(cap).read_line` returns after `cap` bytes or the newline —
+    // `take(cap).read_until` returns after `cap` bytes or the newline —
     // whichever first — so a line is overlong iff the buffer filled
     // without reaching '\n'.
     let cap = MAX_LINE_BYTES + 1;
-    let n = (&mut *reader).take(cap).read_line(out).await?;
+    let n = (&mut *reader).take(cap).read_until(b'\n', out).await?;
     if n == 0 {
         return Ok(LineRead::Eof);
     }
-    if n as u64 == cap && !out.ends_with('\n') {
+    if n as u64 == cap && out.last() != Some(&b'\n') {
         // Drain the rest of the oversized line.
-        let mut scratch = String::new();
+        let mut scratch = Vec::new();
         loop {
             scratch.clear();
-            let m = (&mut *reader).take(cap).read_line(&mut scratch).await?;
-            if m == 0 || scratch.ends_with('\n') {
+            let m = (&mut *reader)
+                .take(cap)
+                .read_until(b'\n', &mut scratch)
+                .await?;
+            if m == 0 || scratch.last() == Some(&b'\n') {
                 break;
             }
         }
@@ -456,7 +491,7 @@ async fn handle_conn(stream: UnixStream, daemon: Arc<Daemon>) {
     let mut forwarder: Option<JoinHandle<()>> = None;
 
     let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
+    let mut line = Vec::new();
     loop {
         line.clear();
         match read_limited_line(&mut reader, &mut line).await {
@@ -476,8 +511,9 @@ async fn handle_conn(stream: UnixStream, daemon: Arc<Daemon>) {
         }
 
         // `Value` first: malformed JSON is a parse error even when the
-        // bytes happened to look request-shaped.
-        let value = match serde_json::from_str::<Value>(&line) {
+        // bytes happened to look request-shaped. `from_slice` also
+        // rejects invalid UTF-8 → -32700, keeping the connection open.
+        let value = match serde_json::from_slice::<Value>(&line) {
             Ok(v) => v,
             Err(e) => {
                 let resp = RpcResponse::err(

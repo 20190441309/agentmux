@@ -37,6 +37,19 @@ impl AgentRegistry {
         AgentRegistry { profiles }
     }
 
+    /// Build a registry and probe every profile's adapter `command` —
+    /// `available` reflects the filesystem at construction time.
+    ///
+    /// Config-loaded profiles always carry `available: false`; a daemon
+    /// that creates sessions must probe (here, or lazily via
+    /// `list_agents`/`register_agent`) or every spawn is refused.
+    pub fn probed(cfg: &Config) -> AgentRegistry {
+        let registry = Self::from_config(cfg);
+        AgentRegistry {
+            profiles: registry.probe(),
+        }
+    }
+
     /// All profiles, in config order.
     pub fn profiles(&self) -> &[AgentProfile] {
         &self.profiles

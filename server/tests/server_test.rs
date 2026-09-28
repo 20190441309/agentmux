@@ -26,7 +26,7 @@ use agentmux_core::{
     AdapterKind, AgentId, AgentProfile, AgentRegistry, Config, Event, EventKind, Orchestrator,
     Store,
 };
-use agentmux_server::{bind_unix_listener, Daemon};
+use agentmux_server::{bind_unix_listener, build_daemon, Daemon, ServerPaths};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -472,6 +472,101 @@ async fn second_subscribed_connection_receives_same_events() {
             "client {name} should see the echo: {events:?}"
         );
     }
+
+    shutdown(td).await;
+}
+
+/// ⑤ Regression: `build_daemon` probes adapter availability at boot —
+/// a config file alone (no `agent/register` call, no `agent/list`
+/// write-back) must suffice for `session/create`. Config-loaded profiles
+/// are always `available: false` until probed, so an unprobed registry
+/// would refuse every spawn with "agent … is not available".
+#[tokio::test]
+async fn build_daemon_probes_agent_availability_so_sessions_can_create() {
+    let repo = init_repo();
+    let data = tempfile::tempdir().unwrap();
+    let sock = data.path().join("test.sock");
+
+    // The mock agent exists only on disk — `available` is not a config
+    // field and always deserializes to false.
+    let config_path = data.path().join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[[agents]]\nid = \"mock\"\ncommand = \"{}\"\n",
+            mock_agent_binary().display()
+        ),
+    )
+    .unwrap();
+
+    let paths = ServerPaths {
+        data_dir: data.path().to_path_buf(),
+        socket_path: sock.clone(),
+        config_path,
+    };
+    let daemon = build_daemon(&paths).expect("build_daemon");
+    let listener = bind_unix_listener(&sock).await.unwrap();
+    let serve = {
+        let daemon = daemon.clone();
+        tokio::spawn(async move { daemon.serve(listener).await })
+    };
+    let td = TestDaemon {
+        sock,
+        serve,
+        _data: data,
+        repo,
+    };
+
+    let mut client = Client::connect(&td.sock).await;
+
+    // `agent/list` (fresh probe) and `session/create` (stored flag) agree.
+    let resp = client.request("agent/list", Value::Null).await;
+    let mock = resp["result"]["agents"]
+        .as_array()
+        .and_then(|a| a.iter().find(|p| p["id"] == json!("mock")))
+        .expect("mock should be in agent/list");
+    assert_eq!(
+        mock["available"],
+        json!(true),
+        "boot probe should mark the mock available: {mock}"
+    );
+
+    // The real assertion: this would be "agent mock is not available"
+    // on the unprobed registry.
+    let session_id = create_session_via_rpc(&mut client, td.repo.path(), "ws1").await;
+    assert!(
+        session_id.is_string(),
+        "session/create should have succeeded: {session_id}"
+    );
+
+    shutdown(td).await;
+}
+
+/// ⑥ An inbound line that isn't valid UTF-8 gets a `-32700` parse error
+/// and the connection stays open (it must not be silently dropped).
+#[tokio::test]
+async fn invalid_utf8_line_gets_parse_error_and_connection_survives() {
+    let td = start_daemon().await;
+    let mut client = Client::connect(&td.sock).await;
+
+    client
+        .writer
+        .write_all(&[0x66, 0x6f, 0x80, b'\n']) // "fo" + invalid continuation byte
+        .await
+        .unwrap();
+    client.writer.flush().await.unwrap();
+    let resp = client.read_msg().await;
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32700),
+        "expected a parse error: {resp}"
+    );
+
+    let resp = client.request("server/status", Value::Null).await;
+    assert!(
+        resp["result"].is_object(),
+        "post-error request failed: {resp}"
+    );
 
     shutdown(td).await;
 }

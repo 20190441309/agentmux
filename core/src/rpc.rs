@@ -344,8 +344,9 @@ pub struct SessionPromptParams {
     pub references: Vec<SessionRef>,
 }
 
-/// `session/prompt` acks immediately; the turn's output arrives as
-/// [`N_SESSION_EVENT`] notifications.
+/// `session/prompt` responds when the turn has run to completion
+/// (`TurnEnded`/`Cancelled`/an error event); the turn's output streams
+/// as [`N_SESSION_EVENT`] notifications while it runs.
 pub type SessionPromptResult = ();
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

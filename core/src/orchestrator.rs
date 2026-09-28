@@ -442,39 +442,32 @@ impl Orchestrator {
         self.sink.store.lock().unwrap().list_workspaces(project_id)
     }
 
-    /// Remove a workspace (`workspace/remove`): tears down any remaining
-    /// session slots, deletes session rows + event logs, removes the git
-    /// worktree, then deletes the workspace record.
+    /// Remove a workspace (`workspace/remove`): removes the git worktree,
+    /// then — under a single store lock — re-verifies no live sessions and
+    /// deletes session rows + the workspace record.
     ///
     /// Refuses while any of its sessions is live (not `Done`/`Error`) —
     /// kill them first. Returns `false` when no workspace with that id
-    /// existed. Worktree removal runs after the record checks so a git
+    /// existed. Worktree removal runs before the record delete so a git
     /// failure leaves the record intact and retryable.
+    ///
+    /// Race with `session/create`/`resume`: the post-worktree re-check and
+    /// the row deletes share one store-lock hold, so a racing insert
+    /// either lands before the hold (seen as live → refusal; its spawn
+    /// into the now-deleted worktree fails to `Error`) or after the
+    /// workspace row is gone (FK-violates the insert — nothing spawned).
+    /// A create that was already mid-connect when its row is deleted fails
+    /// its `Ready` transition and tears itself down there.
     pub fn remove_workspace(&self, workspace_id: WorkspaceId) -> Result<bool> {
-        let (workspace, sessions) = {
+        let workspace = {
             let store = self.sink.store.lock().unwrap();
             let Some(workspace) = store.get_workspace(workspace_id)? else {
                 return Ok(false);
             };
-            (workspace, store.list_sessions(workspace_id)?)
+            let sessions = store.list_sessions(workspace_id)?;
+            Self::ensure_no_live_sessions(workspace_id, &sessions)?;
+            workspace
         };
-        let live: Vec<&Session> = sessions
-            .iter()
-            .filter(|s| !matches!(s.state, SessionState::Done | SessionState::Error(_)))
-            .collect();
-        ensure!(
-            live.is_empty(),
-            "workspace {workspace_id} still has {} live session(s); kill them first",
-            live.len()
-        );
-
-        // Detach any lingering slots (e.g. a dead conn an Error session
-        // never closed) before deleting the rows out from under them.
-        for session in &sessions {
-            if let Some(slot) = self.sessions.lock().unwrap().remove(&session.id) {
-                Self::teardown_slot(&slot);
-            }
-        }
 
         let repo_root = {
             let store = self.sink.store.lock().unwrap();
@@ -483,19 +476,65 @@ impl Orchestrator {
                 .ok_or_else(|| anyhow!("project {} is gone", workspace.project_id))?
                 .root_path
         };
-        WorktreeManager::remove(&repo_root, &workspace.worktree_path)?;
-
-        let store = self.sink.store.lock().unwrap();
-        for session_id in store.delete_workspace_sessions(workspace_id)? {
-            let _ = store.delete_event_log(session_id); // best-effort
+        // Tolerate a missing worktree path — a previous attempt may have
+        // partially cleaned up, and the record should still be removable.
+        if workspace.worktree_path.exists() {
+            WorktreeManager::remove(&repo_root, &workspace.worktree_path)?;
         }
-        store.delete_workspace(workspace_id)
+
+        // Atomic re-check + delete (see doc comment): the gap between the
+        // first live-check and this hold is where `session/create` could
+        // have slipped in — catch it here, not after the rows are gone.
+        let session_ids = {
+            let store = self.sink.store.lock().unwrap();
+            let sessions = store.list_sessions(workspace_id)?;
+            Self::ensure_no_live_sessions(workspace_id, &sessions)?;
+            let ids = store.delete_workspace_sessions(workspace_id)?;
+            store.delete_workspace(workspace_id)?;
+            ids
+        };
+
+        // Detach any lingering slots (e.g. a dead conn an Error session
+        // never closed) and drop their event logs.
+        for session_id in &session_ids {
+            if let Some(slot) = self.sessions.lock().unwrap().remove(session_id) {
+                Self::teardown_slot(&slot);
+            }
+        }
+        {
+            let store = self.sink.store.lock().unwrap();
+            for session_id in session_ids {
+                let _ = store.delete_event_log(session_id); // best-effort
+            }
+        }
+        Ok(true)
+    }
+
+    fn ensure_no_live_sessions(workspace_id: WorkspaceId, sessions: &[Session]) -> Result<()> {
+        let live = sessions
+            .iter()
+            .filter(|s| !matches!(s.state, SessionState::Done | SessionState::Error(_)))
+            .count();
+        ensure!(
+            live == 0,
+            "workspace {workspace_id} still has {live} live session(s); kill them first"
+        );
+        Ok(())
     }
 
     /// All configured agents with availability freshly probed
     /// (`agent/list`).
+    ///
+    /// The probe is written back into the registry, so what `agent/list`
+    /// reports is what `create_session`/`resume` will enforce — an agent
+    /// installed after daemon boot becomes usable on the next list.
     pub fn list_agents(&self) -> Vec<AgentProfile> {
-        self.registry.lock().unwrap().probe()
+        let mut registry = self.registry.lock().unwrap();
+        let probed = registry.probe();
+        for profile in &probed {
+            registry.register(profile.clone());
+        }
+        probed
     }
 
     /// Register (or update) an agent profile (`agent/register`).
@@ -608,13 +647,22 @@ impl Orchestrator {
 
         // `unless_terminal`: an in-process `kill` racing setup owns `Done`
         // already — don't start the connect at all (unreachable via the
-        // wire, where the id only exists after this method returns).
-        if !self
+        // wire, where the id only exists after this method returns). On a
+        // vanished row (`workspace/remove` raced the insert) drop the slot
+        // rather than leak it.
+        match self
             .sink
-            .transition(session_id, SessionState::Connecting, true)?
+            .transition(session_id, SessionState::Connecting, true)
         {
-            self.sessions.lock().unwrap().remove(&session_id);
-            bail!("session {session_id} was killed during setup");
+            Ok(true) => {}
+            Ok(false) => {
+                self.sessions.lock().unwrap().remove(&session_id);
+                bail!("session {session_id} was killed during setup");
+            }
+            Err(e) => {
+                self.sessions.lock().unwrap().remove(&session_id);
+                return Err(e);
+            }
         }
         match self
             .connect(&profile, &workspace.worktree_path, session_id, &slot)
@@ -623,13 +671,20 @@ impl Orchestrator {
             Ok(()) => {
                 // `unless_terminal`: a `kill` landing during `connect`
                 // already owns `Done` — tear the fresh conn down instead
-                // of resurrecting the session.
-                if !self
-                    .sink
-                    .transition(session_id, SessionState::Ready, true)?
-                {
-                    Self::teardown_slot(&slot);
-                    return Ok(session_id);
+                // of resurrecting the session. A missing row means the
+                // workspace was removed mid-setup: teardown + drop the
+                // slot so no orphan conn survives.
+                match self.sink.transition(session_id, SessionState::Ready, true) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        Self::teardown_slot(&slot);
+                        return Ok(session_id);
+                    }
+                    Err(e) => {
+                        Self::teardown_slot(&slot);
+                        self.sessions.lock().unwrap().remove(&session_id);
+                        return Err(e);
+                    }
                 }
                 if let Some(text) = prompt {
                     // Errors from the initial prompt propagate — the
@@ -942,18 +997,32 @@ impl Orchestrator {
                 .clone()
         });
 
-        // Best-effort teardown of whatever the slot still holds (an Error
-        // session's dead conn, a Done session's leftover handle).
+        // Claim the resume *before* touching the slot: a concurrent losing
+        // `resume` must not run `teardown_slot` — it could land between the
+        // winner's `fanout`/`conn` installs inside `connect` and leave the
+        // session `Ready` with a live conn but an aborted fan-out (silent
+        // event loss).
+        match self
+            .sink
+            .transition_out_of_terminal(session_id, SessionState::Connecting)
+        {
+            Ok(true) => {}
+            Ok(false) => bail!("session {session_id} left a resumable state mid-resume"),
+            Err(e) => {
+                // The session row vanished under us (e.g. `workspace/remove`
+                // deleted it) — drop the stale slot so no unreachable conn
+                // lingers.
+                if let Some(slot) = self.sessions.lock().unwrap().remove(&session_id) {
+                    Self::teardown_slot(&slot);
+                }
+                return Err(e);
+            }
+        }
+
+        // We own the resume now: tear down whatever the slot still holds
+        // (an Error session's dead conn, a Done session's leftover handle).
         Self::teardown_slot(&slot);
 
-        // Atomic "still terminal" check-and-set: a `kill` landing between
-        // the state check above and here must not be clobbered.
-        if !self
-            .sink
-            .transition_out_of_terminal(session_id, SessionState::Connecting)?
-        {
-            bail!("session {session_id} left a resumable state mid-resume");
-        }
         match self
             .connect(&profile, &workspace.worktree_path, session_id, &slot)
             .await
@@ -970,14 +1039,21 @@ impl Orchestrator {
                 );
                 // `unless_terminal`: a `kill` racing the `connect` await
                 // owns the terminal state — tear the fresh conn down
-                // rather than resurrect.
-                if !self
-                    .sink
-                    .transition(session_id, SessionState::Ready, true)?
-                {
-                    Self::teardown_slot(&slot);
+                // rather than resurrect. A missing row (`workspace/remove`)
+                // means the session is unreachable — teardown + drop the
+                // slot so no orphan conn survives.
+                match self.sink.transition(session_id, SessionState::Ready, true) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        Self::teardown_slot(&slot);
+                        Ok(())
+                    }
+                    Err(e) => {
+                        Self::teardown_slot(&slot);
+                        self.sessions.lock().unwrap().remove(&session_id);
+                        Err(e)
+                    }
                 }
-                Ok(())
             }
             Err(e) => {
                 let _ = self.sink.transition(
