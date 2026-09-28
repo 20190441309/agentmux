@@ -519,7 +519,17 @@ async fn build_daemon_probes_agent_availability_so_sessions_can_create() {
 
     let mut client = Client::connect(&td.sock).await;
 
-    // `agent/list` (fresh probe) and `session/create` (stored flag) agree.
+    // The real assertion, run *before* any `agent/list` — `list_agents`
+    // writes probe results back into the registry, so listing first
+    // would mask a missing boot probe. This would be "agent mock is not
+    // available" on the unprobed registry.
+    let session_id = create_session_via_rpc(&mut client, td.repo.path(), "ws1").await;
+    assert!(
+        session_id.is_string(),
+        "session/create should have succeeded: {session_id}"
+    );
+
+    // `agent/list` (fresh probe) agrees with what `session/create` saw.
     let resp = client.request("agent/list", Value::Null).await;
     let mock = resp["result"]["agents"]
         .as_array()
@@ -529,14 +539,6 @@ async fn build_daemon_probes_agent_availability_so_sessions_can_create() {
         mock["available"],
         json!(true),
         "boot probe should mark the mock available: {mock}"
-    );
-
-    // The real assertion: this would be "agent mock is not available"
-    // on the unprobed registry.
-    let session_id = create_session_via_rpc(&mut client, td.repo.path(), "ws1").await;
-    assert!(
-        session_id.is_string(),
-        "session/create should have succeeded: {session_id}"
     );
 
     shutdown(td).await;

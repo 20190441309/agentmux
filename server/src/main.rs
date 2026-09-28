@@ -129,6 +129,19 @@ async fn daemonize(paths: &ServerPaths) -> i32 {
             return 1;
         }
     };
+    // If the socket already accepts, a daemon is live — spawning a child
+    // would only make it fail its bind, and the readiness poll below
+    // would false-positive on the existing socket anyway.
+    if tokio::net::UnixStream::connect(&paths.socket_path)
+        .await
+        .is_ok()
+    {
+        println!(
+            "agentmux-server: already running on {}",
+            paths.socket_path.display()
+        );
+        return 0;
+    }
     let mut cmd = Command::new(exe);
     cmd.arg("--serve")
         .arg("--socket")
