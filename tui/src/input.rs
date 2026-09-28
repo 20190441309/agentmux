@@ -14,6 +14,8 @@
 //! | Normal    | `n`            | new-session wizard                  |
 //! | Normal    | `@`            | relay pick (event → target session) |
 //! | Normal    | `Tab`          | toggle files/diff panel             |
+//! | Normal    | `x`            | kill selected session               |
+//! | Normal    | `r`            | resume selected (Done/Error) session|
 //! | Normal    | `ctrl-c`       | cancel selected session turn        |
 //! | Editing   | `Enter`        | submit prompt (+ staged relays)     |
 //! | Editing   | `Esc`/`ctrl-c` | back to Normal                      |
@@ -78,6 +80,8 @@ pub(crate) fn normal_key(app: &mut App, key: KeyEvent) -> AppAction {
             app.show_diff = !app.show_diff;
             AppAction::None
         }
+        KeyCode::Char('x') => AppAction::KillSession,
+        KeyCode::Char('r') => AppAction::ResumeSession,
         _ => AppAction::None,
     }
 }

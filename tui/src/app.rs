@@ -63,6 +63,14 @@ pub enum AppAction {
     },
     /// `ctrl-c` in Normal mode — cancel the selected session's turn.
     CancelPrompt,
+    /// `x` in Normal mode — kill the selected session (`session/kill`).
+    /// Kill is direct (no confirm dialog): the session is recoverable
+    /// via `r`/`session/resume`.
+    KillSession,
+    /// `r` in Normal mode — resume a `Done`/`Error` session
+    /// (`session/resume`) — the only way back for sessions the daemon
+    /// swept to `Error` at boot.
+    ResumeSession,
 }
 
 /// A relay staged by the `@` picker, consumed by the next
@@ -776,6 +784,30 @@ mod tests {
             app.handle_key(ctrl(KeyCode::Char('c'))),
             AppAction::CancelPrompt
         );
+    }
+
+    /// `x`/`r` — the lifecycle pair the daemon's zombie sweep makes
+    /// reachable UI-side: kill a live session, resume a terminal one.
+    /// Both emit unconditionally; `main.rs` maps "no selection" to a
+    /// status hint.
+    #[test]
+    fn normal_x_and_r_kill_and_resume() {
+        let mut app = app_with_sessions(&[SessionState::Ready]);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('x'))),
+            AppAction::KillSession
+        );
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('r'))),
+            AppAction::ResumeSession
+        );
+
+        // They don't fire in Editing — `x`/`r` are plain text there.
+        app.mode = InputMode::Editing;
+        assert_eq!(app.handle_key(key(KeyCode::Char('x'))), AppAction::None);
+        assert_eq!(app.input, "x");
+        assert_eq!(app.handle_key(key(KeyCode::Char('r'))), AppAction::None);
+        assert_eq!(app.input, "xr");
     }
 
     #[test]

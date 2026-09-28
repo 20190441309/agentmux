@@ -61,6 +61,11 @@ enum DaemonCall {
     },
     /// `session/cancel` — interrupts the in-flight turn.
     Cancel { session_id: SessionId },
+    /// `session/kill` — terminate the session (recoverable via resume).
+    Kill { session_id: SessionId },
+    /// `session/resume` — bring a `Done`/`Error` session back on a fresh
+    /// adapter connection.
+    Resume { session_id: SessionId },
 }
 
 /// Map staged relays onto the wire `SessionRef` shape: the referenced
@@ -84,7 +89,8 @@ fn usage() -> &'static str {
      dir), starting the daemon first when needed.\n\
      \n\
      Keys: q quit · j/k select · i/a prompt · n new-session wizard ·\n\
-     \x20     @ relay event→session · tab files panel · ctrl-c cancel"
+     \x20     @ relay event→session · tab files panel · x kill ·\n\
+     \x20     r resume · ctrl-c cancel"
 }
 
 #[tokio::main]
@@ -273,6 +279,20 @@ fn dispatch(
             }
             None => app.set_status("no session selected"),
         },
+        AppAction::KillSession => match app.selected_session_id() {
+            Some(session_id) => {
+                spawn_call(ui_tx, socket_path, DaemonCall::Kill { session_id });
+                app.set_status("killing session…");
+            }
+            None => app.set_status("no session selected"),
+        },
+        AppAction::ResumeSession => match app.selected_session_id() {
+            Some(session_id) => {
+                spawn_call(ui_tx, socket_path, DaemonCall::Resume { session_id });
+                app.set_status("resuming session…");
+            }
+            None => app.set_status("no session selected"),
+        },
     }
     false
 }
@@ -298,6 +318,14 @@ fn spawn_call(ui_tx: &mpsc::Sender<UiMsg>, socket_path: &Path, call: DaemonCall)
                 DaemonCall::Cancel { session_id } => match client.cancel(session_id).await {
                     Ok(()) => UiMsg::Status("prompt cancelled".to_string()),
                     Err(e) => UiMsg::Status(format!("cancel failed: {e}")),
+                },
+                DaemonCall::Kill { session_id } => match client.kill(session_id).await {
+                    Ok(()) => UiMsg::Status("session killed".to_string()),
+                    Err(e) => UiMsg::Status(format!("kill failed: {e}")),
+                },
+                DaemonCall::Resume { session_id } => match client.resume(session_id).await {
+                    Ok(()) => UiMsg::Status("session resumed".to_string()),
+                    Err(e) => UiMsg::Status(format!("resume failed: {e}")),
                 },
                 DaemonCall::Create {
                     workspace,

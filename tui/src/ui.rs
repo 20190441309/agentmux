@@ -524,7 +524,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     };
     let hints = match app.mode {
         InputMode::Normal => {
-            "q quit · j/k select · i prompt · n new · @ relay · tab files · ^c cancel"
+            "q quit · j/k select · i prompt · n new · @ relay · x kill · r resume · tab files · ^c cancel"
         }
         InputMode::Editing => "enter send · esc normal",
         InputMode::RelayPick => match app.relay.as_ref().map(|r| r.stage) {

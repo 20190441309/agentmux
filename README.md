@@ -119,6 +119,8 @@ pick an agent. Then `i` to type a prompt and `Enter` to send it.
 | Normal | `n` | new-session wizard (project → workspace → agent) |
 | Normal | `@` | relay: pick one of this session's events → target session |
 | Normal | `Tab` | toggle the "files touched" panel (path list — no diff highlighting yet) |
+| Normal | `x` | kill the selected session (recoverable via `r`) |
+| Normal | `r` | resume a `done`/`error` session on a fresh adapter connection |
 | Normal | `Ctrl-C` | cancel the selected session's in-flight turn |
 | Editing | `Enter` | send prompt (staged `@` relays ride along) |
 | Editing | `Esc` / `Ctrl-C` | back to Normal |
