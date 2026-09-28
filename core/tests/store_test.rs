@@ -4,7 +4,9 @@
 //! daemon uses under `~/.local/share/agentmux/`.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use agentmux_core::id::{AgentId, ProjectId, SessionId, WorkspaceId};
 use agentmux_core::model::{
@@ -288,6 +290,77 @@ fn every_event_kind_survives_the_jsonl_roundtrip() {
             .unwrap();
     }
     assert_eq!(store.read_events(session.id).unwrap().len(), 5);
+}
+
+/// Path of `session_id`'s JSONL log inside `data_dir`.
+fn event_log_path(data_dir: &Path, session_id: SessionId) -> PathBuf {
+    data_dir
+        .join("sessions")
+        .join(format!("{session_id}.jsonl"))
+}
+
+/// Append raw bytes to `session_id`'s log, bypassing `Store` — used to
+/// simulate a crash that left a torn or corrupt line on disk.
+fn append_raw(data_dir: &Path, session_id: SessionId, bytes: &[u8]) {
+    let mut f = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(event_log_path(data_dir, session_id))
+        .unwrap();
+    f.write_all(bytes).unwrap();
+}
+
+#[test]
+fn torn_tail_is_tolerated_and_next_append_heals_it() {
+    let (dir, store) = temp_store();
+    let (_p, _w, _a, session) = scaffold(&store);
+    let e0 = sample_event(session.id, 0);
+    let e1 = sample_event(session.id, 1);
+    store.append_event(&e0).unwrap();
+    store.append_event(&e1).unwrap();
+
+    // Simulate a daemon crash mid-append: a partial JSON object with no
+    // terminating newline.
+    append_raw(dir.path(), session.id, b"{\"session_id\":\"deadbeef");
+
+    // The torn tail is dropped; the complete events still replay.
+    assert_eq!(
+        store.read_events(session.id).unwrap(),
+        vec![e0.clone(), e1.clone()],
+        "torn final line must not poison the readable prefix"
+    );
+
+    // The next append truncates the torn tail first, so the new event does
+    // not glue onto it and the log stays fully parseable.
+    let e2 = sample_event(session.id, 2);
+    store.append_event(&e2).unwrap();
+    assert_eq!(store.read_events(session.id).unwrap(), vec![e0, e1, e2]);
+    let raw = std::fs::read_to_string(event_log_path(dir.path(), session.id)).unwrap();
+    assert_eq!(raw.lines().count(), 3);
+    assert!(raw.ends_with('\n'));
+}
+
+#[test]
+fn corrupt_complete_line_still_errors_loudly() {
+    let (dir, store) = temp_store();
+    let (_p, _w, _a, session) = scaffold(&store);
+    store.append_event(&sample_event(session.id, 0)).unwrap();
+
+    // A newline-terminated garbage line is *complete* corruption, not a
+    // torn write — mid-file and even as the last content line it must
+    // error rather than be silently dropped.
+    append_raw(dir.path(), session.id, b"this is not json\n");
+
+    assert!(
+        store.read_events(session.id).is_err(),
+        "a complete malformed line must error loudly"
+    );
+
+    // A file that is *only* a torn tail (no newline at all) yields no
+    // events instead of erroring.
+    let other = SessionId::new();
+    append_raw(dir.path(), other, b"{\"partial");
+    assert_eq!(store.read_events(other).unwrap(), Vec::<Event>::new());
 }
 
 #[test]

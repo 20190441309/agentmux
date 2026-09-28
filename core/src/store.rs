@@ -12,8 +12,8 @@
 //! `serde_json` strings. `Event.seq` is assigned by the caller — the store
 //! only persists it and guarantees `read_events` returns rows in seq order.
 
-use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -313,46 +313,69 @@ impl Store {
     /// job. The file is opened per call, so appends interleaved across many
     /// sessions stay cheap and there is no per-session writer state to
     /// flush on crash.
+    ///
+    /// Crash safety: if a previous write was torn (the file does not end
+    /// with `'\n'`), the partial tail is truncated *before* appending so it
+    /// can never glue onto this event's line. The event itself is written
+    /// as a single `write_all` of `json + '\n'`, keeping the torn window as
+    /// small as a single syscall can make it.
     pub fn append_event(&self, ev: &Event) -> Result<()> {
         let path = self.event_log_path(ev.session_id);
         let mut file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&path)
             .with_context(|| format!("failed to open event log {}", path.display()))?;
-        let line = serde_json::to_string(ev).context("failed to serialize event")?;
+        drop_torn_tail(&mut file, &path)?;
+
+        let mut line = serde_json::to_string(ev).context("failed to serialize event")?;
+        line.push('\n');
         file.write_all(line.as_bytes())
-            .and_then(|()| file.write_all(b"\n"))
             .with_context(|| format!("failed to append to {}", path.display()))?;
         Ok(())
     }
 
     /// Read all persisted events of `session_id`, sorted by `seq`.
     ///
-    /// A session with no log file yields an empty vec. Blank lines (e.g. a
-    /// truncated final write) are skipped; a malformed non-blank line is a
+    /// A session with no log file yields an empty vec. Blank lines are
+    /// skipped. A non-blank **final** line that fails to parse is a torn
+    /// tail — a crash mid-append — and is dropped so a dead daemon can
+    /// still replay the session (this is the recovery path the log exists
+    /// for). A malformed *complete* line (anything before a `'\n'`) is a
     /// hard error rather than silently dropping history.
     pub fn read_events(&self, session_id: SessionId) -> Result<Vec<Event>> {
         let path = self.event_log_path(session_id);
-        let file = match std::fs::File::open(&path) {
-            Ok(f) => f,
+        let raw = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => {
                 return Err(e)
-                    .with_context(|| format!("failed to open event log {}", path.display()))
+                    .with_context(|| format!("failed to read event log {}", path.display()))
             }
         };
 
+        // `split` yields a trailing empty slice when the file ends with
+        // `'\n'`, so a non-blank element at `last` can only exist when the
+        // final line is unterminated — i.e. torn.
+        let lines: Vec<&[u8]> = raw.split(|&b| b == b'\n').collect();
+        let last = lines.len() - 1;
+
         let mut events = Vec::new();
-        for (idx, line) in BufReader::new(file).lines().enumerate() {
-            let line = line
-                .with_context(|| format!("failed to read {} line {}", path.display(), idx + 1))?;
-            if line.trim().is_empty() {
+        for (idx, bytes) in lines.iter().enumerate() {
+            if bytes.iter().all(|b| b.is_ascii_whitespace()) {
                 continue;
             }
-            events.push(serde_json::from_str::<Event>(&line).with_context(|| {
-                format!("malformed event in {} line {}", path.display(), idx + 1)
-            })?);
+            match serde_json::from_slice::<Event>(bytes) {
+                Ok(ev) => events.push(ev),
+                // Torn tail: partial write left by a crash; drop it.
+                Err(_) if idx == last => break,
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("malformed event in {} line {}", path.display(), idx + 1)
+                    })
+                }
+            }
         }
         events.sort_by_key(|e| e.seq);
         Ok(events)
@@ -399,6 +422,31 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at     TEXT NOT NULL
 );
 ";
+
+/// If `file` does not end with `'\n'`, a previous append was torn by a
+/// crash — truncate back to the last complete line so the next append
+/// starts on a line boundary. The check itself is a 1-byte read at EOF;
+/// the full scan for the last `'\n'` only runs on the rare torn path.
+fn drop_torn_tail(file: &mut File, path: &Path) -> Result<()> {
+    if file.metadata()?.len() == 0 {
+        return Ok(());
+    }
+    let mut byte = [0u8; 1];
+    file.seek(SeekFrom::End(-1))?;
+    file.read_exact(&mut byte)?;
+    if byte[0] == b'\n' {
+        return Ok(());
+    }
+
+    file.seek(SeekFrom::Start(0))?;
+    let mut raw = Vec::new();
+    file.read_to_end(&mut raw)?;
+    // No newline at all means the whole file is one torn line.
+    let keep = raw.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    file.set_len(keep as u64)
+        .with_context(|| format!("failed to truncate torn tail of {}", path.display()))?;
+    Ok(())
+}
 
 /// View a `Path` as `&str` for storage. Errors rather than silently
 /// corrupting a non-UTF-8 path via `to_string_lossy`.
