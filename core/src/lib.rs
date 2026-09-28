@@ -4,9 +4,11 @@
 //! the server, the client/TUI and tests, and can cross the wire between them
 //! unchanged. The exceptions: [`worktree`] shells out to `git` to manage the
 //! worktrees backing each workspace, [`config`] reads the TOML config file,
-//! and [`registry`] probes agent binaries on the filesystem.
+//! [`registry`] probes agent binaries on the filesystem, and [`collab`]
+//! maintains the `.agentmux/` blackboard shared by sessions in a worktree.
 
 pub mod acp_conn;
+pub mod collab;
 pub mod config;
 pub mod id;
 pub mod model;
