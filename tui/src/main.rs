@@ -13,6 +13,7 @@
 
 mod app;
 mod input;
+mod newsession;
 mod ui;
 
 use std::error::Error;
@@ -21,34 +22,57 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use agentmux_client::DaemonClient;
-use agentmux_core::{AgentId, Event, SessionId, WorkspaceId};
+use agentmux_core::{AgentId, Event, SessionId, SessionRef, Workspace};
 use crossterm::event::{Event as TermEvent, EventStream};
 use futures_util::{Stream, StreamExt};
 use tokio::sync::mpsc;
 
-use crate::app::{App, AppAction, SessionView};
+use crate::app::{App, AppAction, PendingRelay, SessionView};
+use crate::newsession::WorkspacePick;
 
 /// Result of a spawned daemon call, reported back to the UI loop.
 enum UiMsg {
     /// Something to show in the status bar (success note or error).
     Status(String),
     /// `session/create` succeeded — insert into the list + select it.
-    Created(SessionView),
+    /// `new_workspace` is the workspace the wizard just created, so the
+    /// session groups under its header even before a reload. Boxed:
+    /// `SessionView` dwarfs the `Status` variant.
+    Created {
+        view: Box<SessionView>,
+        new_workspace: Option<Workspace>,
+    },
 }
 
 /// A daemon operation the loop can run on a background task.
 enum DaemonCall {
     /// `session/prompt` — blocks until the turn finishes.
-    Prompt { session_id: SessionId, text: String },
+    Prompt {
+        session_id: SessionId,
+        text: String,
+        references: Vec<SessionRef>,
+    },
+    /// `workspace/create` (for [`WorkspacePick::New`]) then
     /// `session/create`.
     Create {
-        workspace_id: WorkspaceId,
+        workspace: WorkspacePick,
         agent_id: AgentId,
         agent_name: String,
-        workspace_name: String,
     },
     /// `session/cancel` — interrupts the in-flight turn.
     Cancel { session_id: SessionId },
+}
+
+/// Map staged relays onto the wire `SessionRef` shape: the referenced
+/// session is the *source*; `target` only guided where the prompt goes.
+fn session_refs(relays: &[PendingRelay]) -> Vec<SessionRef> {
+    relays
+        .iter()
+        .map(|r| SessionRef {
+            session_id: r.source,
+            event_seq: r.seq,
+        })
+        .collect()
 }
 
 fn usage() -> &'static str {
@@ -59,8 +83,8 @@ fn usage() -> &'static str {
      Connects to the daemon socket ($AGENTMUX_SOCK or the default data\n\
      dir), starting the daemon first when needed.\n\
      \n\
-     Keys: q quit · j/k select · i/a prompt · n new session ·\n\
-     \x20     @ relay (T14) · ctrl-c cancel prompt"
+     Keys: q quit · j/k select · i/a prompt · n new-session wizard ·\n\
+     \x20     @ relay event→session · tab files panel · ctrl-c cancel"
 }
 
 #[tokio::main]
@@ -129,7 +153,7 @@ async fn snapshot(client: &mut DaemonClient) -> Result<App, Box<dyn Error>> {
             });
         }
     }
-    Ok(App::new(workspaces, views, agents))
+    Ok(App::new(projects, workspaces, views, agents))
 }
 
 /// How often the loop polls [`DaemonClient::is_closed`]. The event
@@ -199,39 +223,48 @@ fn dispatch(
     match action {
         AppAction::None => {}
         AppAction::Quit => return true,
-        AppAction::Submit(text) => match app.selected_session_id() {
+        AppAction::Submit { text, references } => match app.selected_session_id() {
             Some(session_id) => {
-                spawn_call(ui_tx, socket_path, DaemonCall::Prompt { session_id, text });
+                // `App` staged relays in its own terms; the wire wants
+                // `SessionRef`s — `source`/`seq` only.
+                let references = session_refs(&references);
+                spawn_call(
+                    ui_tx,
+                    socket_path,
+                    DaemonCall::Prompt {
+                        session_id,
+                        text,
+                        references,
+                    },
+                );
                 app.set_status("prompt sent…");
             }
             None => app.set_status("no session selected"),
         },
-        // Minimal v1 flow: first workspace + first available agent
-        // (falling back to the first agent). The full picker is T14.
-        AppAction::NewSession => {
-            let workspace = app.workspaces.first();
-            let agent = app
+        AppAction::CreateSession {
+            workspace,
+            agent_id,
+        } => {
+            let agent_name = app
                 .agents
                 .iter()
-                .find(|a| a.available)
-                .or_else(|| app.agents.first());
-            match (workspace, agent) {
-                (Some(ws), Some(agent)) => {
-                    spawn_call(
-                        ui_tx,
-                        socket_path,
-                        DaemonCall::Create {
-                            workspace_id: ws.id,
-                            agent_id: agent.id.clone(),
-                            agent_name: agent.name.clone(),
-                            workspace_name: ws.name.clone(),
-                        },
-                    );
-                    app.set_status(format!("creating session in {}…", ws.name));
-                }
-                (None, _) => app.set_status("no workspace registered — create one first"),
-                (_, None) => app.set_status("no agent configured"),
-            }
+                .find(|a| a.id == agent_id)
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| agent_id.to_string());
+            let label = match &workspace {
+                WorkspacePick::Existing { name, .. } => name.clone(),
+                WorkspacePick::New { name, .. } => format!("new workspace {name}"),
+            };
+            spawn_call(
+                ui_tx,
+                socket_path,
+                DaemonCall::Create {
+                    workspace,
+                    agent_id,
+                    agent_name,
+                },
+            );
+            app.set_status(format!("creating session in {label}…"));
         }
         AppAction::CancelPrompt => match app.selected_session_id() {
             Some(session_id) => {
@@ -240,9 +273,6 @@ fn dispatch(
             }
             None => app.set_status("no session selected"),
         },
-        AppAction::Relay => {
-            app.set_status("relay: not wired yet — lands in Task 14");
-        }
     }
     false
 }
@@ -257,28 +287,28 @@ fn spawn_call(ui_tx: &mpsc::Sender<UiMsg>, socket_path: &Path, call: DaemonCall)
     tokio::spawn(async move {
         let msg = match DaemonClient::connect_existing(&socket_path).await {
             Ok(mut client) => match call {
-                DaemonCall::Prompt { session_id, text } => {
-                    match client.prompt(session_id, text, vec![]).await {
-                        Ok(()) => UiMsg::Status("prompt turn finished".to_string()),
-                        Err(e) => UiMsg::Status(format!("prompt failed: {e}")),
-                    }
-                }
+                DaemonCall::Prompt {
+                    session_id,
+                    text,
+                    references,
+                } => match client.prompt(session_id, text, references).await {
+                    Ok(()) => UiMsg::Status("prompt turn finished".to_string()),
+                    Err(e) => UiMsg::Status(format!("prompt failed: {e}")),
+                },
                 DaemonCall::Cancel { session_id } => match client.cancel(session_id).await {
                     Ok(()) => UiMsg::Status("prompt cancelled".to_string()),
                     Err(e) => UiMsg::Status(format!("cancel failed: {e}")),
                 },
                 DaemonCall::Create {
-                    workspace_id,
+                    workspace,
                     agent_id,
                     agent_name,
-                    workspace_name,
-                } => match client.create_session(workspace_id, agent_id, None).await {
-                    Ok(session) => UiMsg::Created(SessionView {
-                        session,
-                        agent_name,
-                        workspace_name,
-                    }),
-                    Err(e) => UiMsg::Status(format!("session/create failed: {e}")),
+                } => match create_session(&mut client, workspace, agent_id, agent_name).await {
+                    Ok((view, new_workspace)) => UiMsg::Created {
+                        view: Box::new(view),
+                        new_workspace,
+                    },
+                    Err(e) => UiMsg::Status(e),
                 },
             },
             Err(e) => UiMsg::Status(format!("daemon unreachable: {e}")),
@@ -288,14 +318,100 @@ fn spawn_call(ui_tx: &mpsc::Sender<UiMsg>, socket_path: &Path, call: DaemonCall)
     });
 }
 
+/// `session/create`, preceded by `workspace/create` when the wizard
+/// asked for a fresh worktree. Returns the session view plus the new
+/// workspace (so the UI can grow its grouping list).
+async fn create_session(
+    client: &mut DaemonClient,
+    workspace: WorkspacePick,
+    agent_id: AgentId,
+    agent_name: String,
+) -> Result<(SessionView, Option<Workspace>), String> {
+    let (workspace_id, workspace_name, new_workspace) = match workspace {
+        WorkspacePick::Existing { id, name } => (id, name, None),
+        WorkspacePick::New { project_id, name } => client
+            .create_workspace(project_id, name, None)
+            .await
+            .map(|ws| (ws.id, ws.name.clone(), Some(ws)))
+            .map_err(|e| format!("workspace/create failed: {e}"))?,
+    };
+    client
+        .create_session(workspace_id, agent_id, None)
+        .await
+        .map(|session| {
+            (
+                SessionView {
+                    session,
+                    agent_name,
+                    workspace_name,
+                },
+                new_workspace,
+            )
+        })
+        .map_err(|e| format!("session/create failed: {e}"))
+}
+
 /// Apply a spawned-call result to the UI.
 fn apply_msg(app: &mut App, msg: UiMsg) {
     match msg {
         UiMsg::Status(s) => app.set_status(s),
-        UiMsg::Created(view) => {
-            let index = app.add_session(view);
+        UiMsg::Created {
+            view,
+            new_workspace,
+        } => {
+            // A wizard-created workspace joins the grouping list so the
+            // new session renders under its header.
+            if let Some(ws) = new_workspace {
+                if !app.workspaces.iter().any(|w| w.id == ws.id) {
+                    app.workspaces.push(ws);
+                }
+            }
+            let index = app.add_session(*view);
             app.selected = index;
             app.set_status("session created");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentmux_core::rpc::{SessionPromptParams, M_SESSION_PROMPT};
+
+    /// Brief test ①: the Submit path must produce `session/prompt`
+    /// params whose `references` carry the staged relays — `source` →
+    /// `session_id`, `seq` → `event_seq` (target is not on the wire).
+    #[test]
+    fn staged_relays_become_session_ref_params() {
+        let src = SessionId::new();
+        let target = SessionId::new();
+        let relays = vec![PendingRelay {
+            source: src,
+            seq: 7,
+            target,
+        }];
+        let refs = session_refs(&relays);
+        assert_eq!(
+            refs,
+            vec![SessionRef {
+                session_id: src,
+                event_seq: 7
+            }]
+        );
+
+        // …and they serialize onto the wire shape unchanged.
+        let prompt_target = SessionId::new();
+        let params = SessionPromptParams {
+            session_id: prompt_target,
+            text: "incorporate it".into(),
+            references: refs,
+        };
+        let v = serde_json::to_value(&params).unwrap();
+        assert_eq!(v["method"], serde_json::Value::Null); // params only
+        assert_eq!(
+            v["references"],
+            serde_json::json!([{"session_id": src, "event_seq": 7}])
+        );
+        assert_eq!(M_SESSION_PROMPT, "session/prompt");
     }
 }
