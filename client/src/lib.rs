@@ -406,13 +406,17 @@ impl DaemonClient {
     /// `Stream`.
     ///
     /// The server acks the subscribe request before arming its forwarder,
-    /// so when this resolves the stream is live. A receiver that falls
-    /// more than [`EVENT_CHANNEL`] events behind gets a synthetic
-    /// [`EventKind::Orchestrator`] note under the nil session id — the
-    /// same lag convention the server uses.
+    /// so when this resolves the stream is live. The broadcast receiver is
+    /// created *before* the request is sent — the reader task fans
+    /// notifications into a channel with zero receivers only between the
+    /// ack and receiver creation, and this ordering removes that gap.
+    /// A receiver that falls more than [`EVENT_CHANNEL`] events behind
+    /// gets a synthetic [`EventKind::Orchestrator`] note under the nil
+    /// session id — the same lag convention the server uses.
     pub async fn subscribe_events(&mut self) -> Result<impl Stream<Item = Event> + Send + 'static> {
+        let rx = self.events();
         self.call(M_SESSION_SUBSCRIBE, ()).await?;
-        Ok(event_stream(self.events()))
+        Ok(event_stream(rx))
     }
 
     /// `project/register` → the created [`Project`].
