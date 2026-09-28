@@ -15,6 +15,7 @@ pub mod model;
 pub mod orchestrator;
 pub mod pi_rpc;
 pub mod registry;
+pub mod rpc;
 pub mod store;
 pub mod worktree;
 
@@ -29,5 +30,6 @@ pub use model::{
 pub use orchestrator::{Orchestrator, SpawnedConn};
 pub use pi_rpc::PiConn;
 pub use registry::AgentRegistry;
+pub use rpc::RpcError;
 pub use store::Store;
 pub use worktree::WorktreeManager;
