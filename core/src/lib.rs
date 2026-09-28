@@ -7,6 +7,7 @@
 
 pub mod id;
 pub mod model;
+pub mod store;
 pub mod worktree;
 
 pub use anyhow::Result;
@@ -15,4 +16,5 @@ pub use model::{
     AdapterKind, AgentProfile, Event, EventKind, Project, Session, SessionRef, SessionState,
     Workspace,
 };
+pub use store::Store;
 pub use worktree::WorktreeManager;
