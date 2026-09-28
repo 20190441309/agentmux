@@ -40,10 +40,12 @@
 //! - `prompt(session_id, text)` — sends `prompt`; the response's
 //!   `data.disposition` only reports acceptance. To match ACP's
 //!   "resolves when the turn ends" shape we then wait for the
-//!   `agent_settled` event (pi's "no remaining automatic work" signal).
-//!   `disposition == "handled"` means an extension consumed the prompt
-//!   and no run starts, so it resolves immediately. `session_id` is
-//!   unused — pi tracks one session per process.
+//!   `agent_settled` record (pi's "no remaining automatic work" signal)
+//!   via the dedicated `SettledWatch` — deliberately not the lossy
+//!   broadcast bus, which can drop records under lag. `disposition ==
+//!   "handled"` means an extension consumed the prompt and no run
+//!   starts, so it resolves immediately. `session_id` is unused — pi
+//!   tracks one session per process.
 //! - `cancel(session_id)` — sends `abort`, which waits for the session to
 //!   go idle before responding.
 //!
@@ -66,7 +68,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     thread::JoinHandle,
@@ -79,7 +81,7 @@ use serde_json::Value;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::ChildStdout,
-    sync::{broadcast, mpsc, oneshot},
+    sync::{broadcast, mpsc, oneshot, Notify},
 };
 use uuid::Uuid;
 
@@ -212,6 +214,58 @@ fn extract_session_id(state: &Value) -> Option<String> {
     None
 }
 
+/// Turn-completion signaling shared between the stdout reader and prompt
+/// waiters — deliberately independent of the lossy broadcast ring.
+///
+/// The event bus (`broadcast`, capacity 256) exists for *consumers*, who
+/// tolerate lag. A prompt's end-of-turn wait must NOT ride it: a burst of
+/// over-256 `message_update` deltas inside one read chunk can overflow
+/// the ring and a `Lagged` receiver silently skips the dropped range — if
+/// a settling record were ever skipped, `prompt` would hang until process
+/// exit. Instead the reader bumps `gen` every time it sees
+/// `agent_settled` and wakes `notify`; waiters compare against the
+/// generation they snapshotted *before* sending their prompt, so a settle
+/// from history cannot resolve them early.
+struct SettledWatch {
+    /// How many `agent_settled` records the reader has seen so far.
+    gen: AtomicU64,
+    /// The stdout reader ended (EOF or read error) — no settle can arrive.
+    reader_done: AtomicBool,
+    /// Wakes waiters when `gen` advances or `reader_done` flips.
+    notify: Notify,
+}
+
+impl SettledWatch {
+    fn new() -> Self {
+        Self {
+            gen: AtomicU64::new(0),
+            reader_done: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    /// Generation snapshot taken before sending a prompt.
+    fn snapshot(&self) -> u64 {
+        self.gen.load(Ordering::SeqCst)
+    }
+
+    /// The reader saw an `agent_settled` record.
+    fn note_settled(&self) {
+        self.gen.fetch_add(1, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    /// The stdout reader is done — settle will never arrive again.
+    fn note_reader_done(&self) {
+        self.reader_done.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn is_done(&self) -> bool {
+        self.reader_done.load(Ordering::SeqCst)
+    }
+}
+
 /// Commands sent from a [`PiConn`] handle to its worker thread.
 enum Cmd {
     Initialize(oneshot::Sender<Result<Value>>),
@@ -334,11 +388,17 @@ impl PiConn {
     }
 
     /// Send a user prompt; resolves when the agent settles (the
-    /// `agent_settled` event — pi's "no remaining automatic work" signal,
-    /// matching ACP's end-of-turn resolution). A `disposition:"handled"`
-    /// response resolves immediately since no run starts.
+    /// `agent_settled` record — pi's "no remaining automatic work"
+    /// signal, matching ACP's end-of-turn resolution). A
+    /// `disposition:"handled"` response resolves immediately since no
+    /// run starts.
     ///
     /// `session_id` is unused: pi tracks one session per process.
+    ///
+    /// Assumption (v1): the orchestrator serializes prompt/cancel per
+    /// session. A stray `agent_settled` emitted between this call and
+    /// the run's start — e.g. a concurrent `abort` — can resolve the
+    /// wait early; pi events carry no run id to disambiguate.
     pub async fn prompt(&mut self, session_id: &str, text: String) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::Prompt {
@@ -440,9 +500,9 @@ struct RpcCore {
     pending: PendingMap,
     /// Monotonic id source for command correlation (`agentmux-N`).
     next_id: Arc<AtomicU64>,
-    /// Bus for session events; also used by `prompt` to watch for
-    /// `agent_settled`.
-    event_tx: broadcast::Sender<Event>,
+    /// Turn-completion signal fed by the stdout reader — `prompt` waits on
+    /// this, not on the lossy broadcast ring.
+    watch: Arc<SettledWatch>,
 }
 
 impl RpcCore {
@@ -523,11 +583,12 @@ fn actor_main(
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
 
+        let watch = Arc::new(SettledWatch::new());
         let core = RpcCore {
             stdin: Arc::new(tokio::sync::Mutex::new(stdin)),
             pending: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(1)),
-            event_tx: event_tx.clone(),
+            watch: watch.clone(),
         };
 
         // Drive the stdout record loop in the background; on EOF it fails
@@ -535,6 +596,7 @@ fn actor_main(
         tokio::spawn(read_loop(
             stdout,
             core.pending.clone(),
+            watch,
             event_tx.clone(),
             session_id,
         ));
@@ -587,10 +649,12 @@ fn log_noop_wait_error(_e: &std::io::Error) {
 
 /// The stdout reader: buffer bytes, split **only** on LF via
 /// [`take_record`], and dispatch each record — responses to the pending
-/// map, events to the bus. On EOF, fail all pending commands.
+/// map, events to the bus, `agent_settled` to the [`SettledWatch`]. On
+/// EOF, fail all pending commands and all settle waiters.
 async fn read_loop(
     mut stdout: ChildStdout,
     pending: PendingMap,
+    watch: Arc<SettledWatch>,
     event_tx: broadcast::Sender<Event>,
     session_id: SessionId,
 ) {
@@ -602,7 +666,7 @@ async fn read_loop(
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
                 while let Some(rec) = take_record(&mut buf) {
-                    handle_record(&rec, &pending, &event_tx, session_id);
+                    handle_record(&rec, &pending, &watch, &event_tx, session_id);
                 }
             }
             Err(e) => {
@@ -618,20 +682,24 @@ async fn read_loop(
     // Tolerate a torn tail: try to decode whatever the last partial
     // record left in the buffer before giving up on it.
     if !buf.is_empty() {
-        handle_record(&buf, &pending, &event_tx, session_id);
+        handle_record(&buf, &pending, &watch, &event_tx, session_id);
     }
     // The agent is gone: no response will ever arrive for these ids.
     for (_, tx) in pending.lock().unwrap().drain() {
         let _ = tx.send(Err(anyhow!("pi process closed stdout")));
     }
+    // …and no `agent_settled` will ever arrive either.
+    watch.note_reader_done();
 }
 
-/// Dispatch one decoded record: response → pending map, event → bus,
-/// junk → an `Orchestrator` note (pi's stdout is reserved for JSONL, so
-/// anomalies deserve to be visible).
+/// Dispatch one decoded record: response → pending map, event → bus (and
+/// `agent_settled` → [`SettledWatch`]), junk → an `Orchestrator` note
+/// (pi's stdout is reserved for JSONL, so anomalies deserve to be
+/// visible).
 fn handle_record(
     rec: &[u8],
     pending: &PendingMap,
+    watch: &SettledWatch,
     event_tx: &broadcast::Sender<Event>,
     session_id: SessionId,
 ) {
@@ -685,6 +753,9 @@ fn handle_record(
             ),
         },
         Classified::Event(value) => {
+            if value.get("type").and_then(|t| t.as_str()) == Some("agent_settled") {
+                watch.note_settled();
+            }
             emit(event_tx, session_id, EventKind::SessionUpdate(value));
         }
         Classified::Junk => {
@@ -701,31 +772,41 @@ fn handle_record(
     }
 }
 
-/// Wait for the `agent_settled` event on the bus — pi's signal that the
-/// session-level run has no remaining automatic work (the closest analog
-/// of ACP's prompt end-of-turn). Terminal conditions: `AgentExited` or a
-/// closed event stream.
-async fn wait_for_settled(rx: &mut broadcast::Receiver<Event>) -> Result<()> {
+/// Wait for `agent_settled` — pi's signal that the session-level run has
+/// no remaining automatic work (the closest analog of ACP's prompt
+/// end-of-turn) — via the dedicated [`SettledWatch`], NOT the broadcast
+/// bus. The bus is lossy under lag; this signal is not.
+///
+/// `since` is the generation snapshotted before the prompt was sent: only
+/// a settle *after* that point resolves the wait. A settle that lands
+/// between snapshot and our own run's start (e.g. `abort` racing a
+/// `prompt`) can still resolve early — pi events carry no run id to
+/// disambiguate. v1 accepts this: the orchestrator serializes
+/// prompt/cancel per session (Task 9), so `since` can only be beaten by
+/// our own run.
+///
+/// Terminal condition: the stdout reader finishing (`reader_done`) means
+/// no settle will ever arrive → `Err`.
+async fn wait_for_settled(watch: &SettledWatch, since: u64) -> Result<()> {
     loop {
-        match rx.recv().await {
-            Ok(event) => match &event.kind {
-                EventKind::SessionUpdate(v)
-                    if v.get("type").and_then(|t| t.as_str()) == Some("agent_settled") =>
-                {
-                    return Ok(())
-                }
-                EventKind::AgentExited { .. } => {
-                    return Err(anyhow!("pi agent exited before the prompt settled"))
-                }
-                _ => {}
-            },
-            // A lagging receiver skips ahead — 256 buffered events per turn
-            // is generous, so falling behind just keeps watching.
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(broadcast::error::RecvError::Closed) => {
-                return Err(anyhow!("pi event stream closed before the prompt settled"))
-            }
+        if watch.gen.load(Ordering::SeqCst) > since {
+            return Ok(());
         }
+        if watch.is_done() {
+            return Err(anyhow!("pi agent exited before the prompt settled"));
+        }
+        // Register the waiter *before* re-checking so a notification
+        // landing between check and await cannot be missed.
+        let notified = watch.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if watch.gen.load(Ordering::SeqCst) > since {
+            return Ok(());
+        }
+        if watch.is_done() {
+            return Err(anyhow!("pi agent exited before the prompt settled"));
+        }
+        notified.await;
     }
 }
 
@@ -767,9 +848,11 @@ async fn handle_cmd(core: RpcCore, cmd: Cmd) {
             reply,
         } => {
             let _ = session_id; // parity arg; pi tracks one session per process
-            // Subscribe *before* the request so the settling event can't
-            // slip past between the response and the watch.
-            let mut events = core.event_tx.subscribe();
+            // Snapshot the settle generation *before* the request so only
+            // a settle from our own run can resolve the wait — settles
+            // already in history are excluded (see `wait_for_settled` for
+            // the documented concurrent-abort caveat).
+            let since = core.watch.snapshot();
             let result = match core
                 .request(serde_json::json!({"type": "prompt", "message": text}))
                 .await
@@ -785,7 +868,7 @@ async fn handle_cmd(core: RpcCore, cmd: Cmd) {
                 }
                 // `started`/`queued`/unspecified: a run is (or will be)
                 // active — resolve when pi says the session settled.
-                Ok(_) => wait_for_settled(&mut events).await,
+                Ok(_) => wait_for_settled(&core.watch, since).await,
             };
             let _ = reply.send(result);
         }
@@ -826,6 +909,43 @@ mod tests {
         buf.extend_from_slice(b"\n");
         assert_eq!(take_record(&mut buf).unwrap(), b"rest");
         assert!(take_record(&mut buf).is_none());
+    }
+
+    /// A settle that happened *before* the snapshot must not resolve the
+    /// wait; only a generation advance after it does.
+    #[tokio::test]
+    async fn settled_watch_resolves_only_on_new_settle() {
+        let watch = Arc::new(SettledWatch::new());
+        watch.note_settled(); // history — before our prompt's snapshot
+        let since = watch.snapshot();
+
+        let w = watch.clone();
+        let waiter = tokio::spawn(async move { wait_for_settled(&w, since).await });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "a settle from before the snapshot must not resolve the wait"
+        );
+
+        watch.note_settled(); // our run's settle
+        waiter.await.unwrap().unwrap();
+    }
+
+    /// If the stdout reader ends without a settle, the wait errors
+    /// instead of hanging.
+    #[tokio::test]
+    async fn settled_watch_errors_when_reader_ends() {
+        let watch = Arc::new(SettledWatch::new());
+        let w = watch.clone();
+        let waiter = tokio::spawn(async move {
+            let since = w.snapshot();
+            wait_for_settled(&w, since).await
+        });
+        tokio::task::yield_now().await;
+
+        watch.note_reader_done();
+        let err = waiter.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("exited"), "got: {err}");
     }
 
     #[test]

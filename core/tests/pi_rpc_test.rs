@@ -290,6 +290,52 @@ async fn u2028_in_payload_is_not_split() {
     conn.shutdown().await.unwrap();
 }
 
+/// Regression: a turn emitting more records than the 256-cap broadcast
+/// ring can hold must not hang `prompt`. Settle detection rides a
+/// dedicated signal, not the lossy bus — even if a consumer-facing
+/// receiver lags, `prompt` resolves once `agent_settled` is read.
+#[tokio::test]
+async fn prompt_resolves_after_high_event_count_turn() {
+    let (mut conn, dir) = spawn_fake();
+    // A consumer that subscribes but never drains: its receiver lags over
+    // the whole burst. The prompt's own wait must not depend on that ring.
+    let mut rx = conn.events();
+
+    conn.initialize().await.unwrap();
+    let session_id = conn.new_session(dir.path()).await.unwrap();
+
+    tokio::time::timeout(
+        EVENT_TIMEOUT,
+        conn.prompt(&session_id, "burst".to_string()),
+    )
+    .await
+    .expect("prompt hung: settle was lost with the broadcast overflow")
+    .expect("burst prompt should settle successfully");
+
+    // The lagging consumer receiver skipped events — expected — but the
+    // retained tail (which includes the final agent_settled) still shows
+    // the burst happened.
+    let mut saw = 0usize;
+    loop {
+        match rx.try_recv() {
+            Ok(ev) => {
+                if matches!(ev.kind, EventKind::SessionUpdate(_)) {
+                    saw += 1;
+                }
+            }
+            // Skip the lag marker and continue into the retained tail.
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            _ => break,
+        }
+    }
+    assert!(
+        saw > 0,
+        "consumer receiver should retain the tail of the burst"
+    );
+
+    conn.shutdown().await.unwrap();
+}
+
 /// `crash` in the prompt kills the stub mid-turn: the pending prompt
 /// resolves with an error and the bus reports `AgentExited`.
 #[tokio::test]

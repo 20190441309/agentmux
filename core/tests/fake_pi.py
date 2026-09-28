@@ -25,6 +25,10 @@ Contract exercised by `pi_rpc_test.rs`:
 - prompt containing `handled` → `disposition:"handled"`, no event run
 - prompt containing `slow`    → `disposition:"started"` + `agent_start`,
                                 finishing only when `abort` arrives
+- prompt containing `burst`   → `disposition:"started"`, then BURST_COUNT
+                                `message_update` records in one go, then
+                                `agent_settled` — exercises the reader
+                                under a >broadcast-capacity event burst
 - prompt containing `hang`    → never responds (request stays pending)
 - `abort`       → ends a `slow` run (`agent_end` + `agent_settled`), then
                   a success response
@@ -55,6 +59,10 @@ STATE = {
 
 # True while a `slow` prompt run is waiting for `abort`.
 waiting_abort = False
+
+# Event lines emitted by a `burst` prompt — deliberately beyond the 256
+# records a 256-cap broadcast ring can retain.
+BURST_COUNT = 300
 
 
 def send(obj):
@@ -140,6 +148,22 @@ def main():
                 respond(req, "prompt", data={"disposition": "started"})
                 send({"type": "agent_start"})
                 waiting_abort = True
+                continue
+            if "burst" in msg:
+                respond(req, "prompt", data={"disposition": "started"})
+                send({"type": "agent_start"})
+                for i in range(BURST_COUNT):
+                    send({
+                        "type": "message_update",
+                        "usage": {},
+                        "assistantMessageEvent": {
+                            "type": "text_delta",
+                            "contentIndex": 0,
+                            "delta": f"burst chunk {i}",
+                        },
+                    })
+                send({"type": "agent_end", "messages": [], "willRetry": False})
+                send({"type": "agent_settled"})
                 continue
             respond(req, "prompt", data={"disposition": "started"})
             emit_run(msg)
