@@ -4,3 +4,4 @@ members = ["core", "mock-agent", "server", "client", "tui"]
 
 [workspace.package]
 edition = "2021"
+license = "MIT OR Apache-2.0"

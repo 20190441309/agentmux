@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@v2
+
+      - name: rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # `cargo test` builds the `agentmux-mock-agent` fixture itself via
+      # `cargo build -p agentmux-mock-agent` (core/tests/common), so no
+      # pre-build step is needed. Worktree tests create real git repos but
+      # set repo-local `user.email`/`user.name`; pi-rpc tests need `python3`
+      # (preinstalled on ubuntu-latest). No agent API keys are required.
+      - name: test
+        run: cargo test --workspace

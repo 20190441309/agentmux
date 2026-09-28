@@ -1,0 +1,56 @@
+# agentmux configuration example
+#
+# Location: ~/.config/agentmux/config.toml
+# Override with `agentmux-server --config PATH` or $AGENTMUX_CONFIG.
+#
+# Only the [[agents]] tables are read; every other key is ignored, so newer
+# fields can appear in the file without breaking older binaries.
+
+# ---------------------------------------------------------------------------
+# Built-in agents (always present — no config needed)
+#
+# | id          | name        | kind   | command         | args              |
+# |-------------|-------------|--------|-----------------|-------------------|
+# | claude-code | Claude Code | acp    | claude-code-acp | []                |
+# | codex       | Codex       | acp    | codex-acp       | []                |
+# | opencode    | OpenCode    | acp    | opencode        | ["acp"]           |
+# | pi          | Pi          | pi-rpc | pi              | ["--mode", "rpc"] |
+#
+# A [[agents]] entry whose `id` matches a built-in REPLACES that built-in
+# in place — fields you leave unset fall back to per-entry defaults
+# (`name` = `id`, `kind` = "acp", `args` = [], `env` = {}), NOT to the
+# built-in's values. Other entries are appended in file order. There is no
+# "disable a built-in" syntax.
+#
+# `command` is a bare binary name resolved on $PATH at probe time, or a path
+# containing a directory component checked directly. Probing only checks
+# that the binary exists and is executable — no agent process is spawned
+# until you create a session.
+#
+# `kind`: "acp" (default) for agents speaking the Agent Client Protocol
+# over stdio, or "pi-rpc" for a `pi`-style JSONL command/event protocol
+# that agentmux translates internally. Separators and case are ignored:
+# "pi_rpc" and "PiRpc" work too.
+
+# Example 1: point the built-in claude-code entry at a custom binary.
+#
+# [[agents]]
+# id = "claude-code"
+# command = "/opt/claude/bin/claude-code-acp"
+# args = ["--fast"]
+
+# Example 2: register an additional ACP-compatible agent (e.g. kimi,
+# auggie, or the bundled `agentmux-mock-agent` for a smoke test — build it
+# with `cargo build -p agentmux-mock-agent` and point `command` at
+# `<repo>/target/debug/agentmux-mock-agent`).
+
+[[agents]]
+id = "my-agent"          # stable identifier; `name` defaults to this when omitted
+name = "My Agent"        # display name; `id` defaults to this when omitted
+kind = "acp"             # "acp" (default) or "pi-rpc"
+command = "my-agent-acp" # required: binary to spawn for each session
+args = ["--stdio"]       # extra argv passed to the command
+
+# Environment variables for this agent's spawned process.
+[agents.env]
+# MY_AGENT_DEBUG = "1"

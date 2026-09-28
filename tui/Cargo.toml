@@ -2,6 +2,7 @@
 name = "agentmux-tui"
 version = "0.1.0"
 edition.workspace = true
+license.workspace = true
 description = "ratatui terminal client for the agentmux daemon: session list, event stream, prompt input"
 
 [dependencies]
