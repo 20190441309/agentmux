@@ -1,0 +1,14 @@
+[package]
+name = "agentmux-mock-agent"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Deterministic mock ACP agent for agentmux integration tests (Tasks 5/9/11/13)"
+
+[dependencies]
+# Pinned to the exact same release as agentmux-core so client and agent
+# cannot drift onto different wire schemas.
+agent-client-protocol = "=0.10.4"
+async-trait = "0.1"
+tokio = { version = "1", features = ["io-std", "macros", "rt", "sync"] }
+tokio-util = { version = "0.7", features = ["compat"] }

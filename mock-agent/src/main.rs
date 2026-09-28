@@ -1,0 +1,205 @@
+//! `agentmux-mock-agent` — a deterministic ACP agent for agentmux
+//! integration tests (consumed by Tasks 5/9/11/13 and by
+//! `core/tests/acp_e2e_test.rs`).
+//!
+//! It speaks the Agent Client Protocol over stdio, following the
+//! server-side pattern from `agent-client-protocol`'s `examples/agent.rs`:
+//! an [`acp::AgentSideConnection`] on a `current_thread` runtime +
+//! `LocalSet` (the crate's io futures are `!Send`), with session
+//! notifications funnelled through an mpsc channel to a background task
+//! that owns the connection handle.
+//!
+//! # Behaviour contract
+//!
+//! - `initialize` → normal `InitializeResponse` (`agentInfo.name` is
+//!   `"agentmux-mock-agent"`).
+//! - `session/new` → fixed session id [`SESSION_ID`].
+//! - `session/prompt` → sends two `session/update` notifications, in
+//!   order:
+//!     1. `agent_message_chunk` whose text is `"mock reply: <prompt text>"`
+//!        (the echo lets tests correlate a turn with its prompt),
+//!     2. `tool_call` with `kind = "edit"` and location `src/lib.rs`,
+//!        then responds with `stop_reason = "end_turn"`.
+//! - Prompt text containing the token `crash` → `std::process::exit(1)`.
+//! - Prompt text containing the token `exit42` → `std::process::exit(42)`
+//!   (distinct code for `AgentExited` coverage).
+//! - Prompt text containing the token `hang` → the prompt future never
+//!   resolves (for timeout/cancel tests); the agent process stays alive.
+//!
+//! Trigger matching is by whole token (see [`has_trigger`]), not raw
+//! substring — so "changed" doesn't accidentally mean "hang".
+
+use std::cell::Cell;
+
+use agent_client_protocol::{self as acp, Client as _};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
+
+/// Fixed session id returned by every `session/new` — deterministic so
+/// tests can hard-assert on it.
+const SESSION_ID: &str = "mock-session-1";
+
+/// Channel carrying `session/update` notifications from [`MockAgent`] to
+/// the connection task, each paired with a oneshot that resolves once the
+/// notification has been written to the wire. Awaiting that oneshot keeps
+/// update ordering strict and guarantees updates precede the prompt
+/// response.
+type UpdateTx = mpsc::UnboundedSender<(acp::SessionNotification, oneshot::Sender<()>)>;
+
+struct MockAgent {
+    session_update_tx: UpdateTx,
+    /// Monotonic ids for the tool calls we report.
+    next_tool_call_id: Cell<u64>,
+}
+
+impl MockAgent {
+    /// Queue one `session/update` and wait until the connection task has
+    /// flushed it. Errors when the connection is gone map to
+    /// `internal_error`, failing the in-flight prompt.
+    async fn send_update(
+        &self,
+        session_id: &acp::SessionId,
+        update: acp::SessionUpdate,
+    ) -> Result<(), acp::Error> {
+        let (tx, rx) = oneshot::channel();
+        self.session_update_tx
+            .send((
+                acp::SessionNotification::new(session_id.clone(), update),
+                tx,
+            ))
+            .map_err(|_| acp::Error::internal_error())?;
+        rx.await.map_err(|_| acp::Error::internal_error())
+    }
+}
+
+/// Whether `text` contains `word` as a whole token (bounded by
+/// non-alphanumeric characters).
+///
+/// Triggers are matched by token, not substring: prose like "changed" or
+/// "exchanging" must not trip the `hang` trigger — e.g. the
+/// orchestrator's shared-context preamble legitimately contains both.
+fn has_trigger(text: &str, word: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric())
+        .any(|w| w == word)
+}
+
+/// Flatten the prompt's text blocks into one string for the trigger
+/// checks and the echo reply.
+fn prompt_text(prompt: &[acp::ContentBlock]) -> String {
+    let mut text = String::new();
+    for block in prompt {
+        if let acp::ContentBlock::Text(t) = block {
+            text.push_str(&t.text);
+        }
+    }
+    text
+}
+
+#[async_trait::async_trait(?Send)]
+impl acp::Agent for MockAgent {
+    async fn initialize(
+        &self,
+        _args: acp::InitializeRequest,
+    ) -> Result<acp::InitializeResponse, acp::Error> {
+        Ok(
+            acp::InitializeResponse::new(acp::ProtocolVersion::V1).agent_info(
+                acp::Implementation::new("agentmux-mock-agent", env!("CARGO_PKG_VERSION")),
+            ),
+        )
+    }
+
+    async fn authenticate(
+        &self,
+        _args: acp::AuthenticateRequest,
+    ) -> Result<acp::AuthenticateResponse, acp::Error> {
+        Ok(acp::AuthenticateResponse::default())
+    }
+
+    async fn new_session(
+        &self,
+        _args: acp::NewSessionRequest,
+    ) -> Result<acp::NewSessionResponse, acp::Error> {
+        Ok(acp::NewSessionResponse::new(SESSION_ID))
+    }
+
+    async fn prompt(&self, args: acp::PromptRequest) -> Result<acp::PromptResponse, acp::Error> {
+        let text = prompt_text(&args.prompt);
+
+        // Trigger words first — a crashing/hung agent sends no updates.
+        if has_trigger(&text, "crash") {
+            std::process::exit(1);
+        }
+        if has_trigger(&text, "exit42") {
+            std::process::exit(42);
+        }
+        if has_trigger(&text, "hang") {
+            // Never resolves: the request stays pending until the client
+            // gives up or kills us. Cancel cannot unwedge it, which is
+            // exactly what the timeout tests exercise.
+            std::future::pending::<()>().await;
+        }
+
+        // 1) Echo the prompt back as an agent message chunk.
+        self.send_update(
+            &args.session_id,
+            acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(acp::ContentBlock::from(
+                format!("mock reply: {text}"),
+            ))),
+        )
+        .await?;
+
+        // 2) A completed edit tool call on src/lib.rs.
+        let n = self.next_tool_call_id.get();
+        self.next_tool_call_id.set(n + 1);
+        let tool_call =
+            acp::ToolCall::new(format!("mock-tool-call-{n}"), "mock edit of src/lib.rs")
+                .kind(acp::ToolKind::Edit)
+                .status(acp::ToolCallStatus::Completed)
+                .locations(vec![acp::ToolCallLocation::new("src/lib.rs")]);
+        self.send_update(&args.session_id, acp::SessionUpdate::ToolCall(tool_call))
+            .await?;
+
+        Ok(acp::PromptResponse::new(acp::StopReason::EndTurn))
+    }
+
+    async fn cancel(&self, _args: acp::CancelNotification) -> Result<(), acp::Error> {
+        Ok(())
+    }
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> acp::Result<()> {
+    let outgoing = tokio::io::stdout().compat_write();
+    let incoming = tokio::io::stdin().compat();
+
+    // The crate's io futures are `!Send`; everything runs on this
+    // LocalSet, mirroring examples/agent.rs.
+    let local_set = tokio::task::LocalSet::new();
+    local_set
+        .run_until(async move {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let agent = MockAgent {
+                session_update_tx: tx,
+                next_tool_call_id: Cell::new(0),
+            };
+            let (conn, handle_io) =
+                acp::AgentSideConnection::new(agent, outgoing, incoming, |fut| {
+                    tokio::task::spawn_local(fut);
+                });
+            // Flush queued session notifications in send order; each
+            // sender waits on its oneshot, so order is preserved.
+            tokio::task::spawn_local(async move {
+                while let Some((notification, ack)) = rx.recv().await {
+                    if conn.session_notification(notification).await.is_err() {
+                        // Connection is gone — the pending prompt fails on
+                        // the dropped oneshot; stop draining.
+                        return;
+                    }
+                    let _ = ack.send(());
+                }
+            });
+            // Serve until stdin closes (client dropped or killed us).
+            handle_io.await
+        })
+        .await
+}

@@ -1,0 +1,23 @@
+[package]
+name = "agentmux-tui"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "ratatui terminal client for the agentmux daemon: session list, event stream, prompt input"
+
+[dependencies]
+# The TUI is a pure client of the daemon: domain types come from
+# agentmux-core, all I/O goes through agentmux-client's DaemonClient.
+agentmux-client = { path = "../client" }
+agentmux-core = { path = "../core" }
+chrono = { version = "0.4", features = ["serde"] }
+# Version locked to ratatui's crossterm backend (ratatui-crossterm
+# defaults to crossterm 0.29); `event-stream` enables async EventStream.
+crossterm = { version = "0.29", features = ["event-stream"] }
+futures-util = "0.3"
+ratatui = "0.30"
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }
