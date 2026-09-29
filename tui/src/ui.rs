@@ -17,7 +17,7 @@
 //! All color lives in [`crate::theme`] — this file only names roles
 //! (`THEME.accent`, `THEME.faint`, …), never raw `Color`s.
 
-use agentmux_core::{Event, EventKind};
+use agentmux_core::{pi_shape, Event, EventKind};
 use chrono::{DateTime, Utc};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
@@ -26,9 +26,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{
-    permission_summary, short_id, App, InputMode, RelayStage, SessionView, PERMISSION_PREFIX,
-};
+use crate::app::{permission_summary, short_id, App, InputMode, RelayStage, SessionView};
 use crate::newsession::WizardStep;
 use crate::theme::THEME;
 use ratatui::style::Style;
@@ -478,34 +476,38 @@ fn event_block(ev: &Event) -> EventBlock {
             Span::styled("✗ ", THEME.error),
             Span::styled(format!("agent exited (code {code:?})"), THEME.error),
         ])]),
-        EventKind::Orchestrator(msg) => EventBlock::Static(vec![orchestrator_line(ev, msg)]),
-    }
-}
-
-/// An orchestrator notice: permission requests become warning banners,
-/// everything else a quiet prefixed line.
-fn orchestrator_line(ev: &Event, msg: &str) -> Line<'static> {
-    if let Some(payload) = msg.strip_prefix(PERMISSION_PREFIX) {
-        return Line::from(vec![
+        EventKind::Orchestrator(msg) => EventBlock::Static(vec![Line::from(vec![
+            ts_span(ev),
+            Span::styled("· ", THEME.faint),
+            Span::styled(msg.clone(), THEME.dim_italic),
+        ])]),
+        EventKind::PermissionRequest { request, .. } => EventBlock::Static(vec![Line::from(vec![
             ts_span(ev),
             Span::styled("⚠ ", THEME.warning),
             Span::styled(
-                format!("permission requested — {}", permission_summary(payload)),
+                format!("permission requested — {}", permission_summary(request)),
                 THEME.warning_bold,
             ),
-        ]);
+        ])]),
+        EventKind::PermissionResolved { outcome, .. } => {
+            EventBlock::Static(vec![Line::from(vec![
+                ts_span(ev),
+                Span::styled("⚠ ", THEME.faint),
+                Span::styled(format!("permission {outcome}"), THEME.dim),
+            ])])
+        }
     }
-    Line::from(vec![
-        ts_span(ev),
-        Span::styled("· ", THEME.faint),
-        Span::styled(msg.to_string(), THEME.dim_italic),
-    ])
 }
 
 /// `session/update` payloads → blocks: message chunks stay `Msg` for
 /// coalescing; tool calls and friends render as structured cards.
+/// Pi-native passthrough records (`{"type": "<kind>"}`, no
+/// `sessionUpdate`) go to [`pi_event_block`].
 fn session_update_block(ev: &Event, value: &serde_json::Value) -> EventBlock {
     let update = value.get("update").unwrap_or(value);
+    if update.get("sessionUpdate").is_none() && pi_shape::kind(update).is_some() {
+        return pi_event_block(ev, update);
+    }
     let text = || {
         update
             .pointer("/content/text")
@@ -551,6 +553,75 @@ fn session_update_block(ev: &Event, value: &serde_json::Value) -> EventBlock {
             ),
         ])]),
         _ => EventBlock::Static(vec![fallback_update_line(ev, update)]),
+    }
+}
+
+/// A pi-native `{"type": "<kind>", …}` record → its block. The pi
+/// translator normalizes deltas and `tool_execution_*` into ACP shapes
+/// upstream, so what lands here is passthrough: message plumbing and
+/// turn scaffolding render as nothing at all (an empty `Static` — their
+/// content already arrived via deltas), deltas render defensively as
+/// `Msg` (persisted pre-translation logs, manual injection), and
+/// lifecycle/extension records get one quiet `·`-prefixed line via
+/// [`pi_shape::summary`].
+fn pi_event_block(ev: &Event, update: &serde_json::Value) -> EventBlock {
+    // Streaming deltas (defensive — normalized upstream into
+    // agent_*_chunk; this covers records that arrived unnormalized).
+    if let Some((role, text)) = pi_shape::delta(update) {
+        let role = match role {
+            pi_shape::Delta::Message => MsgRole::Agent,
+            pi_shape::Delta::Thought => MsgRole::Thought,
+        };
+        return EventBlock::Msg {
+            role,
+            ts: ev.ts,
+            text: text.to_string(),
+        };
+    }
+
+    match pi_shape::kind(update) {
+        // `error` assistant events deserve a visible line; the other
+        // message_update sub-kinds (text_start/end, toolcall_*, done)
+        // are provider plumbing.
+        Some("message_update") => {
+            let err = update
+                .pointer("/assistantMessageEvent/error")
+                .or_else(|| update.pointer("/assistantMessageEvent/message"))
+                .and_then(|e| e.as_str());
+            if update
+                .pointer("/assistantMessageEvent/type")
+                .and_then(|t| t.as_str())
+                == Some("error")
+            {
+                return EventBlock::Static(vec![Line::from(vec![
+                    ts_span(ev),
+                    Span::styled("⚠ ", THEME.warning),
+                    Span::styled(
+                        format!("stream error: {}", err.unwrap_or("unknown")),
+                        THEME.warning,
+                    ),
+                ])]);
+            }
+            EventBlock::Static(vec![])
+        }
+        // `message_end` restates the text the deltas already streamed —
+        // showing it would double every reply.
+        Some("message_end") | Some("message_start") | Some("turn_start") | Some("turn_end") => {
+            EventBlock::Static(vec![])
+        }
+        // Direct RPC bash output streams as dim body text.
+        Some("bash_execution_update") => match update.get("delta").and_then(|d| d.as_str()) {
+            Some(delta) => EventBlock::Static(body_lines(delta, THEME.dim, true)),
+            None => EventBlock::Static(vec![]),
+        },
+        _ => match pi_shape::summary(update) {
+            Some(text) => EventBlock::Static(vec![Line::from(vec![
+                ts_span(ev),
+                Span::styled("· ", THEME.faint),
+                Span::styled(text, THEME.faint),
+            ])]),
+            None => EventBlock::Static(vec![]),
+        },
     }
 }
 
@@ -1100,27 +1171,39 @@ fn draw_wizard(frame: &mut Frame, app: &App) {
     frame.render_stateful_widget(list, rect, &mut state);
 }
 
-/// The permission notice overlay. `AcpConn` answers
-/// `session/request_permission` itself (deny-by-default) before the
-/// event reaches the TUI and no permission-response RPC exists, so this
-/// is strictly observe-only — any key dismisses it.
+/// The permission dialog: the agent's request is parked daemon-side —
+/// `y`/`a`/`n`/`Esc` send `session/permission`. While the answer is in
+/// flight (`pending`) the dialog stays up with an "answering…" row and
+/// keys are ignored; the `PermissionResolved` event dismisses it.
 fn draw_permission(frame: &mut Frame, app: &App) {
     let Some(notice) = &app.permission else {
         return;
     };
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("⚠ ", THEME.warning),
             Span::styled(notice.summary.clone(), THEME.warning_bold),
         ]),
         Line::default(),
-        Line::from(Span::styled(
-            "the daemon auto-denied this request (v1 is observe-only)",
-            THEME.dim,
-        )),
-        Line::from(Span::styled("press any key to dismiss", THEME.faint)),
     ];
-    let rect = centered(frame.area(), 60, 7);
+    if notice.pending {
+        lines.push(Line::from(Span::styled("  answering…", THEME.dim_italic)));
+    } else {
+        let mut hints = vec![
+            Span::styled("  y", THEME.warning_bold),
+            Span::styled(" allow once", THEME.dim),
+        ];
+        if notice.allows_always() {
+            hints.push(Span::styled(" · ", THEME.faint));
+            hints.push(Span::styled("a", THEME.warning_bold));
+            hints.push(Span::styled(" always", THEME.dim));
+        }
+        hints.push(Span::styled(" · ", THEME.faint));
+        hints.push(Span::styled("n/esc", THEME.warning_bold));
+        hints.push(Span::styled(" reject", THEME.dim));
+        lines.push(Line::from(hints));
+    }
+    let rect = centered(frame.area(), 60, lines.len() as u16 + 2);
     draw_backdrop(frame);
     frame.render_widget(Clear, rect);
     let block = pane(Line::from(Span::styled(
@@ -1134,10 +1217,12 @@ fn draw_permission(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
-/// Pull human-readable text out of an opaque ACP `session/update` JSON
-/// blob: known shapes get their `text` payload, everything else falls
-/// back to a compact, truncated dump. (Kept for the compact/relay path
-/// and tests; the rich renderer lives in [`session_update_block`].)
+/// Pull human-readable text out of an opaque `session/update` JSON
+/// blob: known ACP shapes get their `text` payload, pi-native records
+/// (`{"type": "<kind>"}`) get their delta/message/summary text, and
+/// everything else falls back to a compact, truncated dump. (Kept for
+/// the compact/relay path and tests; the rich renderer lives in
+/// [`session_update_block`].)
 fn session_update_text(value: &serde_json::Value) -> String {
     let update = value.get("update").unwrap_or(value);
     let tag = update.get("sessionUpdate").and_then(|t| t.as_str());
@@ -1147,6 +1232,21 @@ fn session_update_text(value: &serde_json::Value) -> String {
         .and_then(|t| t.as_str())
     {
         return text.to_string();
+    }
+    if tag.is_none() {
+        // Pi-native record: dig by `type` instead of dumping JSON.
+        if let Some((_, text)) = pi_shape::delta(update) {
+            return text.to_string();
+        }
+        if let Some(text) = pi_shape::message_text(update) {
+            return text;
+        }
+        if let Some(summary) = pi_shape::summary(update) {
+            return summary;
+        }
+        if let Some(kind) = pi_shape::kind(update) {
+            return format!("[{kind}]");
+        }
     }
     let dump = serde_json::to_string(update).unwrap_or_else(|_| "<?>".to_string());
     let dump = if dump.chars().count() > 160 {
@@ -1181,7 +1281,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             _ => "j/k pick target · enter relay · esc abort",
         },
         InputMode::NewSession => "enter select · esc back",
-        InputMode::Permission => "auto-denied by the daemon · any key dismisses",
+        InputMode::Permission => match app.permission.as_ref() {
+            Some(n) if n.pending => "answering…",
+            Some(n) if n.allows_always() => "y allow once · a always · n/esc reject",
+            _ => "y allow once · n/esc reject",
+        },
     };
 
     let mut spans = vec![
@@ -1463,6 +1567,91 @@ mod tests {
         assert!(session_update_text(&wrapped).contains("[tool_call]"));
     }
 
+    /// Pi-native passthrough records dig meaningful text by `type` —
+    /// never a raw JSON dump.
+    #[test]
+    fn session_update_text_handles_pi_shapes() {
+        // A `message_update` text_delta yields the delta itself.
+        let v = serde_json::json!({"type":"message_update","usage":{},
+            "assistantMessageEvent":{"type":"text_delta","contentIndex":0,
+            "delta":"pi says hi"}});
+        assert_eq!(session_update_text(&v), "pi says hi");
+
+        // `message_end` yields the joined message text.
+        let v = serde_json::json!({"type":"message_end","message":
+            {"role":"assistant","content":[{"type":"text","text":"all of it"}]}});
+        assert_eq!(session_update_text(&v), "all of it");
+
+        // Tool records and lifecycle get summaries/labels.
+        let v = serde_json::json!({"type":"tool_execution_start","toolCallId":"t",
+            "toolName":"edit","args":{"path":"src/x.rs"}});
+        assert_eq!(session_update_text(&v), "tool edit started (src/x.rs)");
+        let v = serde_json::json!({"type": "agent_settled"});
+        assert_eq!(session_update_text(&v), "run settled");
+        // Scaffolding without a summary still gets a tag, not JSON.
+        let v = serde_json::json!({"type": "turn_start"});
+        assert_eq!(session_update_text(&v), "[turn_start]");
+    }
+
+    /// A raw pi `text_delta` (defensive path — the conn normalizes
+    /// these upstream) renders as agent prose, coalescing under one
+    /// header like ACP chunks do.
+    #[test]
+    fn pi_delta_renders_as_agent_prose() {
+        let app = app_with_events(vec![
+            EventKind::SessionUpdate(serde_json::json!({"type":"message_update",
+                "assistantMessageEvent":{"type":"text_delta","delta":"hello "}})),
+            EventKind::SessionUpdate(serde_json::json!({"type":"message_update",
+                "assistantMessageEvent":{"type":"text_delta","delta":"pi"}})),
+        ]);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend());
+        assert!(text.contains("hello pi"), "pi deltas as prose: {text}");
+        assert!(
+            !text.contains("\"type\""),
+            "no raw JSON in the pane: {text}"
+        );
+    }
+
+    /// pi lifecycle/passthrough records render as quiet lines — or not
+    /// at all — but never as truncated JSON walls.
+    #[test]
+    fn pi_lifecycle_renders_quietly_without_json() {
+        let app = app_with_events(vec![
+            EventKind::SessionUpdate(serde_json::json!({"type": "agent_start"})),
+            EventKind::SessionUpdate(serde_json::json!({"type": "turn_start"})),
+            EventKind::SessionUpdate(serde_json::json!({"type": "agent_end",
+                "messages": [], "willRetry": false})),
+            EventKind::SessionUpdate(serde_json::json!({"type": "agent_settled"})),
+        ]);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend());
+        assert!(text.contains("run settled"), "{text}");
+        assert!(text.contains("agent run finished"), "{text}");
+        // Scaffolding is invisible; nothing dumps raw JSON.
+        assert!(!text.contains("turn_start"), "{text}");
+        assert!(!text.contains("\"type\""), "no raw JSON: {text}");
+    }
+
+    /// A `message_update` whose `assistantMessageEvent` is `error`
+    /// renders a warning line rather than vanishing.
+    #[test]
+    fn pi_message_error_renders_warning() {
+        let app = app_with_events(vec![EventKind::SessionUpdate(serde_json::json!({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "error", "error": "provider exploded"}
+        }))]);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend());
+        assert!(text.contains("provider exploded"), "{text}");
+    }
+
     // --- structured event rendering --------------------------------------
 
     /// One session of workspace `w`, its events preloaded.
@@ -1598,14 +1787,17 @@ mod tests {
         assert!(text.contains("ready → prompting"), "{text}");
     }
 
-    /// A permission-request orchestrator note becomes a warning banner,
-    /// not raw JSON.
+    /// A `PermissionRequest` event becomes a warning banner in the
+    /// stream — not raw JSON.
     #[test]
     fn permission_event_renders_warning_banner() {
-        let app = app_with_events(vec![EventKind::Orchestrator(
-            r#"permission-request: {"toolCall":{"title":"Write src/x.rs"},"options":[{"name":"reject"}]}"#
-                .into(),
-        )]);
+        let app = app_with_events(vec![EventKind::PermissionRequest {
+            request_id: "req-1".into(),
+            request: serde_json::json!({
+                "toolCall": {"title": "Write src/x.rs"},
+                "options": [{"name": "reject"}],
+            }),
+        }]);
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
@@ -1675,13 +1867,26 @@ mod tests {
         assert!(text.contains("smoke"), "{text}");
     }
 
+    /// The permission dialog is interactive: it names the tool call and
+    /// shows the answer keys. While the `session/permission` call is in
+    /// flight it swaps the hints for "answering…" and stays up.
     #[test]
-    fn permission_overlay_renders_observe_only_notice() {
+    fn permission_overlay_renders_interactive_dialog() {
         let mut app = app_with_events(vec![]);
         app.permission = Some(PermissionNotice {
             session_id: SessionId(uuid::Uuid::nil()),
+            request_id: "req-1".into(),
             summary: "agent asks: Write src/x.rs (options: allow, reject)".into(),
+            request: serde_json::json!({
+                "toolCall": {"title": "Write src/x.rs"},
+                "options": [
+                    {"name": "allow", "kind": "allow_once"},
+                    {"name": "always", "kind": "allow_always"},
+                    {"name": "reject", "kind": "reject_once"},
+                ],
+            }),
             resume: InputMode::Normal,
+            pending: false,
         });
         app.mode = InputMode::Permission;
         let backend = TestBackend::new(80, 24);
@@ -1690,7 +1895,16 @@ mod tests {
         let text = buffer_text(terminal.backend());
         assert!(text.contains("permission requested"), "{text}");
         assert!(text.contains("Write src/x.rs"), "{text}");
-        assert!(text.contains("auto-denied"), "{text}");
+        assert!(text.contains("allow once"), "{text}");
+        assert!(text.contains("always"), "{text}");
+        assert!(text.contains("reject"), "{text}");
+
+        // In-flight answer: hints swap to "answering…".
+        app.permission.as_mut().unwrap().pending = true;
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend());
+        assert!(text.contains("answering"), "{text}");
+        assert!(!text.contains("allow once"), "{text}");
     }
 
     #[test]
@@ -1913,7 +2127,13 @@ mod tests {
                 "content": [{"type": "diff", "path": "tui/src/theme.rs",
                     "oldText": "const FG: u8 = 1;", "newText": "const FG: u8 = 2;"}]
             })),
-            EventKind::Orchestrator("permission-request: {\"toolCall\":{\"title\":\"Write src/x.rs\"},\"options\":[{\"name\":\"reject\"}]}".into()),
+            EventKind::PermissionRequest {
+                request_id: "req-1".into(),
+                request: serde_json::json!({
+                    "toolCall": {"title": "Write src/x.rs"},
+                    "options": [{"name": "reject"}],
+                }),
+            },
             EventKind::Orchestrator("event stream lagged, skipped 3".into()),
         ];
         for (seq, kind) in kinds.into_iter().enumerate() {

@@ -47,8 +47,8 @@ use std::time::{Duration, Instant};
 use agentmux_core::rpc::{
     self, RpcRequest, M_AGENT_LIST, M_AGENT_REGISTER, M_PROJECT_LIST, M_PROJECT_REGISTER,
     M_PROJECT_REMOVE, M_SERVER_SHUTDOWN, M_SERVER_STATUS, M_SESSION_CANCEL, M_SESSION_CREATE,
-    M_SESSION_KILL, M_SESSION_LIST, M_SESSION_PROMPT, M_SESSION_RESUME, M_SESSION_SUBSCRIBE,
-    M_WORKSPACE_CREATE, M_WORKSPACE_LIST, M_WORKSPACE_REMOVE, N_SESSION_EVENT,
+    M_SESSION_KILL, M_SESSION_LIST, M_SESSION_PERMISSION, M_SESSION_PROMPT, M_SESSION_RESUME,
+    M_SESSION_SUBSCRIBE, M_WORKSPACE_CREATE, M_WORKSPACE_LIST, M_WORKSPACE_REMOVE, N_SESSION_EVENT,
 };
 use agentmux_server::ServerPaths;
 use serde::de::DeserializeOwned;
@@ -65,8 +65,8 @@ use tokio_stream::{Stream, StreamExt};
 
 pub use agentmux_core::rpc::ServerStatusResult;
 pub use agentmux_core::{
-    AgentId, AgentProfile, Event, EventKind, Project, ProjectId, Session, SessionId, SessionRef,
-    SessionState, Workspace, WorkspaceId,
+    AgentId, AgentProfile, Event, EventKind, PermissionDecision, Project, ProjectId, Session,
+    SessionId, SessionRef, SessionState, Workspace, WorkspaceId,
 };
 
 /// Largest inbound line the client will read; mirrors the server's own
@@ -551,6 +551,28 @@ impl DaemonClient {
     pub async fn cancel(&mut self, session_id: SessionId) -> Result<()> {
         self.call_unit(M_SESSION_CANCEL, rpc::SessionCancelParams { session_id })
             .await
+    }
+
+    /// `session/permission` → answer a parked agent permission request.
+    /// `request_id` is the id carried by the `PermissionRequest` event;
+    /// `outcome` maps onto the option kinds the agent offered. Like
+    /// `cancel`, this needs a second connection while a `prompt` call
+    /// is still awaiting on this one.
+    pub async fn respond_permission(
+        &mut self,
+        session_id: SessionId,
+        request_id: &str,
+        outcome: PermissionDecision,
+    ) -> Result<()> {
+        self.call_unit(
+            M_SESSION_PERMISSION,
+            rpc::SessionPermissionParams {
+                session_id,
+                request_id: request_id.to_string(),
+                outcome,
+            },
+        )
+        .await
     }
 
     /// `session/kill` → kill the session's agent process.

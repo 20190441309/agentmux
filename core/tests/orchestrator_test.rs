@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 use agentmux_core::collab::append_activity;
 use agentmux_core::orchestrator::Orchestrator;
 use agentmux_core::{
-    AdapterKind, AgentId, AgentProfile, AgentRegistry, Config, Event, EventKind, Project,
-    ProjectId, SessionId, SessionState, Store, WorkspaceId,
+    AdapterKind, AgentId, AgentProfile, AgentRegistry, Config, ConnTimeouts, Event, EventKind,
+    Project, ProjectId, SessionId, SessionRef, SessionState, Store, WorkspaceId,
 };
 use tempfile::TempDir;
 use tokio::sync::broadcast;
@@ -114,6 +114,7 @@ fn setup() -> TestEnv {
 
     let cfg = Config {
         agents: vec![mock_profile(), unavailable_profile()],
+        ..Config::default()
     };
     let orch = Orchestrator::new(
         store,
@@ -547,6 +548,7 @@ async fn restart_sweeps_stale_sessions_to_error_and_resumable() {
             .unwrap();
         let cfg = Config {
             agents: vec![mock_profile()],
+            ..Config::default()
         };
         let orch = Orchestrator::new(
             store,
@@ -570,6 +572,7 @@ async fn restart_sweeps_stale_sessions_to_error_and_resumable() {
     // Second daemon lifetime over the same data dir.
     let cfg = Config {
         agents: vec![mock_profile()],
+        ..Config::default()
     };
     let orch = Orchestrator::new(
         Store::open(data.path()).unwrap(),
@@ -619,5 +622,492 @@ async fn restart_sweeps_stale_sessions_to_error_and_resumable() {
     assert_eq!(
         orch.get_session(sid).unwrap().unwrap().state,
         SessionState::Ready
+    );
+}
+
+/// A `pi` profile backed by the `tests/fake_pi.py` stub — same trick as
+/// `pi_rpc_test.rs`'s `spawn_fake`, routed through the adapter registry.
+fn pi_profile() -> AgentProfile {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_pi.py");
+    assert!(
+        script.is_file(),
+        "fake pi stub missing at {}",
+        script.display()
+    );
+    AgentProfile {
+        id: AgentId::new("pi"),
+        name: "Fake Pi".into(),
+        adapter: AdapterKind::PiRpc {
+            command: PathBuf::from("python3"),
+            args: vec![script.to_string_lossy().into_owned()],
+        },
+        env: BTreeMap::new(),
+        available: true,
+    }
+}
+
+/// `setup()` with an extra pi agent alongside the mock.
+fn setup_with_pi() -> TestEnv {
+    let repo = init_repo();
+    let data = tempfile::tempdir().unwrap();
+
+    let store = Store::open(data.path()).unwrap();
+    let project_id = ProjectId::new();
+    store
+        .insert_project(&Project {
+            id: project_id,
+            root_path: repo.path().to_path_buf(),
+            name: "test-project".into(),
+        })
+        .unwrap();
+
+    let cfg = Config {
+        agents: vec![mock_profile(), pi_profile()],
+        ..Config::default()
+    };
+    let orch = Orchestrator::new(
+        store,
+        AgentRegistry::from_config(&cfg),
+        data.path().to_path_buf(),
+    );
+    TestEnv {
+        _repo: repo,
+        data,
+        orch,
+        project_id,
+    }
+}
+
+/// The `perm` trigger's full lifecycle through the orchestrator: the bus
+/// carries `PermissionRequest`, the fan-out steps
+/// `Prompting → WaitingPermission`, `respond_permission` selects the
+/// offered `always` option, `PermissionResolved` steps
+/// `WaitingPermission → Prompting`, and the turn ends back at `Ready`.
+#[tokio::test]
+async fn permission_roundtrip_walks_waiting_permission_states() {
+    let env = setup();
+    let (_ws, sid) = new_session(&env, "ws1").await;
+    let orch = Arc::new(env.orch);
+    let mut rx = orch.subscribe();
+
+    let o2 = orch.clone();
+    let turn = tokio::spawn(async move { o2.prompt(sid, "perm".into(), vec![]).await });
+
+    // The request is parked: bus event + WaitingPermission state.
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |e| {
+        e.session_id == sid && matches!(e.kind, EventKind::PermissionRequest { .. })
+    })
+    .await;
+    let request_id = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::PermissionRequest { request_id, .. } if e.session_id == sid => {
+                Some(request_id.clone())
+            }
+            _ => None,
+        })
+        .expect("PermissionRequest event should reach the bus");
+    wait_state(&orch, sid, |s| matches!(s, SessionState::WaitingPermission)).await;
+
+    // The turn still holds the session while it parks.
+    let err = orch
+        .prompt(sid, "second".to_string(), vec![])
+        .await
+        .expect_err("concurrent prompt must be rejected while parked");
+    assert!(err.to_string().contains("session busy"), "{err}");
+
+    orch.respond_permission(
+        sid,
+        &request_id,
+        agentmux_core::PermissionDecision::AllowAlways,
+    )
+    .expect("respond_permission should accept the parked request");
+    turn.await
+        .expect("prompt task panicked")
+        .expect("prompt should complete once answered");
+
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |e| {
+        e.session_id == sid
+            && matches!(&e.kind, EventKind::SessionUpdate(v)
+                if v["update"]["sessionUpdate"] == "agent_message_chunk"
+                    && v["update"]["content"]["text"] == "permission outcome: selected:always")
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::PermissionResolved { request_id: r, outcome }
+                if *r == request_id && outcome == "selected:always"
+        )),
+        "expected a paired PermissionResolved: {events:?}"
+    );
+
+    assert_eq!(
+        wait_state(&orch, sid, |s| matches!(s, SessionState::Ready)).await,
+        SessionState::Ready,
+        "the session should return to Ready after the resolved turn"
+    );
+
+    // Both transitions were persisted in order — WaitingPermission is a
+    // real state, not a UI fiction.
+    let log = orch.read_events(sid).unwrap();
+    let mut waiting = false;
+    let mut back = false;
+    for e in &log {
+        match &e.kind {
+            EventKind::StateChanged {
+                from: SessionState::Prompting,
+                to: SessionState::WaitingPermission,
+            } => waiting = true,
+            EventKind::StateChanged {
+                from: SessionState::WaitingPermission,
+                to: SessionState::Prompting,
+            } if waiting => back = true,
+            _ => {}
+        }
+    }
+    assert!(
+        waiting && back,
+        "expected Prompting→WaitingPermission→Prompting in {log:?}"
+    );
+}
+
+/// `respond_permission` on a session with no parked request fails, and so
+/// does one on a session with no live connection.
+#[tokio::test]
+async fn respond_permission_without_a_parked_request_errors() {
+    let env = setup();
+    let (_ws, sid) = new_session(&env, "ws1").await;
+
+    let err = env
+        .orch
+        .respond_permission(sid, "req-1", agentmux_core::PermissionDecision::AllowOnce)
+        .expect_err("nothing is parked — this must fail");
+    assert!(err.to_string().contains("req-1"), "{err}");
+
+    env.orch.kill(sid).await.unwrap();
+    let err = env
+        .orch
+        .respond_permission(sid, "req-1", agentmux_core::PermissionDecision::AllowOnce)
+        .expect_err("a killed session has no conn to answer on");
+    assert!(err.to_string().contains("no live connection"), "{err}");
+
+    let err = env
+        .orch
+        .respond_permission(
+            SessionId::new(),
+            "req-1",
+            agentmux_core::PermissionDecision::AllowOnce,
+        )
+        .expect_err("an unknown session id must fail");
+    assert!(err.to_string().contains("not running"), "{err}");
+}
+
+/// Pi sessions have no permission protocol: `respond_permission` must
+/// report a clear unsupported error instead of silently doing nothing.
+#[tokio::test]
+async fn respond_permission_on_pi_session_is_unsupported() {
+    let env = setup_with_pi();
+    let ws = env
+        .orch
+        .create_workspace(env.project_id, "pi-ws", "main")
+        .await
+        .unwrap();
+    let sid = env
+        .orch
+        .create_session(ws, &AgentId::new("pi"), None)
+        .await
+        .expect("create_session with fake pi should succeed");
+
+    let err = env
+        .orch
+        .respond_permission(sid, "req-9", agentmux_core::PermissionDecision::AllowOnce)
+        .expect_err("pi has no permission protocol");
+    assert!(
+        err.to_string().contains("do not support permission"),
+        "{err}"
+    );
+}
+
+/// A `SessionRef` into a pi session must render real relay context: the
+/// pi session's persisted (normalized + passthrough) events feed
+/// `describe_event`, whose lines land in the referenced block the mock
+/// echoes back. Before pi-shape awareness this produced an empty
+/// "Context from" shell.
+#[tokio::test]
+async fn session_ref_into_pi_session_renders_event_text() {
+    let env = setup_with_pi();
+    let ws = env
+        .orch
+        .create_workspace(env.project_id, "pi-ws", "main")
+        .await
+        .unwrap();
+    let sa = env
+        .orch
+        .create_session(ws, &AgentId::new("pi"), None)
+        .await
+        .expect("pi session should start");
+    let sb = env
+        .orch
+        .create_session(ws, &AgentId::new("mock"), None)
+        .await
+        .expect("mock session should start");
+
+    // Run the pi turn so its log has content worth relaying.
+    prompt(&env.orch, sa, "relay me")
+        .await
+        .expect("pi prompt should settle");
+
+    // The fan-out persists asynchronously; wait until the turn's
+    // `agent_settled` is in the log before referencing it.
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    loop {
+        let log = env.orch.read_events(sa).unwrap();
+        if log.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::SessionUpdate(v) if v["type"] == "agent_settled"
+            )
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "pi events never persisted");
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    // Prompt the mock session with a reference into the pi session; the
+    // mock echoes the whole composed prompt back as a chunk.
+    let mut rx = env.orch.subscribe();
+    env.orch
+        .prompt(
+            sb,
+            "absorb this".to_string(),
+            vec![SessionRef {
+                session_id: sa,
+                event_seq: 0,
+            }],
+        )
+        .await
+        .expect("relay prompt should complete");
+
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |e| {
+        chunk_text(e, sb).is_some_and(|t| t.contains("Context from session"))
+    })
+    .await;
+    let text = events
+        .iter()
+        .find_map(|e| chunk_text(e, sb))
+        .expect("expected the echoed prompt for session B");
+
+    assert!(
+        text.contains(&format!("Context from session {sa}")),
+        "the ref block header should name the pi session, got: {text}"
+    );
+    // The pi turn's text (normalized `agent_message_chunk` on the wire,
+    // plus the passthrough `message_end`) renders as `message:` lines.
+    // The delta itself echoes sa's composed prompt, which includes the
+    // shared-context preamble — so match the prefix, not the tail.
+    assert!(
+        text.contains("- message: fake pi reply:"),
+        "the pi delta text must render in the relay block, got: {text}"
+    );
+    assert!(
+        text.contains("- run settled"),
+        "the passthrough agent_settled should summarize, got: {text}"
+    );
+    assert!(
+        !text.contains("{\"type\""),
+        "no raw pi JSON should leak into the block, got: {text}"
+    );
+}
+
+/// `kill` racing a parked permission: the conn teardown cancels the
+/// request, the session lands `Done`, and the `PermissionResolved`
+/// (or its `WaitingPermission → Prompting` step) can never resurrect it.
+#[tokio::test]
+async fn kill_during_waiting_permission_ends_done() {
+    let env = setup();
+    let (_ws, sid) = new_session(&env, "ws1").await;
+    let orch = Arc::new(env.orch);
+    let mut rx = orch.subscribe();
+
+    let o2 = orch.clone();
+    let turn = tokio::spawn(async move { o2.prompt(sid, "perm".into(), vec![]).await });
+
+    // Wait for the parked request, then kill mid-wait.
+    recv_until(&mut rx, EVENT_TIMEOUT, |e| {
+        e.session_id == sid && matches!(e.kind, EventKind::PermissionRequest { .. })
+    })
+    .await;
+    wait_state(&orch, sid, |s| matches!(s, SessionState::WaitingPermission)).await;
+
+    orch.kill(sid).await.expect("kill should succeed");
+    let _ = turn.await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        orch.get_session(sid).unwrap().unwrap().state,
+        SessionState::Done,
+        "a killed session must stay Done even if PermissionResolved lands late"
+    );
+    let log = orch.read_events(sid).unwrap();
+    assert!(
+        !log.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::StateChanged {
+                from: SessionState::Done,
+                ..
+            }
+        )),
+        "no transition may leave Done: {log:?}"
+    );
+}
+
+/// The configured `prompt_timeout` unwedges a stuck turn end to end:
+/// the conn's prompt resolves with a timeout error, the orchestrator's
+/// existing error path moves the session to `Error`, and the conn's
+/// "timed out" `Orchestrator` note is persisted into the event log.
+/// `kill` still cleans the wedged session up.
+#[tokio::test]
+async fn prompt_timeout_marks_session_error() {
+    let repo = init_repo();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let project_id = ProjectId::new();
+    store
+        .insert_project(&Project {
+            id: project_id,
+            root_path: repo.path().to_path_buf(),
+            name: "test-project".into(),
+        })
+        .unwrap();
+    let cfg = Config {
+        agents: vec![mock_profile()],
+        timeouts: ConnTimeouts {
+            init: Duration::from_secs(10),
+            prompt: Duration::from_secs(1),
+        },
+    };
+    let orch = Orchestrator::new(
+        store,
+        AgentRegistry::from_config(&cfg),
+        data.path().to_path_buf(),
+    );
+    let ws = orch
+        .create_workspace(project_id, "ws", "main")
+        .await
+        .unwrap();
+    let sid = orch
+        .create_session(ws, &AgentId::new("mock"), None)
+        .await
+        .expect("create_session should succeed");
+
+    // The mock's `hang` trigger never answers — the 1 s prompt bound is
+    // the only way this resolves.
+    let err = orch
+        .prompt(sid, "hang".to_string(), vec![])
+        .await
+        .expect_err("a wedged turn must fail at the prompt bound");
+    assert!(err.to_string().contains("timed out"), "{err}");
+
+    let state = wait_state(&orch, sid, |s| matches!(s, SessionState::Error(_))).await;
+    assert!(
+        matches!(&state, SessionState::Error(m) if m.contains("timed out")),
+        "the timeout error should land in the session state, got {state:?}"
+    );
+
+    // The conn emitted an Orchestrator note; the fan-out persists it.
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    loop {
+        let log = orch.read_events(sid).unwrap();
+        if log
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::Orchestrator(m) if m.contains("timed out")))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the 'timed out' note was never persisted: {log:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    orch.kill(sid).await.expect("kill should succeed");
+}
+
+/// Agent stderr end to end: a `noisy` turn kills the mock with 15
+/// stderr lines; the drain writes `<data_dir>/sessions/<id>.stderr.log`
+/// (all 15 lines — the ~12-line truncation is in-memory only), the
+/// session lands in `Error`, and a persisted `Orchestrator` note carries
+/// the tail. `delete_workspace` removes the stderr log alongside the
+/// event log.
+#[tokio::test]
+async fn stderr_log_is_written_and_cleaned_on_workspace_delete() {
+    let env = setup();
+    let (ws, sid) = new_session(&env, "ws-stderr").await;
+
+    let err = prompt(&env.orch, sid, "noisy")
+        .await
+        .expect_err("a crashing turn must fail the prompt");
+    assert!(
+        format!("{err:#}").contains("mock stderr line 15"),
+        "orchestrator error should carry the stderr tail: {err:#}"
+    );
+
+    let state = wait_state(&env.orch, sid, |s| matches!(s, SessionState::Error(_))).await;
+    assert!(matches!(state, SessionState::Error(_)), "{state:?}");
+
+    // The session-scoped stderr log exists and holds every line.
+    let log_path = env
+        .data
+        .path()
+        .join("sessions")
+        .join(format!("{sid}.stderr.log"));
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    loop {
+        if log_path
+            .exists()
+            .then(|| std::fs::read_to_string(&log_path).unwrap())
+            .is_some_and(|c| c.contains("mock stderr line 15\n"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stderr log never materialized at {}",
+            log_path.display()
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    let content = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        content.contains("mock stderr line 1\n") && content.contains("mock stderr line 15\n"),
+        "log should hold all 15 lines: {content:?}"
+    );
+
+    // The tail note is persisted into the session's JSONL event log.
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    loop {
+        let log = env.orch.read_events(sid).unwrap();
+        if log
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::Orchestrator(m) if m.contains("stderr tail")))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the stderr-tail note was never persisted: {log:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    // Workspace removal removes the stderr log along with the event log
+    // (the session is `Error`, i.e. non-live, so removal is allowed).
+    assert!(env.orch.remove_workspace(ws).unwrap());
+    assert!(
+        !log_path.exists(),
+        "stderr log should be removed on workspace delete"
     );
 }

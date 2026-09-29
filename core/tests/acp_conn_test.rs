@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
-use agentmux_core::{AcpConn, EventKind};
+use agentmux_core::{AcpConn, EventKind, SpawnOptions};
 
 /// Collect events until `pred` matches or `timeout` elapses; returns the
 /// matching event.
@@ -45,6 +45,7 @@ fn spawn_fails_for_missing_command() {
         &[],
         &BTreeMap::new(),
         dir.path(),
+        &SpawnOptions::default(),
     );
     assert!(result.is_err());
 }
@@ -58,7 +59,14 @@ async fn spawn_applies_env_and_cwd_and_reports_child_exit() {
         "printf %s \"$AGENTMUX_ENV_PROBE\" > probe.txt".to_string(),
     ];
 
-    let mut conn = AcpConn::spawn(Path::new("/bin/sh"), &args, &env, dir.path()).unwrap();
+    let mut conn = AcpConn::spawn(
+        Path::new("/bin/sh"),
+        &args,
+        &env,
+        dir.path(),
+        &SpawnOptions::default(),
+    )
+    .unwrap();
 
     // The child may exit before we subscribe: the *first* `events()` call
     // returns the receiver that has been buffering since spawn, so the early
@@ -102,6 +110,7 @@ async fn initialize_times_out_when_agent_never_responds() {
         &["60".to_string()],
         &BTreeMap::new(),
         dir.path(),
+        &SpawnOptions::default(),
     )
     .unwrap();
 
@@ -118,8 +127,14 @@ async fn initialize_times_out_when_agent_never_responds() {
 async fn events_survive_without_consumers_and_shutdown_is_clean() {
     let dir = tempfile::tempdir().unwrap();
     let args = vec!["-c".to_string(), "sleep 0.05".to_string()];
-    let mut conn =
-        AcpConn::spawn(Path::new("/bin/sh"), &args, &BTreeMap::new(), dir.path()).unwrap();
+    let mut conn = AcpConn::spawn(
+        Path::new("/bin/sh"),
+        &args,
+        &BTreeMap::new(),
+        dir.path(),
+        &SpawnOptions::default(),
+    )
+    .unwrap();
 
     // Let the child exit before anyone subscribes; broadcast must not
     // deadlock the connection.

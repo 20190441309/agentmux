@@ -7,6 +7,9 @@
 //! [`AgentRegistry::probe`](crate::registry::AgentRegistry::probe) sets it.
 //!
 //! ```toml
+//! init_timeout_secs = 10      # optional; bound on the agent handshake
+//! prompt_timeout_secs = 600   # optional; bound on one prompt turn (0 = forever)
+//!
 //! [[agents]]
 //! id = "claude-code"          # colliding with a built-in id overrides it
 //! command = "/custom/claude"
@@ -24,6 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{bail, Context};
 use serde::Deserialize;
@@ -31,6 +35,52 @@ use serde::Deserialize;
 use crate::id::AgentId;
 use crate::model::{AdapterKind, AgentProfile};
 use crate::Result;
+
+/// Default [`ConnTimeouts::init`] — bound on the agent `initialize`
+/// handshake (`get_state` for pi). Ten seconds is plenty for a healthy
+/// agent to answer its first RPC; a wedged spawn shouldn't stall session
+/// setup longer than that.
+pub const DEFAULT_INIT_TIMEOUT_SECS: u64 = 10;
+
+/// Default [`ConnTimeouts::prompt`] — bound on one prompt turn, measured
+/// from send to the agent's end-of-turn. Ten minutes is deliberately
+/// generous — real turns legitimately run builds and test suites — but
+/// *bounded*: before this existed a wedged agent turn hung the caller
+/// forever and only `cancel`/`kill` could escape it (and pi's `abort`
+/// itself can block). `0` disables the bound.
+pub const DEFAULT_PROMPT_TIMEOUT_SECS: u64 = 600;
+
+/// Timeouts the daemon applies to spawned-agent connections, resolved
+/// from the optional top-level `*_timeout_secs` config keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConnTimeouts {
+    /// Bound on the `initialize` handshake (pi: `get_state`).
+    pub init: Duration,
+    /// Bound on one `prompt` turn; [`Duration::ZERO`] waits forever.
+    pub prompt: Duration,
+}
+
+impl Default for ConnTimeouts {
+    fn default() -> Self {
+        ConnTimeouts {
+            init: Duration::from_secs(DEFAULT_INIT_TIMEOUT_SECS),
+            prompt: Duration::from_secs(DEFAULT_PROMPT_TIMEOUT_SECS),
+        }
+    }
+}
+
+/// Per-connection spawn options handed to `AcpConn::spawn` /
+/// `PiConn::spawn`: the config-derived [`ConnTimeouts`] plus where the
+/// agent's stderr should be captured.
+#[derive(Debug, Clone, Default)]
+pub struct SpawnOptions {
+    /// Connection timeouts (see [`ConnTimeouts`]).
+    pub timeouts: ConnTimeouts,
+    /// File the child's stderr is mirrored to —
+    /// `<data_dir>/sessions/<id>.stderr.log` in the orchestrator. `None`
+    /// keeps capture in-memory only (the tail still surfaces on errors).
+    pub stderr_log: Option<PathBuf>,
+}
 
 /// Parsed agentmux configuration.
 ///
@@ -41,12 +91,16 @@ pub struct Config {
     /// Agent profiles: built-ins first, then user-defined extras in file
     /// order.
     pub agents: Vec<AgentProfile>,
+    /// Connection timeouts from the top-level `init_timeout_secs` /
+    /// `prompt_timeout_secs` keys (defaults apply when unset).
+    pub timeouts: ConnTimeouts,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             agents: builtin_agents(),
+            timeouts: ConnTimeouts::default(),
         }
     }
 }
@@ -78,6 +132,12 @@ impl Config {
             toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))?;
 
         let mut config = Config::default();
+        if let Some(secs) = raw.init_timeout_secs {
+            config.timeouts.init = Duration::from_secs(secs);
+        }
+        if let Some(secs) = raw.prompt_timeout_secs {
+            config.timeouts.prompt = Duration::from_secs(secs);
+        }
         for raw_agent in raw.agents {
             let profile = raw_agent.into_profile()?;
             match config.agents.iter_mut().find(|p| p.id == profile.id) {
@@ -120,12 +180,19 @@ fn builtin_agents() -> Vec<AgentProfile> {
     ]
 }
 
-/// On-disk shape of the config file. Only `[[agents]]` is read; every other
-/// key is ignored so newer fields can appear without breaking old binaries.
+/// On-disk shape of the config file. `[[agents]]` and the top-level
+/// `*_timeout_secs` keys are read; every other key is ignored so newer
+/// fields can appear without breaking old binaries.
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     #[serde(default)]
     agents: Vec<RawAgent>,
+    /// Optional bound on the agent `initialize` handshake, in seconds
+    /// (default [`DEFAULT_INIT_TIMEOUT_SECS`]).
+    init_timeout_secs: Option<u64>,
+    /// Optional bound on one `prompt` turn, in seconds (default
+    /// [`DEFAULT_PROMPT_TIMEOUT_SECS`]; `0` disables the bound).
+    prompt_timeout_secs: Option<u64>,
 }
 
 /// One `[[agents]]` table entry — a flattened, friendlier projection of

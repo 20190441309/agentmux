@@ -82,6 +82,29 @@ pub struct SessionRef {
     pub event_seq: u64,
 }
 
+/// A generic answer to an agent's permission request — what
+/// `session/permission` carries on the wire.
+///
+/// The daemon maps the decision onto the agent's offered ACP
+/// `PermissionOption`s: `AllowOnce`/`AllowAlways` pick the option of the
+/// matching kind (unknown kind → an error, the request stays parked),
+/// `Reject` prefers `reject_once` then `reject_always` and degrades to
+/// ACP `cancelled` when the agent offered no rejection at all, `Cancel`
+/// is the protocol's `cancelled` outcome outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionDecision {
+    /// Allow this operation only this time.
+    AllowOnce,
+    /// Allow this operation and remember the choice.
+    AllowAlways,
+    /// Deny the operation (any `reject_*` option; `cancelled` as the
+    /// deny-equivalent fallback).
+    Reject,
+    /// Abort the pending tool call (ACP `cancelled`).
+    Cancel,
+}
+
 /// One orchestrated agent session inside a [`Workspace`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
@@ -114,6 +137,24 @@ pub enum EventKind {
     FileEdited { path: PathBuf },
     /// The agent process exited.
     AgentExited { code: Option<i32> },
+    /// The agent asked `session/request_permission`; the request is
+    /// parked awaiting a `session/permission` answer (or the
+    /// timeout/teardown fallback). `request` is the raw ACP
+    /// `RequestPermissionRequest` JSON — the offered options included —
+    /// kept opaque for the same reason as [`EventKind::SessionUpdate`].
+    PermissionRequest {
+        /// Daemon-minted correlation id — the key `session/permission`
+        /// resolves the request under.
+        request_id: String,
+        request: serde_json::Value,
+    },
+    /// A parked permission request concluded (user answer, timeout,
+    /// session cancel, or conn teardown).
+    ///
+    /// `outcome` is `"cancelled"` or `"selected:<option_id>"` — enough
+    /// for UIs to dismiss the matching dialog and log the decision
+    /// without re-parsing the ACP response shape.
+    PermissionResolved { request_id: String, outcome: String },
     /// A message produced by the orchestrator itself (lifecycle notes,
     /// internal errors, ...).
     Orchestrator(String),
@@ -250,6 +291,18 @@ mod tests {
             },
             EventKind::AgentExited { code: Some(0) },
             EventKind::AgentExited { code: None },
+            EventKind::PermissionRequest {
+                request_id: "req-1".into(),
+                request: serde_json::json!({
+                    "sessionId": "s",
+                    "toolCall": {"title": "Write src/x.rs"},
+                    "options": [{"optionId": "allow", "name": "Allow", "kind": "allow_once"}],
+                }),
+            },
+            EventKind::PermissionResolved {
+                request_id: "req-1".into(),
+                outcome: "selected:allow".into(),
+            },
             EventKind::Orchestrator("workspace cleaned".into()),
         ];
 
@@ -262,5 +315,22 @@ mod tests {
             };
             roundtrip(&event);
         }
+    }
+
+    /// `session/permission` outcomes ride the wire as snake_case strings.
+    #[test]
+    fn permission_decision_roundtrips_as_snake_case() {
+        for (decision, wire) in [
+            (PermissionDecision::AllowOnce, "allow_once"),
+            (PermissionDecision::AllowAlways, "allow_always"),
+            (PermissionDecision::Reject, "reject"),
+            (PermissionDecision::Cancel, "cancel"),
+        ] {
+            let v = serde_json::to_value(decision).unwrap();
+            assert_eq!(v, serde_json::json!(wire));
+            let back: PermissionDecision = serde_json::from_value(v).unwrap();
+            assert_eq!(decision, back);
+        }
+        assert!(serde_json::from_value::<PermissionDecision>(serde_json::json!("y")).is_err());
     }
 }

@@ -17,13 +17,16 @@
 //!
 //! `session/update` notifications are normalised to
 //! [`EventKind::SessionUpdate`] carrying the raw notification JSON, agent exit
-//! produces [`EventKind::AgentExited`], and permission requests / internal io
-//! failures surface as [`EventKind::Orchestrator`]. `Event::seq` is always `0`
-//! here — the orchestrator assigns real sequence numbers when it ingests
-//! events into the session log.
+//! produces [`EventKind::AgentExited`], and internal io failures surface as
+//! [`EventKind::Orchestrator`]. Permission requests emit
+//! [`EventKind::PermissionRequest`] when parked and
+//! [`EventKind::PermissionResolved`] once they conclude (a daemon answer via
+//! [`AcpConn::respond_permission`], the [`PERMISSION_TIMEOUT`] fallback, or
+//! conn teardown). `Event::seq` is always `0` here — the orchestrator assigns
+//! real sequence numbers when it ingests events into the session log.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Component, Path, PathBuf},
     rc::Rc,
     sync::{Arc, Mutex},
@@ -36,12 +39,18 @@ use anyhow::anyhow;
 use chrono::Utc;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use uuid::Uuid;
 
-use crate::{Event, EventKind, Result, SessionId};
+use crate::config::SpawnOptions;
+use crate::stderr::{self, StderrCapture};
+use crate::{Event, EventKind, PermissionDecision, Result, SessionId};
 
-/// Timeout for the ACP `initialize` handshake.
-// TODO(config): allow overriding this via `Config` in a later task.
-const INIT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a parked `session/request_permission` waits for a
+/// `session/permission` answer before resolving itself `cancelled`. A UI
+/// client can die mid-answer; the timeout keeps the agent's turn from
+/// hanging forever.
+// TODO(config): make this configurable.
+const PERMISSION_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Capacity of the per-connection event broadcast channel.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -56,6 +65,114 @@ fn emit(event_tx: &broadcast::Sender<Event>, session_id: SessionId, kind: EventK
         ts: Utc::now(),
         kind,
     });
+}
+
+/// A parked `session/request_permission`: the options the agent offered
+/// (kept so a generic [`PermissionDecision`] can be mapped onto a concrete
+/// option id at answer time) and the oneshot the handler is awaiting.
+#[derive(Debug)]
+struct PendingPermission {
+    options: Vec<acp::PermissionOption>,
+    tx: oneshot::Sender<acp::RequestPermissionOutcome>,
+}
+
+/// The per-connection pending-permission registry, shared between the
+/// worker-side [`AcpClientHandler`] (which parks requests) and the
+/// [`AcpConn`] handle (which resolves them). Locked for map ops only —
+/// never held across `.await`.
+type PendingPermissions = Arc<Mutex<HashMap<String, PendingPermission>>>;
+
+/// Map a generic [`PermissionDecision`] onto the options the agent
+/// offered. `Err` means the asked-for kind wasn't offered — the request
+/// stays parked so the caller can answer differently.
+///
+/// `Reject` prefers `reject_once` over `reject_always` (the narrowest
+/// refusal) — by *preference* order, not the agent's offer order — and
+/// degrades to `cancelled`, the deny-equivalent, when the agent offered
+/// no rejection option at all (mirroring ACP's own fallback guidance).
+/// `Cancel` needs no option.
+fn decision_outcome(
+    decision: PermissionDecision,
+    options: &[acp::PermissionOption],
+) -> Result<acp::RequestPermissionOutcome> {
+    use acp::PermissionOptionKind as K;
+    let find = |kinds: &[K]| {
+        options
+            .iter()
+            .find(|o| kinds.contains(&o.kind))
+            .map(|o| o.option_id.clone())
+    };
+    let selected = |option_id| {
+        acp::RequestPermissionOutcome::Selected(acp::SelectedPermissionOutcome::new(option_id))
+    };
+    match decision {
+        PermissionDecision::AllowOnce => find(&[K::AllowOnce])
+            .map(selected)
+            .ok_or_else(|| anyhow!("agent offered no allow-once option")),
+        PermissionDecision::AllowAlways => find(&[K::AllowAlways])
+            .map(selected)
+            .ok_or_else(|| anyhow!("agent offered no allow-always option")),
+        PermissionDecision::Reject => Ok(find(&[K::RejectOnce])
+            .or_else(|| find(&[K::RejectAlways]))
+            .map(selected)
+            .unwrap_or(acp::RequestPermissionOutcome::Cancelled)),
+        PermissionDecision::Cancel => Ok(acp::RequestPermissionOutcome::Cancelled),
+    }
+}
+
+/// Resolve one parked request: map `decision` onto the offered options,
+/// then deliver the outcome. Errors leave the entry parked — the request
+/// is still answerable. A consumed entry whose receiver is already gone
+/// counts as resolved (nobody is waiting anymore).
+fn resolve_pending(
+    pending: &PendingPermissions,
+    request_id: &str,
+    decision: PermissionDecision,
+) -> Result<()> {
+    // Lookup, mapping and removal run under one lock: a racing second
+    // answer or drain can't slip between the check and the removal —
+    // a decision must never return Ok and then be silently dropped.
+    let (entry, outcome) = {
+        let mut map = pending.lock().unwrap();
+        let entry = map
+            .get(request_id)
+            .ok_or_else(|| anyhow!("no pending permission request {request_id}"))?;
+        // Compute the outcome *before* consuming the entry: an unoffered
+        // kind must leave the request parked.
+        let outcome = decision_outcome(decision, &entry.options)?;
+        let entry = map
+            .remove(request_id)
+            .expect("the map was locked across get and remove");
+        (entry, outcome)
+    };
+    // A dropped receiver means the handler went away (worker teardown) —
+    // the request is concluded either way.
+    let _ = entry.tx.send(outcome);
+    Ok(())
+}
+
+/// Cancel every parked request — the conn-teardown and `session/cancel`
+/// path. ACP's cancellation semantics: a cancelled turn's pending
+/// `session/request_permission`s must be answered `cancelled` so the
+/// agent can unwind them.
+fn drain_pending(pending: &PendingPermissions) {
+    let entries: Vec<PendingPermission> = pending.lock().unwrap().drain().map(|(_, e)| e).collect();
+    for entry in entries {
+        let _ = entry.tx.send(acp::RequestPermissionOutcome::Cancelled);
+    }
+}
+
+/// Render an ACP outcome for [`EventKind::PermissionResolved`]:
+/// `"cancelled"` or `"selected:<option_id>"`.
+fn outcome_label(outcome: &acp::RequestPermissionOutcome) -> String {
+    match outcome {
+        acp::RequestPermissionOutcome::Cancelled => "cancelled".to_string(),
+        acp::RequestPermissionOutcome::Selected(sel) => {
+            format!("selected:{}", sel.option_id)
+        }
+        // The enum is non_exhaustive; forward-compat label.
+        _ => "unknown".to_string(),
+    }
 }
 
 /// Commands sent from an [`AcpConn`] handle to its worker thread.
@@ -99,8 +216,20 @@ pub struct AcpConn {
     /// `&self`: an `Arc`'d connection shared with an in-flight prompt must
     /// still be stoppable (the orchestrator's kill path).
     cmd_tx: Mutex<Option<mpsc::UnboundedSender<Cmd>>>,
+    /// `session/request_permission`s parked awaiting an answer, keyed by
+    /// the daemon-minted `request_id` carried on the
+    /// [`EventKind::PermissionRequest`] event. Shared with the
+    /// worker-side handler; resolved by [`AcpConn::respond_permission`]
+    /// and drained `cancelled` on `cancel`/`close`/drop.
+    pending: PendingPermissions,
     /// Worker thread driving the `!Send` ACP machinery.
     thread: Option<JoinHandle<()>>,
+    /// Connection timeouts from config (`ConnTimeouts`, resolved through
+    /// the registry into [`SpawnOptions`] at spawn).
+    timeouts: crate::config::ConnTimeouts,
+    /// Agent stderr drain: holds the shared tail and aborts the drain
+    /// task on drop. The drain task itself lives on the worker runtime.
+    stderr: StderrCapture,
 }
 
 impl AcpConn {
@@ -109,37 +238,50 @@ impl AcpConn {
     ///
     /// `env` is layered on top of the inherited environment; `cwd` becomes the
     /// child's working directory and the default root for `fs/*` requests.
-    /// A background thread takes over io immediately; call
-    /// [`AcpConn::initialize`] to perform the ACP handshake.
+    /// `options` carries the config-derived timeouts (see
+    /// [`crate::config::ConnTimeouts`]). A background thread takes over io
+    /// immediately; call [`AcpConn::initialize`] to perform the ACP handshake.
     pub fn spawn(
         command: &Path,
         args: &[String],
         env: &BTreeMap<String, String>,
         cwd: &Path,
+        options: &SpawnOptions,
     ) -> Result<AcpConn> {
         let session_id = SessionId::new();
         let (event_tx, first_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let pending: PendingPermissions = Arc::new(Mutex::new(HashMap::new()));
 
         let spec = SpawnSpec {
             command: command.to_path_buf(),
             args: args.to_vec(),
             env: env.clone(),
             cwd: cwd.to_path_buf(),
+            stderr_log: options.stderr_log.clone(),
         };
         let thread_event_tx = event_tx.clone();
+        let thread_pending = pending.clone();
 
         let thread = std::thread::Builder::new()
             .name(format!("acp-conn-{session_id}"))
             .spawn(move || {
-                actor_main(spec, session_id, thread_event_tx, cmd_rx, ready_tx);
+                actor_main(
+                    spec,
+                    session_id,
+                    thread_event_tx,
+                    thread_pending,
+                    cmd_rx,
+                    ready_tx,
+                );
             })
             .map_err(|e| anyhow!("failed to spawn acp io thread: {e}"))?;
 
         // Block until the worker reports whether the child spawned. If the
         // worker dies first, `ready_tx` is dropped and `recv` errors out.
-        ready_rx
+        // On success the worker hands back the stderr-drain handle.
+        let stderr = ready_rx
             .recv()
             .map_err(|_| anyhow!("acp io thread died before reporting spawn status"))??;
 
@@ -148,7 +290,10 @@ impl AcpConn {
             first_rx: Mutex::new(Some(first_rx)),
             session_id,
             cmd_tx: Mutex::new(Some(cmd_tx)),
+            pending,
             thread: Some(thread),
+            timeouts: options.timeouts,
+            stderr,
         })
     }
 
@@ -158,7 +303,8 @@ impl AcpConn {
     }
 
     /// Perform the ACP `initialize` handshake, advertising fs read/write and
-    /// terminal client capabilities. Times out after [`INIT_TIMEOUT`].
+    /// terminal client capabilities. Times out after the configured
+    /// `init` bound ([`crate::config::ConnTimeouts::init`], default 10 s).
     ///
     /// Resolves to the serialized `InitializeResponse` so callers can inspect
     /// agent capabilities without depending on the ACP crate's types.
@@ -169,24 +315,28 @@ impl AcpConn {
     pub async fn initialize(&self) -> Result<serde_json::Value> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::Initialize(tx))?;
-        tokio::time::timeout(INIT_TIMEOUT, rx)
-            .await
-            .map_err(|_| anyhow!("acp initialize timed out after {INIT_TIMEOUT:?}"))?
-            .map_err(|_| anyhow!("acp connection closed before initialize completed"))?
+        self.await_reply(rx, self.timeouts.init, "initialize").await
     }
 
     /// Create a new ACP session rooted at `cwd`; returns the acp session id.
+    /// Unbounded: session/new cost is agent-defined (v1 keeps the
+    /// pre-existing behavior rather than inventing a bound).
     pub async fn new_session(&self, cwd: &Path) -> Result<String> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::NewSession {
             cwd: cwd.to_path_buf(),
             reply: tx,
         })?;
-        rx.await
-            .map_err(|_| anyhow!("acp connection closed before session/new completed"))?
+        self.await_reply(rx, Duration::ZERO, "session/new").await
     }
 
     /// Send a user prompt; resolves when the agent finishes its turn.
+    /// Times out after the configured `prompt` bound
+    /// ([`crate::config::ConnTimeouts::prompt`], default 600 s; `0`
+    /// disables) — the timeout fires on the caller's side; the wedged
+    /// worker-side request is abandoned in place and dies with the conn.
+    /// An [`EventKind::Orchestrator`] "timed out" note is emitted so the
+    /// orchestrator's fan-out persists it into the session log.
     pub async fn prompt(&self, session_id: &str, text: String) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::Prompt {
@@ -194,12 +344,71 @@ impl AcpConn {
             text,
             reply: tx,
         })?;
-        rx.await
-            .map_err(|_| anyhow!("acp connection closed before session/prompt completed"))?
+        self.await_reply(rx, self.timeouts.prompt, "session/prompt")
+            .await
+    }
+
+    /// Await a command reply, bounding the wait to `bound`
+    /// ([`Duration::ZERO`] = wait forever). A timeout emits an
+    /// `Orchestrator` note and resolves to a `timed out` error; the
+    /// worker-side request keeps running (the reply oneshot is simply
+    /// dropped) so machinery that *un*wedges it — `cancel`, `close` —
+    /// is never blocked by the timeout.
+    async fn await_reply<T>(
+        &self,
+        rx: oneshot::Receiver<Result<T>>,
+        bound: Duration,
+        what: &'static str,
+    ) -> Result<T> {
+        let outcome = if bound.is_zero() {
+            rx.await
+        } else {
+            match tokio::time::timeout(bound, rx).await {
+                Err(_) => {
+                    emit(
+                        &self.event_tx,
+                        self.session_id,
+                        EventKind::Orchestrator(format!("acp {what} timed out after {bound:?}")),
+                    );
+                    return Err(anyhow!(
+                        "acp {what} timed out after {bound:?}{}",
+                        self.stderr.tail_suffix()
+                    ));
+                }
+                Ok(outcome) => outcome,
+            }
+        };
+        match outcome {
+            // Worker-side failure — most often the child died under the
+            // request. Wait briefly for the stderr drain to flush so the
+            // error carries the agent's last lines when they exist.
+            Ok(Err(e)) => {
+                let tail = self.stderr.tail();
+                tail.wait_eof(stderr::EOF_WAIT).await;
+                Err(anyhow!("{e:#}{}", tail.suffix()))
+            }
+            Ok(Ok(v)) => Ok(v),
+            // The reply channel dropped before the worker answered —
+            // the conn itself is gone.
+            Err(_) => {
+                let tail = self.stderr.tail();
+                tail.wait_eof(stderr::EOF_WAIT).await;
+                Err(anyhow!(
+                    "acp connection closed before {what} completed{}",
+                    tail.suffix()
+                ))
+            }
+        }
     }
 
     /// Send `session/cancel` for an in-flight prompt turn.
+    ///
+    /// Per ACP cancellation semantics the client MUST answer every
+    /// pending `session/request_permission` with `cancelled` — parked
+    /// requests are drained first so the agent's outstanding permission
+    /// calls resolve instead of outliving the cancelled turn.
     pub async fn cancel(&self, session_id: &str) -> Result<()> {
+        drain_pending(&self.pending);
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::Cancel {
             session_id: session_id.to_string(),
@@ -207,6 +416,20 @@ impl AcpConn {
         })?;
         rx.await
             .map_err(|_| anyhow!("acp connection closed before session/cancel completed"))?
+    }
+
+    /// Answer a parked `session/request_permission` — the conn-level half
+    /// of the `session/permission` RPC.
+    ///
+    /// `decision` is mapped onto the options the agent offered (see
+    /// [`decision_outcome`]); answering with a kind the agent didn't
+    /// offer errors and leaves the request parked. An unknown or
+    /// already-resolved `request_id` errors too.
+    ///
+    /// Synchronous and non-blocking: the registry is shared with the
+    /// worker-side handler, so no worker round-trip is needed.
+    pub fn respond_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()> {
+        resolve_pending(&self.pending, request_id, decision)
     }
 
     /// Subscribe to this connection's event stream.
@@ -233,12 +456,17 @@ impl AcpConn {
     /// acknowledge or join its thread; use `shutdown` when a clean,
     /// awaited teardown is wanted and `&mut` access is available.
     pub fn close(&self) {
+        // Answer parked permission requests first: while the worker is
+        // still up the agent sees a clean `cancelled` rather than a dead
+        // channel mid-RPC.
+        drain_pending(&self.pending);
         self.cmd_tx.lock().unwrap().take();
     }
 
     /// Shut the connection down: the worker thread exits and the child
     /// process is killed (`kill_on_drop`). Idempotent.
     pub async fn shutdown(&mut self) -> Result<()> {
+        drain_pending(&self.pending);
         // Take the sender in a statement of its own — the guard must drop
         // before awaiting, otherwise the lock is held across `.await`.
         let cmd_tx = self.cmd_tx.lock().unwrap().take();
@@ -283,6 +511,7 @@ impl Drop for AcpConn {
         // executor, and the worker exits promptly once the channel closes.
         // (Even if the lock were poisoned, field destruction would drop the
         // sender anyway, closing the channel — this just does it early.)
+        drain_pending(&self.pending);
         if let Ok(mut cmd_tx) = self.cmd_tx.lock() {
             cmd_tx.take();
         }
@@ -295,6 +524,9 @@ struct SpawnSpec {
     args: Vec<String>,
     env: BTreeMap<String, String>,
     cwd: PathBuf,
+    /// Optional on-disk destination for the stderr drain; `None` keeps
+    /// only the in-memory tail.
+    stderr_log: Option<PathBuf>,
 }
 
 /// The worker thread: builds its own `current_thread` runtime, spawns the
@@ -304,8 +536,9 @@ fn actor_main(
     spec: SpawnSpec,
     session_id: SessionId,
     event_tx: broadcast::Sender<Event>,
+    pending: PendingPermissions,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
-    ready_tx: std::sync::mpsc::Sender<Result<()>>,
+    ready_tx: std::sync::mpsc::Sender<Result<StderrCapture>>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -325,9 +558,9 @@ fn actor_main(
             .current_dir(&spec.cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            // TODO(observability): route agent stderr into the event stream
-            // instead of discarding it.
-            .stderr(std::process::Stdio::null())
+            // Piped, then drained by `stderr::spawn_drain` into the
+            // session log + shared tail (v1.1 observability).
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
         {
@@ -343,6 +576,13 @@ fn actor_main(
 
         let child_stdin = child.stdin.take().expect("stdin was piped");
         let child_stdout = child.stdout.take().expect("stdout was piped");
+        let child_stderr = child.stderr.take().expect("stderr was piped");
+
+        // Drain stderr line-wise on this runtime: last N lines are kept
+        // for error reporting, every line is appended to the session's
+        // stderr log when a path was configured.
+        let stderr = stderr::spawn_drain(child_stderr, spec.stderr_log.clone());
+        let stderr_tail = stderr.tail();
 
         // Working directory the `fs/*` handlers are confined to; replaced by
         // the `session/new` cwd once a session exists.
@@ -352,6 +592,7 @@ fn actor_main(
             session_id,
             cwd: session_cwd.clone(),
             event_tx: event_tx.clone(),
+            pending,
         };
 
         // The returned io future and the `spawn` callback are `!Send`; both
@@ -380,9 +621,13 @@ fn actor_main(
             }
         });
 
-        // Report child exit as `AgentExited`.
+        // Report child exit as `AgentExited`. On a nonzero (or unknown)
+        // exit first wait briefly for the stderr drain to flush, then
+        // emit the captured tail as an `Orchestrator` note so the
+        // agent's dying words land in the session log.
         tokio::task::spawn_local({
             let event_tx = event_tx.clone();
+            let tail = stderr_tail.clone();
             async move {
                 let code = match child.wait().await {
                     Ok(status) => status.code(),
@@ -391,11 +636,24 @@ fn actor_main(
                         None
                     }
                 };
+                if code != Some(0) {
+                    tail.wait_eof(stderr::EOF_WAIT).await;
+                    let suffix = tail.suffix();
+                    if !suffix.is_empty() {
+                        emit(
+                            &event_tx,
+                            session_id,
+                            EventKind::Orchestrator(format!(
+                                "agent exited with code {code:?}{suffix}"
+                            )),
+                        );
+                    }
+                }
                 emit(&event_tx, session_id, EventKind::AgentExited { code });
             }
         });
 
-        if ready_tx.send(Ok(())).is_err() {
+        if ready_tx.send(Ok(stderr)).is_err() {
             // The caller went away while we were starting up.
             return;
         }
@@ -501,6 +759,11 @@ struct AcpClientHandler {
     /// Directory `fs/*` requests are confined to.
     cwd: Arc<Mutex<PathBuf>>,
     event_tx: broadcast::Sender<Event>,
+    /// Requests this handler has parked, shared with the [`AcpConn`]
+    /// handle — `respond_permission` resolves them, conn teardown drains
+    /// them, and the handler removes its own entry when its await ends
+    /// (so a timed-out request can never be answered into a void).
+    pending: PendingPermissions,
 }
 
 impl AcpClientHandler {
@@ -577,36 +840,72 @@ impl AcpClientHandler {
 
 #[async_trait::async_trait(?Send)]
 impl acp::Client for AcpClientHandler {
+    /// Park the agent's permission request and await an answer.
+    ///
+    /// The request gets a daemon-minted `request_id`, is registered in
+    /// the shared `pending` map, and surfaced as
+    /// [`EventKind::PermissionRequest`] so clients can answer it via
+    /// `session/permission` → [`AcpConn::respond_permission`]. The trait
+    /// method then awaits the oneshot — the agent's turn is in flight for
+    /// the whole wait, which is inherent to a permission gate.
+    ///
+    /// Resolution order, whichever comes first:
+    /// - a `session/permission` answer (`resolve_pending`);
+    /// - [`PERMISSION_TIMEOUT`] → `cancelled` (a UI can die mid-answer —
+    ///   the turn must not hang forever);
+    /// - the oneshot's sender being dropped (`close`/kill teardown or
+    ///   `session/cancel` draining the map) → `cancelled`, per ACP's
+    ///   "pending permission requests MUST be answered `cancelled` on
+    ///   cancel" rule.
+    ///
+    /// Every conclusion emits [`EventKind::PermissionResolved`] — the
+    /// single emission site that lets the orchestrator's fan-out pair
+    /// park/resolve for its `WaitingPermission` transitions.
     async fn request_permission(
         &self,
         args: acp::RequestPermissionRequest,
     ) -> acp::Result<acp::RequestPermissionResponse> {
-        // Forward the request onto the event bus so the daemon/UI can see it.
+        let request_id = Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel();
+        // Register *before* emitting: a `session/permission` answer that
+        // lands between emit and insert would otherwise see no pending
+        // entry and fail.
+        self.pending.lock().unwrap().insert(
+            request_id.clone(),
+            PendingPermission {
+                options: args.options.clone(),
+                tx,
+            },
+        );
         let payload = serde_json::to_value(&args)
             .unwrap_or_else(|_| serde_json::json!({"unserializable": true}));
         emit(
             &self.event_tx,
             self.session_id,
-            EventKind::Orchestrator(format!("permission-request: {payload}")),
+            EventKind::PermissionRequest {
+                request_id: request_id.clone(),
+                request: payload,
+            },
         );
 
-        // SECURITY: deny-by-default. Prefer an explicit `reject_*` option so
-        // the agent learns the call was refused; fall back to `cancelled`
-        // when the agent offered no rejection option.
-        // TODO(T14): park the request on a oneshot and let the daemon drive
-        // an interactive approval flow instead of auto-denying.
-        let reject = args.options.iter().find(|o| {
-            matches!(
-                o.kind,
-                acp::PermissionOptionKind::RejectOnce | acp::PermissionOptionKind::RejectAlways
-            )
-        });
-        let outcome = match reject {
-            Some(option) => acp::RequestPermissionOutcome::Selected(
-                acp::SelectedPermissionOutcome::new(option.option_id.clone()),
-            ),
-            None => acp::RequestPermissionOutcome::Cancelled,
+        let outcome = match tokio::time::timeout(PERMISSION_TIMEOUT, rx).await {
+            Ok(Ok(outcome)) => outcome,
+            // Sender dropped (teardown/cancel drain) or timed out —
+            // either way the request resolves `cancelled`.
+            Ok(Err(_)) | Err(_) => acp::RequestPermissionOutcome::Cancelled,
         };
+        // Self-cleanup so the map never leaks (the timeout path leaves
+        // its entry; the resolve path already consumed it — remove is
+        // idempotent).
+        self.pending.lock().unwrap().remove(&request_id);
+        emit(
+            &self.event_tx,
+            self.session_id,
+            EventKind::PermissionResolved {
+                request_id,
+                outcome: outcome_label(&outcome),
+            },
+        );
         Ok(acp::RequestPermissionResponse::new(outcome))
     }
 
@@ -691,13 +990,55 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use agent_client_protocol::Client as _;
+    use std::future::Future;
+    use std::pin::Pin;
 
     fn handler(cwd: &Path) -> AcpClientHandler {
-        AcpClientHandler {
-            session_id: SessionId::new(),
-            cwd: Arc::new(Mutex::new(cwd.to_path_buf())),
-            event_tx: broadcast::channel(1).0,
-        }
+        handler_with(cwd).0
+    }
+
+    /// A handler wired to a real event channel + pending map — the
+    /// permission-parking tests need both.
+    fn handler_with(
+        cwd: &Path,
+    ) -> (
+        AcpClientHandler,
+        broadcast::Receiver<Event>,
+        PendingPermissions,
+    ) {
+        let (event_tx, rx) = broadcast::channel(8);
+        let pending: PendingPermissions = Arc::new(Mutex::new(HashMap::new()));
+        (
+            AcpClientHandler {
+                session_id: SessionId::new(),
+                cwd: Arc::new(Mutex::new(cwd.to_path_buf())),
+                event_tx,
+                pending: pending.clone(),
+            },
+            rx,
+            pending,
+        )
+    }
+
+    /// A `RequestPermissionRequest` offering allow-once, allow-always,
+    /// and reject-once options.
+    fn perm_request() -> acp::RequestPermissionRequest {
+        acp::RequestPermissionRequest::new(
+            "mock-session-1",
+            acp::ToolCallUpdate::new(
+                "tc-1",
+                acp::ToolCallUpdateFields::new().title("Write src/x.rs".to_string()),
+            ),
+            vec![
+                acp::PermissionOption::new("allow", "Allow", acp::PermissionOptionKind::AllowOnce),
+                acp::PermissionOption::new(
+                    "always",
+                    "Always allow",
+                    acp::PermissionOptionKind::AllowAlways,
+                ),
+                acp::PermissionOption::new("deny", "Reject", acp::PermissionOptionKind::RejectOnce),
+            ],
+        )
     }
 
     #[test]
@@ -768,5 +1109,244 @@ mod tests {
 
         let h = handler(inside.path());
         assert!(h.resolve_in_cwd(&inside.path().join("link.txt")).is_ok());
+    }
+
+    // --- interactive permission requests -------------------------------------
+
+    /// The parked request future — `Client` is `#[async_trait(?Send)]`,
+    /// so `tokio::spawn` can't drive it; tests poll it on their own task.
+    type ParkedRequest =
+        Pin<Box<dyn Future<Output = Result<acp::RequestPermissionResponse, acp::Error>>>>;
+
+    /// Start `handler.request_permission` and poll it until its
+    /// `PermissionRequest` event lands; returns the (still-parked)
+    /// future plus the event's request_id.
+    async fn park_request(
+        h: &'static AcpClientHandler,
+        rx: &mut broadcast::Receiver<Event>,
+        req: acp::RequestPermissionRequest,
+    ) -> (ParkedRequest, String) {
+        let mut fut: ParkedRequest = Box::pin(h.request_permission(req));
+        loop {
+            tokio::select! {
+                ev = rx.recv() => {
+                    let ev = ev.expect("event channel closed");
+                    if let EventKind::PermissionRequest { request_id, request } = &ev.kind {
+                        assert!(
+                            request.get("toolCall").is_some(),
+                            "event payload should carry the tool call: {request}"
+                        );
+                        return (fut, request_id.clone());
+                    }
+                }
+                r = &mut fut => panic!(
+                    "request_permission completed before its event was seen: {r:?}"
+                ),
+            }
+        }
+    }
+
+    /// `allow_once` answers with the matching option's id; the parked
+    /// future resolves `Selected("allow")` and a `PermissionResolved`
+    /// event follows the request in the log.
+    #[tokio::test]
+    async fn parked_permission_resolves_allow_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, mut rx, pending) = handler_with(dir.path());
+        let h: &'static _ = Box::leak(Box::new(h));
+
+        let (fut, request_id) = park_request(h, &mut rx, perm_request()).await;
+        assert!(pending.lock().unwrap().contains_key(&request_id));
+
+        resolve_pending(&pending, &request_id, PermissionDecision::AllowOnce).unwrap();
+        let resp = fut.await.unwrap();
+        assert!(
+            matches!(
+                &resp.outcome,
+                acp::RequestPermissionOutcome::Selected(sel) if sel.option_id.to_string() == "allow"
+            ),
+            "allow_once must select the AllowOnce option: {:?}",
+            resp.outcome
+        );
+        assert!(pending.lock().unwrap().is_empty(), "entry consumed");
+
+        // The resolved event pairs with the request in the event stream.
+        let resolved = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                &resolved.kind,
+                EventKind::PermissionResolved { request_id: rid, outcome }
+                    if *rid == request_id && outcome == "selected:allow"
+            ),
+            "expected paired PermissionResolved, got {resolved:?}"
+        );
+    }
+
+    /// `reject` picks the `reject_once` option — the agent learns it was
+    /// refused rather than cancelled.
+    #[tokio::test]
+    async fn reject_selects_the_reject_option() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, mut rx, pending) = handler_with(dir.path());
+        let h: &'static _ = Box::leak(Box::new(h));
+
+        let (fut, request_id) = park_request(h, &mut rx, perm_request()).await;
+        resolve_pending(&pending, &request_id, PermissionDecision::Reject).unwrap();
+        let resp = fut.await.unwrap();
+        assert!(
+            matches!(
+                &resp.outcome,
+                acp::RequestPermissionOutcome::Selected(sel) if sel.option_id.to_string() == "deny"
+            ),
+            "reject must select the RejectOnce option: {:?}",
+            resp.outcome
+        );
+    }
+
+    /// `reject` honours preference order, not offer order: with
+    /// `reject_always` listed first it still picks the `reject_once`
+    /// option — the narrowest refusal.
+    #[tokio::test]
+    async fn reject_prefers_once_even_when_always_is_offered_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, mut rx, pending) = handler_with(dir.path());
+        let h: &'static _ = Box::leak(Box::new(h));
+        let req = acp::RequestPermissionRequest::new(
+            "mock-session-1",
+            acp::ToolCallUpdate::new("tc-1", acp::ToolCallUpdateFields::new()),
+            vec![
+                acp::PermissionOption::new(
+                    "always-deny",
+                    "Always reject",
+                    acp::PermissionOptionKind::RejectAlways,
+                ),
+                acp::PermissionOption::new("deny", "Reject", acp::PermissionOptionKind::RejectOnce),
+            ],
+        );
+
+        let (fut, request_id) = park_request(h, &mut rx, req).await;
+        resolve_pending(&pending, &request_id, PermissionDecision::Reject).unwrap();
+        let resp = fut.await.unwrap();
+        assert!(
+            matches!(
+                &resp.outcome,
+                acp::RequestPermissionOutcome::Selected(sel) if sel.option_id.to_string() == "deny"
+            ),
+            "reject must prefer the RejectOnce option over RejectAlways: {:?}",
+            resp.outcome
+        );
+    }
+
+    /// A decision the agent didn't offer errors and leaves the request
+    /// parked — a later valid answer still resolves it. Unknown and
+    /// already-resolved ids fail the same way.
+    #[tokio::test]
+    async fn unoffered_or_unknown_decisions_fail_and_stay_parked() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, mut rx, pending) = handler_with(dir.path());
+        let h: &'static _ = Box::leak(Box::new(h));
+        // Offer allow_once only so `allow_always` is unoffered.
+        let req = acp::RequestPermissionRequest::new(
+            "mock-session-1",
+            acp::ToolCallUpdate::new("tc-1", acp::ToolCallUpdateFields::new()),
+            vec![acp::PermissionOption::new(
+                "allow",
+                "Allow",
+                acp::PermissionOptionKind::AllowOnce,
+            )],
+        );
+
+        let (fut, request_id) = park_request(h, &mut rx, req).await;
+
+        assert!(resolve_pending(&pending, "nope", PermissionDecision::AllowOnce).is_err());
+        assert!(
+            resolve_pending(&pending, &request_id, PermissionDecision::AllowAlways).is_err(),
+            "allow_always was not offered — the request must stay parked"
+        );
+        assert!(pending.lock().unwrap().contains_key(&request_id));
+
+        resolve_pending(&pending, &request_id, PermissionDecision::AllowOnce).unwrap();
+        fut.await.unwrap();
+        assert!(
+            resolve_pending(&pending, &request_id, PermissionDecision::AllowOnce).is_err(),
+            "an already-resolved request_id must fail"
+        );
+    }
+
+    /// When the agent offers only allows, `reject`/`cancel` resolve to
+    /// `cancelled` — the deny-equivalent — instead of erroring.
+    #[tokio::test]
+    async fn reject_without_reject_option_falls_back_to_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, mut rx, pending) = handler_with(dir.path());
+        let h: &'static _ = Box::leak(Box::new(h));
+        let req = acp::RequestPermissionRequest::new(
+            "mock-session-1",
+            acp::ToolCallUpdate::new("tc-1", acp::ToolCallUpdateFields::new()),
+            vec![acp::PermissionOption::new(
+                "allow",
+                "Allow",
+                acp::PermissionOptionKind::AllowOnce,
+            )],
+        );
+
+        let (fut, request_id) = park_request(h, &mut rx, req).await;
+        resolve_pending(&pending, &request_id, PermissionDecision::Reject).unwrap();
+        let resp = fut.await.unwrap();
+        assert!(matches!(
+            &resp.outcome,
+            acp::RequestPermissionOutcome::Cancelled
+        ));
+    }
+
+    /// The `PERMISSION_TIMEOUT` fallback: an unanswered request resolves
+    /// `cancelled`, emits `PermissionResolved`, and drops its map entry.
+    /// `start_paused` makes the 120 s wait instant.
+    #[tokio::test(start_paused = true)]
+    async fn unanswered_permission_times_out_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, mut rx, pending) = handler_with(dir.path());
+        let h: &'static _ = Box::leak(Box::new(h));
+
+        let (fut, request_id) = park_request(h, &mut rx, perm_request()).await;
+        let resp = fut.await.unwrap();
+        assert!(matches!(
+            &resp.outcome,
+            acp::RequestPermissionOutcome::Cancelled
+        ));
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "a timed-out request must not linger in the map"
+        );
+        let resolved = rx.recv().await.unwrap();
+        assert!(
+            matches!(
+                &resolved.kind,
+                EventKind::PermissionResolved { request_id: rid, outcome }
+                    if *rid == request_id && outcome == "cancelled"
+            ),
+            "expected cancelled PermissionResolved, got {resolved:?}"
+        );
+    }
+
+    /// Conn teardown (`drain_pending` — what `close`/`kill`/`cancel`
+    /// call) resolves every parked request `cancelled`.
+    #[tokio::test]
+    async fn teardown_drains_pending_as_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, mut rx, pending) = handler_with(dir.path());
+        let h: &'static _ = Box::leak(Box::new(h));
+
+        let (fut, _request_id) = park_request(h, &mut rx, perm_request()).await;
+        drain_pending(&pending);
+        let resp = fut.await.unwrap();
+        assert!(matches!(
+            &resp.outcome,
+            acp::RequestPermissionOutcome::Cancelled
+        ));
+        assert!(pending.lock().unwrap().is_empty());
     }
 }

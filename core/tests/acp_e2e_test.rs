@@ -21,6 +21,9 @@
 //! - prompt containing `"crash"` → process exits with code 1
 //! - prompt containing `"exit42"` → process exits with code 42
 //! - prompt containing `"hang"` → never responds (for timeout tests)
+//! - prompt containing `"perm"` → the agent calls
+//!   `session/request_permission` (allow/always/deny options) mid-turn,
+//!   then reports the answer as a `"permission outcome: …"` chunk
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -28,7 +31,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use agentmux_core::{AcpConn, Event, EventKind};
+use agentmux_core::{AcpConn, ConnTimeouts, Event, EventKind, PermissionDecision, SpawnOptions};
 
 /// Generous deadline for event collection; the mock replies instantly, so
 /// this only bites on regression.
@@ -81,9 +84,14 @@ fn mock_agent_binary() -> PathBuf {
 
 /// Spawn a connection to the mock agent; the tempdir is the child's cwd.
 async fn spawn_mock() -> (AcpConn, tempfile::TempDir) {
+    spawn_mock_opts(&SpawnOptions::default()).await
+}
+
+/// [`spawn_mock`] with explicit spawn options (timeouts, stderr log).
+async fn spawn_mock_opts(opts: &SpawnOptions) -> (AcpConn, tempfile::TempDir) {
     let binary = mock_agent_binary();
     let dir = tempfile::tempdir().unwrap();
-    let conn = AcpConn::spawn(&binary, &[], &BTreeMap::new(), dir.path())
+    let conn = AcpConn::spawn(&binary, &[], &BTreeMap::new(), dir.path(), opts)
         .expect("mock agent should spawn");
     (conn, dir)
 }
@@ -269,4 +277,340 @@ async fn hang_prompt_never_resolves_but_connection_stays_alive() {
     // The worker dispatches each command on its own task, so a stuck
     // prompt does not wedge the connection.
     conn.shutdown().await.unwrap();
+}
+
+/// The parked prompt future, boxed so it can leave this helper's frame.
+type ParkedPrompt<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = agentmux_core::Result<()>> + 'a>>;
+
+/// Run `conn.prompt` against the `perm` trigger and pull events until the
+/// `PermissionRequest` lands; returns the still-parked prompt future (so
+/// the caller can keep asserting "not done yet") and the request_id.
+async fn park_perm_prompt<'a>(
+    conn: &'a AcpConn,
+    session_id: &'a str,
+    rx: &mut tokio::sync::broadcast::Receiver<Event>,
+) -> (ParkedPrompt<'a>, String) {
+    let mut prompt: ParkedPrompt<'_> =
+        Box::pin(conn.prompt(session_id, "please perm now".to_string()));
+    let request_id = loop {
+        tokio::select! {
+            r = &mut prompt => panic!("prompt finished before its permission was answered: {r:?}"),
+            e = rx.recv() => {
+                if let Ok(Event { kind: EventKind::PermissionRequest { request_id, request }, .. }) = e {
+                    // The raw request is on the wire for the UI: three
+                    // offered options, the tool call, the session id.
+                    assert_eq!(
+                        request["options"].as_array().map(|o| o.len()),
+                        Some(3),
+                        "expected allow/always/deny options: {request}"
+                    );
+                    assert_eq!(
+                        request["toolCall"]["title"],
+                        serde_json::json!("mock edit of src/lib.rs"),
+                        "{request}"
+                    );
+                    break request_id;
+                }
+            }
+        }
+    };
+    (prompt, request_id)
+}
+
+/// Whether `k` is the mock's `"permission outcome: <text>"` chunk.
+fn is_perm_outcome(k: &EventKind, text: &str) -> bool {
+    matches!(k, EventKind::SessionUpdate(v)
+        if v["update"]["sessionUpdate"] == "agent_message_chunk"
+            && v["update"]["content"]["text"] == format!("permission outcome: {text}"))
+}
+
+/// `perm` parks the turn on `session/request_permission`; answering
+/// `allow_once` selects the mock's `allow` option — visible both in the
+/// paired `PermissionResolved` event and the agent's own outcome chunk.
+#[tokio::test]
+async fn perm_prompt_parks_until_allowed() {
+    let (mut conn, dir) = spawn_mock().await;
+    let mut rx = conn.events();
+    conn.initialize().await.unwrap();
+    let session_id = conn.new_session(dir.path()).await.unwrap();
+
+    let (prompt, request_id) = park_perm_prompt(&conn, &session_id, &mut rx).await;
+
+    conn.respond_permission(&request_id, PermissionDecision::AllowOnce)
+        .expect("respond_permission should accept a parked request");
+    prompt.await.expect("the prompt completes once answered");
+
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |k| {
+        is_perm_outcome(k, "selected:allow")
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::PermissionResolved { request_id: r, outcome }
+                if *r == request_id && outcome == "selected:allow"
+        )),
+        "expected a paired PermissionResolved: {events:?}"
+    );
+    conn.shutdown().await.unwrap();
+}
+
+/// `reject` maps onto the mock's `deny` option (kind `reject_once`).
+#[tokio::test]
+async fn perm_prompt_reject_selects_deny() {
+    let (mut conn, dir) = spawn_mock().await;
+    let mut rx = conn.events();
+    conn.initialize().await.unwrap();
+    let session_id = conn.new_session(dir.path()).await.unwrap();
+
+    let (prompt, request_id) = park_perm_prompt(&conn, &session_id, &mut rx).await;
+
+    conn.respond_permission(&request_id, PermissionDecision::Reject)
+        .unwrap();
+    prompt.await.expect("a rejected prompt still completes");
+
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |k| {
+        is_perm_outcome(k, "selected:deny")
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::PermissionResolved { outcome, .. } if outcome == "selected:deny"
+        )),
+        "expected PermissionResolved selected:deny: {events:?}"
+    );
+    conn.shutdown().await.unwrap();
+}
+
+/// `respond_permission` on an unknown request id errors cleanly; a
+/// resolved id errors the same way (the entry was consumed).
+#[tokio::test]
+async fn respond_permission_unknown_or_consumed_id_errors() {
+    let (mut conn, dir) = spawn_mock().await;
+    let mut rx = conn.events();
+    conn.initialize().await.unwrap();
+    let session_id = conn.new_session(dir.path()).await.unwrap();
+
+    let (prompt, request_id) = park_perm_prompt(&conn, &session_id, &mut rx).await;
+    let err = conn
+        .respond_permission("no-such-request", PermissionDecision::AllowOnce)
+        .expect_err("unknown request_id must fail");
+    assert!(err.to_string().contains("no-such-request"), "{err}");
+
+    conn.respond_permission(&request_id, PermissionDecision::Cancel)
+        .unwrap();
+    assert!(
+        conn.respond_permission(&request_id, PermissionDecision::AllowOnce)
+            .is_err(),
+        "an already-answered request_id must fail"
+    );
+    prompt.await.expect("cancel resolves the turn");
+
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |k| is_perm_outcome(k, "cancelled")).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::PermissionResolved { outcome, .. } if outcome == "cancelled"
+        )),
+        "cancel resolves as the cancelled outcome: {events:?}"
+    );
+    conn.shutdown().await.unwrap();
+}
+
+/// Closing the conn mid-parked-request resolves it `cancelled` — the
+/// agent's turn unwinds instead of parking forever.
+#[tokio::test]
+async fn close_cancels_a_parked_permission() {
+    let (conn, dir) = spawn_mock().await;
+    let mut rx = conn.events();
+    conn.initialize().await.unwrap();
+    let session_id = conn.new_session(dir.path()).await.unwrap();
+
+    let (prompt, _request_id) = park_perm_prompt(&conn, &session_id, &mut rx).await;
+    conn.close();
+    // The prompt unwinds one way or another — conn death fails it.
+    let _ = tokio::time::timeout(EVENT_TIMEOUT, prompt)
+        .await
+        .expect("a killed conn must not leave the prompt hanging");
+}
+
+/// The configured `prompt` bound: a wedged turn resolves with a timeout
+/// error exactly at the bound — under the paused clock the 30 s virtual
+/// deadline fires the instant the caller parks on the reply (external
+/// replies always lose to auto-advance, so this pins the timeout path
+/// itself). `cancel` takes no timeout and still resolves.
+#[tokio::test(start_paused = true)]
+async fn prompt_times_out_on_the_configured_bound_virtual() {
+    let opts = SpawnOptions {
+        timeouts: ConnTimeouts {
+            init: Duration::from_secs(10),
+            prompt: Duration::from_secs(30),
+        },
+        ..SpawnOptions::default()
+    };
+    let (mut conn, _dir) = spawn_mock_opts(&opts).await;
+    let mut rx = conn.events();
+
+    let err = conn
+        .prompt("mock-session-1", "hang".to_string())
+        .await
+        .expect_err("a wedged turn must error at the prompt bound");
+    assert!(
+        err.to_string().contains("timed out"),
+        "expected a timeout error, got: {err}"
+    );
+
+    // The conn emitted an Orchestrator note naming the timeout — the
+    // orchestrator's fan-out persists these into the session log.
+    let mut notes = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        notes.push(ev);
+    }
+    assert!(
+        notes.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::Orchestrator(m) if m.contains("timed out")
+        )),
+        "expected a 'timed out' Orchestrator note, got {notes:?}"
+    );
+
+    // CANCEL is not subject to the prompt bound — it answers right away
+    // even with the turn still wedged agent-side.
+    conn.cancel("mock-session-1")
+        .await
+        .expect("cancel must resolve immediately");
+    conn.shutdown().await.unwrap();
+}
+
+/// Real-clock counterpart: the 1 s bound frees the caller from the mock's
+/// `hang` turn (~1 s, not forever), while a healthy turn under the same
+/// conn completes well inside the bound.
+#[tokio::test]
+async fn prompt_timeout_frees_the_caller_and_cancel_still_works() {
+    let opts = SpawnOptions {
+        timeouts: ConnTimeouts {
+            init: Duration::from_secs(10),
+            prompt: Duration::from_secs(1),
+        },
+        ..SpawnOptions::default()
+    };
+    let (mut conn, dir) = spawn_mock_opts(&opts).await;
+    conn.initialize().await.unwrap();
+    let session_id = conn.new_session(dir.path()).await.unwrap();
+
+    let start = std::time::Instant::now();
+    let err = conn
+        .prompt(&session_id, "hang".to_string())
+        .await
+        .expect_err("a wedged turn must fail at the prompt bound");
+    let elapsed = start.elapsed();
+    assert!(err.to_string().contains("timed out"), "{err}");
+    assert!(
+        elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(5),
+        "bound should fire near 1s, took {elapsed:?}"
+    );
+
+    // The wedged worker-side request does not wedge the conn: cancel
+    // resolves, and the next prompt works once the turn unwinds.
+    conn.cancel(&session_id)
+        .await
+        .expect("cancel should resolve");
+    conn.shutdown().await.unwrap();
+}
+
+/// Agent stderr is piped, drained into the configured log file, and the
+/// retained tail surfaces twice: appended to the failed prompt's error
+/// and as an `Orchestrator` note emitted before `AgentExited`. The
+/// mock's `noisy` trigger writes 15 lines then exits 3 — one more than
+/// the 12-line tail, so truncation is exercised too.
+#[tokio::test]
+async fn stderr_is_logged_and_tail_surfaces_on_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("agent.stderr.log");
+    let opts = SpawnOptions {
+        stderr_log: Some(log_path.clone()),
+        ..SpawnOptions::default()
+    };
+    let (mut conn, work) = spawn_mock_opts(&opts).await;
+    conn.initialize().await.unwrap();
+    let session_id = conn.new_session(work.path()).await.unwrap();
+    let mut rx = conn.events();
+
+    let err = conn
+        .prompt(&session_id, "noisy".to_string())
+        .await
+        .expect_err("a crashing prompt must fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("mock stderr line 15"),
+        "error should carry the stderr tail, got: {msg}"
+    );
+    assert!(
+        !msg.contains("mock stderr line 3"),
+        "tail should keep only the last ~12 lines, got: {msg}"
+    );
+
+    // The exit watcher emits the tail as an Orchestrator note, then
+    // AgentExited{Some(3)} — order asserted by position.
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |k| {
+        matches!(k, EventKind::AgentExited { .. })
+    })
+    .await;
+    let note_pos = events
+        .iter()
+        .position(|e| matches!(&e.kind, EventKind::Orchestrator(m) if m.contains("stderr tail")))
+        .expect("a stderr-tail Orchestrator note should precede AgentExited");
+    let note = match &events[note_pos].kind {
+        EventKind::Orchestrator(m) => m,
+        _ => unreachable!(),
+    };
+    assert!(note.contains("mock stderr line 15"), "{note}");
+    assert!(!note.contains("mock stderr line 3"), "{note}");
+    assert!(
+        note_pos < events.len() - 1
+            && matches!(
+                events.last().unwrap().kind,
+                EventKind::AgentExited { code: Some(3) }
+            ),
+        "expected note then AgentExited{{3}}, got {events:?}"
+    );
+
+    // The on-disk log keeps ALL 15 lines — tail truncation is in-memory
+    // only.
+    let content = std::fs::read_to_string(&log_path).unwrap();
+    assert!(content.contains("mock stderr line 1\n"), "{content:?}");
+    assert!(content.contains("mock stderr line 15\n"), "{content:?}");
+
+    conn.shutdown().await.unwrap();
+}
+
+/// An agent that dies during the initialize handshake fails the call
+/// with its last stderr line on the error — no `noisy` trigger needed,
+/// `sh` exits before answering.
+#[tokio::test]
+async fn init_failure_error_carries_stderr_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = AcpConn::spawn(
+        Path::new("sh"),
+        &[
+            "-c".to_string(),
+            "echo 'init boom on stderr' >&2; exit 7".to_string(),
+        ],
+        &BTreeMap::new(),
+        dir.path(),
+        &SpawnOptions::default(),
+    )
+    .expect("sh should spawn");
+
+    let err = conn
+        .initialize()
+        .await
+        .expect_err("a dead agent must fail initialize");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("init boom on stderr"),
+        "init failure should carry the stderr tail, got: {msg}"
+    );
 }

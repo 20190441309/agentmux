@@ -452,6 +452,28 @@ impl Store {
         }
     }
 
+    /// Path of `session_id`'s captured agent-stderr log —
+    /// `<data_dir>/sessions/<id>.stderr.log`, beside the JSONL event log.
+    /// Created lazily by the conn's stderr drain (a quiet agent leaves no
+    /// file); the orchestrator passes it in via
+    /// [`crate::config::SpawnOptions::stderr_log`].
+    pub fn stderr_log_path(&self, session_id: SessionId) -> PathBuf {
+        self.data_dir
+            .join(EVENTS_DIR)
+            .join(format!("{session_id}.stderr.log"))
+    }
+
+    /// Remove `session_id`'s stderr log, if present. A missing log is not
+    /// an error (a quiet agent never creates one).
+    pub fn delete_stderr_log(&self, session_id: SessionId) -> Result<()> {
+        let path = self.stderr_log_path(session_id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("failed to remove {}", path.display())),
+        }
+    }
+
     /// Path of `session_id`'s JSONL log.
     fn event_log_path(&self, session_id: SessionId) -> PathBuf {
         self.data_dir

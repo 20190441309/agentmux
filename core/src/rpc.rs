@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::id::{AgentId, ProjectId, SessionId, WorkspaceId};
-use crate::model::{AgentProfile, Event, Project, Session, SessionRef, Workspace};
+use crate::model::{
+    AgentProfile, Event, PermissionDecision, Project, Session, SessionRef, Workspace,
+};
 
 /// Value of the `jsonrpc` field on every envelope message.
 pub const JSONRPC_VERSION: &str = "2.0";
@@ -47,6 +49,8 @@ pub const M_SESSION_CREATE: &str = "session/create";
 pub const M_SESSION_PROMPT: &str = "session/prompt";
 /// Cancel the in-flight prompt turn (ACP `session/cancel`).
 pub const M_SESSION_CANCEL: &str = "session/cancel";
+/// Answer a parked agent permission request (ACP `session/request_permission`).
+pub const M_SESSION_PERMISSION: &str = "session/permission";
 /// Kill the session's agent process.
 pub const M_SESSION_KILL: &str = "session/kill";
 /// List a workspace's sessions.
@@ -77,6 +81,7 @@ pub const ALL_METHODS: &[&str] = &[
     M_SESSION_CREATE,
     M_SESSION_PROMPT,
     M_SESSION_CANCEL,
+    M_SESSION_PERMISSION,
     M_SESSION_KILL,
     M_SESSION_LIST,
     M_SESSION_RESUME,
@@ -356,6 +361,22 @@ pub struct SessionCancelParams {
 
 pub type SessionCancelResult = ();
 
+/// Params of `session/permission`: answer the permission request a
+/// `PermissionRequest` event advertised. `outcome` is the caller's
+/// generic decision ([`PermissionDecision`]'s snake_case wire values);
+/// the daemon maps it onto the option ids the agent actually offered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPermissionParams {
+    pub session_id: SessionId,
+    /// The `request_id` carried by the `PermissionRequest` event.
+    pub request_id: String,
+    pub outcome: PermissionDecision,
+}
+
+/// `session/permission` acks the answer — the turn resumes on the agent
+/// side; `PermissionResolved` arrives on the event stream.
+pub type SessionPermissionResult = ();
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionKillParams {
     pub session_id: SessionId,
@@ -466,7 +487,7 @@ mod tests {
         let mut sorted = ALL_METHODS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), 17, "duplicate method constants");
+        assert_eq!(sorted.len(), 18, "duplicate method constants");
         assert!(ALL_METHODS.iter().all(|m| m.contains('/')));
     }
 
@@ -488,6 +509,35 @@ mod tests {
             }],
         };
         roundtrip(&prompt);
+    }
+
+    /// `session/permission` params: `outcome` rides the wire as the
+    /// decision's snake_case string — a bad value is a params error.
+    #[test]
+    fn session_permission_params_roundtrip() {
+        roundtrip(&SessionPermissionParams {
+            session_id: SessionId::new(),
+            request_id: "req-1".into(),
+            outcome: PermissionDecision::AllowAlways,
+        });
+
+        let parsed: SessionPermissionParams = serde_json::from_value(json!({
+            "session_id": SessionId::new(),
+            "request_id": "r",
+            "outcome": "reject",
+        }))
+        .unwrap();
+        assert_eq!(parsed.outcome, PermissionDecision::Reject);
+
+        assert!(
+            serde_json::from_value::<SessionPermissionParams>(json!({
+                "session_id": SessionId::new(),
+                "request_id": "r",
+                "outcome": "maybe",
+            }))
+            .is_err(),
+            "an unknown outcome must fail to parse"
+        );
     }
 
     #[test]

@@ -47,10 +47,11 @@ use tokio::sync::{broadcast, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
 use crate::collab;
+use crate::config::{ConnTimeouts, SpawnOptions};
 use crate::id::{AgentId, ProjectId, SessionId, WorkspaceId};
 use crate::model::{
-    AdapterKind, AgentProfile, Event, EventKind, Project, Session, SessionRef, SessionState,
-    Workspace,
+    AdapterKind, AgentProfile, Event, EventKind, PermissionDecision, Project, Session, SessionRef,
+    SessionState, Workspace,
 };
 use crate::registry::AgentRegistry;
 use crate::store::Store;
@@ -77,13 +78,18 @@ pub enum SpawnedConn {
 
 impl SpawnedConn {
     /// Spawn the adapter process described by `profile`, working in `cwd`.
-    pub fn spawn(profile: &AgentProfile, cwd: &Path) -> Result<SpawnedConn> {
+    /// `options` carries the config-derived connection timeouts.
+    pub fn spawn(
+        profile: &AgentProfile,
+        cwd: &Path,
+        options: &SpawnOptions,
+    ) -> Result<SpawnedConn> {
         match &profile.adapter {
             AdapterKind::Acp { command, args } => {
-                AcpConn::spawn(command, args, &profile.env, cwd).map(SpawnedConn::Acp)
+                AcpConn::spawn(command, args, &profile.env, cwd, options).map(SpawnedConn::Acp)
             }
             AdapterKind::PiRpc { command, args } => {
-                PiConn::spawn(command, args, &profile.env, cwd).map(SpawnedConn::Pi)
+                PiConn::spawn(command, args, &profile.env, cwd, options).map(SpawnedConn::Pi)
             }
         }
     }
@@ -123,6 +129,16 @@ impl SpawnedConn {
         match self {
             SpawnedConn::Acp(c) => c.cancel(acp_session_id).await,
             SpawnedConn::Pi(c) => c.cancel(acp_session_id).await,
+        }
+    }
+
+    /// Answer a parked `session/request_permission`. Only ACP agents can
+    /// emit permission requests; pi sessions get a clean unsupported
+    /// error (they have no permission protocol to answer).
+    pub fn respond_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()> {
+        match self {
+            SpawnedConn::Acp(c) => c.respond_permission(request_id, decision),
+            SpawnedConn::Pi(c) => c.respond_permission(request_id, decision),
         }
     }
 
@@ -288,6 +304,38 @@ impl EventSink {
         self.ingest_locked(&store, &mut ev);
         Ok(true)
     }
+
+    /// Transition only while the session is in `from` — one atomic
+    /// check-and-set under the store lock. The permission flow uses
+    /// this to step `Prompting → WaitingPermission → Prompting`: a
+    /// resolved event racing a `cancel`/`kill` (which already moved the
+    /// session to `Ready`/`Done`) must not drag it back into `Prompting`.
+    fn transition_from(
+        &self,
+        session_id: SessionId,
+        from: SessionState,
+        to: SessionState,
+    ) -> Result<bool> {
+        let store = self.store.lock().unwrap();
+        let session = store
+            .get_session(session_id)?
+            .ok_or_else(|| anyhow!("no such session {session_id}"))?;
+        if session.state != from {
+            return Ok(false);
+        }
+        store.update_session_state(session_id, &to)?;
+        let mut ev = Event {
+            session_id,
+            seq: 0,
+            ts: Utc::now(),
+            kind: EventKind::StateChanged {
+                from: session.state,
+                to,
+            },
+        };
+        self.ingest_locked(&store, &mut ev);
+        Ok(true)
+    }
 }
 
 /// A session's live connection plus its adapter-level session id —
@@ -341,6 +389,9 @@ pub struct Orchestrator {
     registry: Mutex<AgentRegistry>,
     sessions: Mutex<HashMap<SessionId, Arc<SessionSlot>>>,
     data_dir: PathBuf,
+    /// Connection timeouts handed to every spawned conn — captured from
+    /// the registry's [`crate::config::Config`] at construction.
+    timeouts: ConnTimeouts,
 }
 
 impl Orchestrator {
@@ -354,6 +405,7 @@ impl Orchestrator {
     /// live session and `kill`/`resume` can reach them again.
     pub fn new(store: Store, registry: AgentRegistry, data_dir: PathBuf) -> Orchestrator {
         let (bus, _) = broadcast::channel(BUS_CAPACITY);
+        let timeouts = registry.timeouts();
         let orch = Orchestrator {
             sink: EventSink {
                 store: Arc::new(Mutex::new(store)),
@@ -363,6 +415,7 @@ impl Orchestrator {
             registry: Mutex::new(registry),
             sessions: Mutex::new(HashMap::new()),
             data_dir,
+            timeouts,
         };
         orch.sweep_restarted_sessions();
         orch
@@ -575,6 +628,7 @@ impl Orchestrator {
             let store = self.sink.store.lock().unwrap();
             for session_id in session_ids {
                 let _ = store.delete_event_log(session_id); // best-effort
+                let _ = store.delete_stderr_log(session_id); // best-effort
             }
         }
         Ok(true)
@@ -789,9 +843,18 @@ impl Orchestrator {
         // handshake; keep that off the async executor.
         let profile = profile.clone();
         let cwd = worktree.to_path_buf();
-        let conn = tokio::task::spawn_blocking(move || SpawnedConn::spawn(&profile, &cwd))
-            .await
-            .context("spawn task failed")??;
+        let stderr_log = {
+            let store = self.sink.store.lock().unwrap();
+            Some(store.stderr_log_path(session_id))
+        };
+        let options = SpawnOptions {
+            timeouts: self.timeouts,
+            stderr_log,
+        };
+        let conn =
+            tokio::task::spawn_blocking(move || SpawnedConn::spawn(&profile, &cwd, &options))
+                .await
+                .context("spawn task failed")??;
         let conn = Arc::new(conn);
 
         // Grab the replay receiver *before* the handshake so events the
@@ -973,6 +1036,33 @@ impl Orchestrator {
         self.sink
             .transition(session_id, SessionState::Ready, true)?;
         Ok(())
+    }
+
+    /// Answer a parked permission request (`session/permission`). The
+    /// `request_id` came from a `PermissionRequest` event; `decision`
+    /// maps onto the options the agent offered (see
+    /// [`AcpConn::respond_permission`] for the mapping and its errors).
+    ///
+    /// No state transition happens here: the conn emits
+    /// `PermissionResolved` when the parked agent request unwinds, and
+    /// the fan-out moves `WaitingPermission → Prompting` off that event —
+    /// so a response racing a `kill`/`cancel` can't resurrect the
+    /// session. Not async: the conn's resolve is a sync channel send.
+    pub fn respond_permission(
+        &self,
+        session_id: SessionId,
+        request_id: &str,
+        decision: PermissionDecision,
+    ) -> Result<()> {
+        let slot = self.slot(session_id)?;
+        let live = slot
+            .conn
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("session {session_id} has no live connection"))?;
+        live.conn.respond_permission(request_id, decision)
     }
 
     /// Stop a slot's fan-out and close its conn — the shared teardown used
@@ -1160,6 +1250,28 @@ fn spawn_fanout(
                     ev.session_id = session_id;
                     let exited = matches!(ev.kind, EventKind::AgentExited { .. });
                     sink.ingest(&mut ev);
+                    // Permission bookkeeping rides the event stream so
+                    // the WaitingPermission step lands strictly after the
+                    // PermissionRequest it answers. `transition_from`
+                    // (not the generic `transition`) keeps a resolved
+                    // racing a cancel/kill from resurrecting the session.
+                    match &ev.kind {
+                        EventKind::PermissionRequest { .. } => {
+                            let _ = sink.transition_from(
+                                session_id,
+                                SessionState::Prompting,
+                                SessionState::WaitingPermission,
+                            );
+                        }
+                        EventKind::PermissionResolved { .. } => {
+                            let _ = sink.transition_from(
+                                session_id,
+                                SessionState::WaitingPermission,
+                                SessionState::Prompting,
+                            );
+                        }
+                        _ => {}
+                    }
                     if let Some(summary) = collab::summarize_event(&ev.kind) {
                         let _ = collab::append_activity(&worktree_path, &agent_name, &summary);
                     }
@@ -1210,12 +1322,26 @@ fn describe_event(ev: &Event) -> Option<String> {
                     .and_then(|t| t.as_str())
                     .map(|t| format!("message: {t}")),
                 Some(other) => Some(format!("session update: {other}")),
-                None => None,
+                // No `sessionUpdate` key: a pi-native record that
+                // survived translation unnormalized (`agent_settled`,
+                // lifecycle records, raw `tool_execution_*`, …) or a
+                // persisted pre-translation pi event.
+                None => crate::pi_shape::summary(update),
             }
         }
         EventKind::StateChanged { from, to } => Some(format!("state {from:?} → {to:?}")),
         EventKind::AgentExited { code } => Some(format!("agent exited (code {code:?})")),
         EventKind::Orchestrator(note) => Some(note.clone()),
+        EventKind::PermissionRequest { request, .. } => {
+            // Best-effort title dig — the serialized shape is
+            // `{"toolCall": {"title": …, …}, "options": […]}`.
+            let title = request
+                .pointer("/toolCall/title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("tool call");
+            Some(format!("permission requested: {title}"))
+        }
+        EventKind::PermissionResolved { outcome, .. } => Some(format!("permission {outcome}")),
         // summarize_event handled FileEdited above.
         EventKind::FileEdited { .. } => None,
     }
@@ -1241,6 +1367,70 @@ mod tests {
             ts: Utc::now(),
             kind: EventKind::Orchestrator(format!("burst {i}")),
         }
+    }
+
+    fn update_event(session_id: SessionId, value: serde_json::Value) -> Event {
+        Event {
+            session_id,
+            seq: 1,
+            ts: Utc::now(),
+            kind: EventKind::SessionUpdate(value),
+        }
+    }
+
+    /// pi passthrough records must produce non-empty relay lines — a
+    /// `SessionRef` into a pi session is useless if every line drops.
+    /// `pi_shape::summary` does the digging; this pins the contract at
+    /// the relay-rendering seam.
+    #[test]
+    fn describe_event_summarizes_pi_records() {
+        let sid = SessionId::new();
+
+        // A text delta that arrived unnormalized (persisted log).
+        let delta = update_event(
+            sid,
+            serde_json::json!({"type":"message_update","assistantMessageEvent":
+                {"type":"text_delta","contentIndex":0,"delta":"half a reply"}}),
+        );
+        assert_eq!(
+            describe_event(&delta).as_deref(),
+            Some("message: half a reply")
+        );
+
+        // `message_end` carries the complete message — the best relay
+        // line a pi turn offers.
+        let end = update_event(
+            sid,
+            serde_json::json!({"type":"message_end","message":{"role":"assistant",
+                "content":[{"type":"text","text":"full reply"}]}}),
+        );
+        assert_eq!(describe_event(&end).as_deref(), Some("message: full reply"));
+
+        // Tool lifecycle passthrough and settle records summarize too.
+        let tool = update_event(
+            sid,
+            serde_json::json!({"type":"tool_execution_start","toolCallId":"t",
+                "toolName":"edit","args":{"path":"src/x.rs"}}),
+        );
+        assert!(
+            describe_event(&tool).unwrap().contains("src/x.rs"),
+            "tool start should name the path"
+        );
+        let settled = update_event(sid, serde_json::json!({"type": "agent_settled"}));
+        assert_eq!(describe_event(&settled).as_deref(), Some("run settled"));
+
+        // Pure scaffolding stays out of the context block.
+        let noise = update_event(sid, serde_json::json!({"type": "turn_start"}));
+        assert_eq!(describe_event(&noise), None);
+
+        // Normalized pi output takes the ACP path unchanged.
+        let chunk = update_event(
+            sid,
+            serde_json::json!({"sessionUpdate":"agent_message_chunk",
+                "content":{"type":"text","text":"hi"},
+                "pi":{"type":"message_update"}}),
+        );
+        assert_eq!(describe_event(&chunk).as_deref(), Some("message: hi"));
     }
 
     /// Regression: the conn-side event channel is bounded (256 deep); an
