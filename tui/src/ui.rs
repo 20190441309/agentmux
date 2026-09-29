@@ -17,7 +17,7 @@
 //! All color lives in [`crate::theme`] — this file only names roles
 //! (`THEME.accent`, `THEME.faint`, …), never raw `Color`s.
 
-use agentmux_core::{Event, EventKind};
+use agentmux_core::{pi_shape, Event, EventKind};
 use chrono::{DateTime, Utc};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
@@ -501,8 +501,13 @@ fn event_block(ev: &Event) -> EventBlock {
 
 /// `session/update` payloads → blocks: message chunks stay `Msg` for
 /// coalescing; tool calls and friends render as structured cards.
+/// Pi-native passthrough records (`{"type": "<kind>"}`, no
+/// `sessionUpdate`) go to [`pi_event_block`].
 fn session_update_block(ev: &Event, value: &serde_json::Value) -> EventBlock {
     let update = value.get("update").unwrap_or(value);
+    if update.get("sessionUpdate").is_none() && pi_shape::kind(update).is_some() {
+        return pi_event_block(ev, update);
+    }
     let text = || {
         update
             .pointer("/content/text")
@@ -548,6 +553,75 @@ fn session_update_block(ev: &Event, value: &serde_json::Value) -> EventBlock {
             ),
         ])]),
         _ => EventBlock::Static(vec![fallback_update_line(ev, update)]),
+    }
+}
+
+/// A pi-native `{"type": "<kind>", …}` record → its block. The pi
+/// translator normalizes deltas and `tool_execution_*` into ACP shapes
+/// upstream, so what lands here is passthrough: message plumbing and
+/// turn scaffolding render as nothing at all (an empty `Static` — their
+/// content already arrived via deltas), deltas render defensively as
+/// `Msg` (persisted pre-translation logs, manual injection), and
+/// lifecycle/extension records get one quiet `·`-prefixed line via
+/// [`pi_shape::summary`].
+fn pi_event_block(ev: &Event, update: &serde_json::Value) -> EventBlock {
+    // Streaming deltas (defensive — normalized upstream into
+    // agent_*_chunk; this covers records that arrived unnormalized).
+    if let Some((role, text)) = pi_shape::delta(update) {
+        let role = match role {
+            pi_shape::Delta::Message => MsgRole::Agent,
+            pi_shape::Delta::Thought => MsgRole::Thought,
+        };
+        return EventBlock::Msg {
+            role,
+            ts: ev.ts,
+            text: text.to_string(),
+        };
+    }
+
+    match pi_shape::kind(update) {
+        // `error` assistant events deserve a visible line; the other
+        // message_update sub-kinds (text_start/end, toolcall_*, done)
+        // are provider plumbing.
+        Some("message_update") => {
+            let err = update
+                .pointer("/assistantMessageEvent/error")
+                .or_else(|| update.pointer("/assistantMessageEvent/message"))
+                .and_then(|e| e.as_str());
+            if update
+                .pointer("/assistantMessageEvent/type")
+                .and_then(|t| t.as_str())
+                == Some("error")
+            {
+                return EventBlock::Static(vec![Line::from(vec![
+                    ts_span(ev),
+                    Span::styled("⚠ ", THEME.warning),
+                    Span::styled(
+                        format!("stream error: {}", err.unwrap_or("unknown")),
+                        THEME.warning,
+                    ),
+                ])]);
+            }
+            EventBlock::Static(vec![])
+        }
+        // `message_end` restates the text the deltas already streamed —
+        // showing it would double every reply.
+        Some("message_end") | Some("message_start") | Some("turn_start") | Some("turn_end") => {
+            EventBlock::Static(vec![])
+        }
+        // Direct RPC bash output streams as dim body text.
+        Some("bash_execution_update") => match update.get("delta").and_then(|d| d.as_str()) {
+            Some(delta) => EventBlock::Static(body_lines(delta, THEME.dim, true)),
+            None => EventBlock::Static(vec![]),
+        },
+        _ => match pi_shape::summary(update) {
+            Some(text) => EventBlock::Static(vec![Line::from(vec![
+                ts_span(ev),
+                Span::styled("· ", THEME.faint),
+                Span::styled(text, THEME.faint),
+            ])]),
+            None => EventBlock::Static(vec![]),
+        },
     }
 }
 
@@ -1143,10 +1217,12 @@ fn draw_permission(frame: &mut Frame, app: &App) {
     frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
-/// Pull human-readable text out of an opaque ACP `session/update` JSON
-/// blob: known shapes get their `text` payload, everything else falls
-/// back to a compact, truncated dump. (Kept for the compact/relay path
-/// and tests; the rich renderer lives in [`session_update_block`].)
+/// Pull human-readable text out of an opaque `session/update` JSON
+/// blob: known ACP shapes get their `text` payload, pi-native records
+/// (`{"type": "<kind>"}`) get their delta/message/summary text, and
+/// everything else falls back to a compact, truncated dump. (Kept for
+/// the compact/relay path and tests; the rich renderer lives in
+/// [`session_update_block`].)
 fn session_update_text(value: &serde_json::Value) -> String {
     let update = value.get("update").unwrap_or(value);
     let tag = update.get("sessionUpdate").and_then(|t| t.as_str());
@@ -1156,6 +1232,21 @@ fn session_update_text(value: &serde_json::Value) -> String {
         .and_then(|t| t.as_str())
     {
         return text.to_string();
+    }
+    if tag.is_none() {
+        // Pi-native record: dig by `type` instead of dumping JSON.
+        if let Some((_, text)) = pi_shape::delta(update) {
+            return text.to_string();
+        }
+        if let Some(text) = pi_shape::message_text(update) {
+            return text;
+        }
+        if let Some(summary) = pi_shape::summary(update) {
+            return summary;
+        }
+        if let Some(kind) = pi_shape::kind(update) {
+            return format!("[{kind}]");
+        }
     }
     let dump = serde_json::to_string(update).unwrap_or_else(|_| "<?>".to_string());
     let dump = if dump.chars().count() > 160 {
@@ -1474,6 +1565,91 @@ mod tests {
             "update": {"sessionUpdate": "tool_call", "title": "Read"}
         });
         assert!(session_update_text(&wrapped).contains("[tool_call]"));
+    }
+
+    /// Pi-native passthrough records dig meaningful text by `type` —
+    /// never a raw JSON dump.
+    #[test]
+    fn session_update_text_handles_pi_shapes() {
+        // A `message_update` text_delta yields the delta itself.
+        let v = serde_json::json!({"type":"message_update","usage":{},
+            "assistantMessageEvent":{"type":"text_delta","contentIndex":0,
+            "delta":"pi says hi"}});
+        assert_eq!(session_update_text(&v), "pi says hi");
+
+        // `message_end` yields the joined message text.
+        let v = serde_json::json!({"type":"message_end","message":
+            {"role":"assistant","content":[{"type":"text","text":"all of it"}]}});
+        assert_eq!(session_update_text(&v), "all of it");
+
+        // Tool records and lifecycle get summaries/labels.
+        let v = serde_json::json!({"type":"tool_execution_start","toolCallId":"t",
+            "toolName":"edit","args":{"path":"src/x.rs"}});
+        assert_eq!(session_update_text(&v), "tool edit started (src/x.rs)");
+        let v = serde_json::json!({"type": "agent_settled"});
+        assert_eq!(session_update_text(&v), "run settled");
+        // Scaffolding without a summary still gets a tag, not JSON.
+        let v = serde_json::json!({"type": "turn_start"});
+        assert_eq!(session_update_text(&v), "[turn_start]");
+    }
+
+    /// A raw pi `text_delta` (defensive path — the conn normalizes
+    /// these upstream) renders as agent prose, coalescing under one
+    /// header like ACP chunks do.
+    #[test]
+    fn pi_delta_renders_as_agent_prose() {
+        let app = app_with_events(vec![
+            EventKind::SessionUpdate(serde_json::json!({"type":"message_update",
+                "assistantMessageEvent":{"type":"text_delta","delta":"hello "}})),
+            EventKind::SessionUpdate(serde_json::json!({"type":"message_update",
+                "assistantMessageEvent":{"type":"text_delta","delta":"pi"}})),
+        ]);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend());
+        assert!(text.contains("hello pi"), "pi deltas as prose: {text}");
+        assert!(
+            !text.contains("\"type\""),
+            "no raw JSON in the pane: {text}"
+        );
+    }
+
+    /// pi lifecycle/passthrough records render as quiet lines — or not
+    /// at all — but never as truncated JSON walls.
+    #[test]
+    fn pi_lifecycle_renders_quietly_without_json() {
+        let app = app_with_events(vec![
+            EventKind::SessionUpdate(serde_json::json!({"type": "agent_start"})),
+            EventKind::SessionUpdate(serde_json::json!({"type": "turn_start"})),
+            EventKind::SessionUpdate(serde_json::json!({"type": "agent_end",
+                "messages": [], "willRetry": false})),
+            EventKind::SessionUpdate(serde_json::json!({"type": "agent_settled"})),
+        ]);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend());
+        assert!(text.contains("run settled"), "{text}");
+        assert!(text.contains("agent run finished"), "{text}");
+        // Scaffolding is invisible; nothing dumps raw JSON.
+        assert!(!text.contains("turn_start"), "{text}");
+        assert!(!text.contains("\"type\""), "no raw JSON: {text}");
+    }
+
+    /// A `message_update` whose `assistantMessageEvent` is `error`
+    /// renders a warning line rather than vanishing.
+    #[test]
+    fn pi_message_error_renders_warning() {
+        let app = app_with_events(vec![EventKind::SessionUpdate(serde_json::json!({
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "error", "error": "provider exploded"}
+        }))]);
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend());
+        assert!(text.contains("provider exploded"), "{text}");
     }
 
     // --- structured event rendering --------------------------------------

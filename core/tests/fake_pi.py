@@ -29,13 +29,26 @@ Contract exercised by `pi_rpc_test.rs`:
                                 `message_update` records in one go, then
                                 `agent_settled` — exercises the reader
                                 under a >broadcast-capacity event burst
+- prompt containing `tool`    → additionally emits a `tool_execution_`
+                                lifecycle for an `edit` tool on
+                                `src/edited.rs` (start → update → end,
+                                `isError:false`), exercising the
+                                toolCallId → FileEdited translation
+- prompt containing `toolfail`→ same lifecycle but `isError:true` —
+                                failed edits must NOT yield FileEdited
 - prompt containing `hang`    → never responds (request stays pending)
+
+Trigger words match on WHOLE alphanumeric words (like mock-agent's
+`has_trigger`), not substrings — otherwise real prompt text trips them:
+the shared-context preamble's "changed" contains "hang", "tools" would
+match `tool`, etc.
 - `abort`       → ends a `slow` run (`agent_end` + `agent_settled`), then
                   a success response
 """
 
 import json
 import os
+import re
 import sys
 
 sys.stdin.reconfigure(encoding="utf-8")
@@ -83,12 +96,49 @@ def respond(req, command, success=True, data=None, error=None):
     send(rec)
 
 
+def triggered(msg, word):
+    """Whole-word trigger match — same semantics as mock-agent's
+    `has_trigger` (split on non-alphanumerics, compare words)."""
+    return word in re.findall(r"[a-zA-Z0-9]+", msg)
+
+
+def emit_tool_run(fail=False):
+    """Emit one `edit`-tool execution lifecycle, as pi does between a
+    tool call and the assistant's next message. `end` carries no `args`
+    (only the correlating `toolCallId`) — the documented pi shape."""
+    call = "toolcall-1"
+    send({
+        "type": "tool_execution_start",
+        "toolCallId": call,
+        "toolName": "edit",
+        "args": {"path": "src/edited.rs", "oldText": "a", "newText": "b"},
+    })
+    send({
+        "type": "tool_execution_update",
+        "toolCallId": call,
+        "toolName": "edit",
+        "args": {"path": "src/edited.rs"},
+        "partialResult": {"content": [{"type": "text", "text": "edited"}]},
+    })
+    send({
+        "type": "tool_execution_end",
+        "toolCallId": call,
+        "toolName": "edit",
+        "result": {"content": [{"type": "text", "text": "ok"}]},
+        "isError": fail,
+    })
+
+
 def emit_run(message):
     """Emit a complete agent run for `message`, in the documented order."""
     reply = "fake pi reply: " + message
     send({"type": "agent_start"})
     send({"type": "turn_start"})
     send({"type": "message_start", "message": {"role": "assistant", "content": []}})
+    if triggered(message, "toolfail"):
+        emit_tool_run(fail=True)
+    elif triggered(message, "tool"):
+        emit_tool_run()
     send({
         "type": "message_update",
         "usage": {},
@@ -131,25 +181,25 @@ def main():
             respond(req, "abort")
         elif ctype == "prompt":
             msg = req.get("message", "")
-            if "crash" in msg:
+            if triggered(msg, "crash"):
                 os._exit(1)
-            if "exit42" in msg:
+            if triggered(msg, "exit42"):
                 os._exit(42)
-            if "hang" in msg:
+            if triggered(msg, "hang"):
                 continue  # blackhole: no response, the request stays pending
-            if "reject" in msg:
+            if triggered(msg, "reject"):
                 respond(req, "prompt", success=False,
                         error="prompt rejected: agent is streaming")
                 continue
-            if "handled" in msg:
+            if triggered(msg, "handled"):
                 respond(req, "prompt", data={"disposition": "handled"})
                 continue
-            if "slow" in msg:
+            if triggered(msg, "slow"):
                 respond(req, "prompt", data={"disposition": "started"})
                 send({"type": "agent_start"})
                 waiting_abort = True
                 continue
-            if "burst" in msg:
+            if triggered(msg, "burst"):
                 respond(req, "prompt", data={"disposition": "started"})
                 send({"type": "agent_start"})
                 for i in range(BURST_COUNT):

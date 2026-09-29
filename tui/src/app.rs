@@ -483,31 +483,31 @@ impl App {
 
     /// File paths the selected session touched, in first-touch order:
     /// [`EventKind::FileEdited`] paths plus the `locations` of `tool_call`
-    /// session updates. Drives the `Tab` diff/files panel.
+    /// session updates. Drives the `Tab` diff/files panel. Pi
+    /// `tool_execution_*` records contribute their `args` path too —
+    /// normally the conn translator already emits `FileEdited` +
+    /// `tool_call` upstream, so this is the defensive path for records
+    /// that reached the log unnormalized.
     pub fn touched_files(&self) -> Vec<String> {
         let mut seen: Vec<String> = Vec::new();
         for ev in self.session_events() {
             match &ev.kind {
                 EventKind::FileEdited { path } => {
-                    let path = path.display().to_string();
-                    if !seen.contains(&path) {
-                        seen.push(path);
-                    }
+                    note_touched(&mut seen, path.display().to_string());
                 }
                 EventKind::SessionUpdate(v) => {
                     let update = v.get("update").unwrap_or(v);
-                    if update.get("sessionUpdate").and_then(|u| u.as_str()) != Some("tool_call") {
-                        continue;
-                    }
-                    if let Some(locations) = update.get("locations").and_then(|l| l.as_array()) {
-                        for loc in locations {
-                            if let Some(path) = loc.get("path").and_then(|p| p.as_str()) {
-                                let path = path.to_string();
-                                if !seen.contains(&path) {
-                                    seen.push(path);
+                    if update.get("sessionUpdate").and_then(|u| u.as_str()) == Some("tool_call") {
+                        if let Some(locations) = update.get("locations").and_then(|l| l.as_array())
+                        {
+                            for loc in locations {
+                                if let Some(path) = loc.get("path").and_then(|p| p.as_str()) {
+                                    note_touched(&mut seen, path.to_string());
                                 }
                             }
                         }
+                    } else if let Some(path) = agentmux_core::pi_shape::tool_path(update) {
+                        note_touched(&mut seen, path.to_string());
                     }
                 }
                 _ => {}
@@ -569,6 +569,13 @@ impl App {
     }
 }
 
+/// Push `path` onto `seen` on first sight — first-touch order.
+fn note_touched(seen: &mut Vec<String>, path: String) {
+    if !seen.contains(&path) {
+        seen.push(path);
+    }
+}
+
 /// First 8 chars of a session id — enough to tell sessions apart in the
 /// list and in `[@…]` relay markers.
 pub(crate) fn short_id(id: &str) -> &str {
@@ -593,7 +600,12 @@ pub(crate) fn event_summary(ev: &Event) -> String {
                     .map(|t| format!("message: {t}"))
                     .unwrap_or_else(|| "agent message".to_string()),
                 Some(other) => format!("session update: {other}"),
-                None => "session update".to_string(),
+                // A pi-native passthrough record — summarize by `type`.
+                None => agentmux_core::pi_shape::summary(update)
+                    .or_else(|| {
+                        agentmux_core::pi_shape::kind(update).map(|k| format!("pi event: {k}"))
+                    })
+                    .unwrap_or_else(|| "session update".to_string()),
             }
         }
         EventKind::StateChanged { from, to } => format!("state {from:?} → {to:?}"),
@@ -1427,6 +1439,61 @@ mod tests {
                 "src/c.rs".to_string()
             ]
         );
+    }
+
+    /// Pi `tool_execution_*` records carry the target path in `args` —
+    /// a raw record (persisted pre-translation log, defensive path)
+    /// still lands on the files panel.
+    #[test]
+    fn touched_files_collects_pi_tool_paths() {
+        let mut app = app_with_sessions(&[SessionState::Ready]);
+        let sid = app.sessions[0].session.id;
+        app.handle_event(event(
+            sid,
+            EventKind::SessionUpdate(serde_json::json!({
+                "type": "tool_execution_start",
+                "toolCallId": "tc-1",
+                "toolName": "edit",
+                "args": {"path": "src/pi.rs", "oldText": "a", "newText": "b"}
+            })),
+        ));
+        // Normalized pi output contributes its `tool_call` locations too.
+        app.handle_event(event(
+            sid,
+            EventKind::SessionUpdate(serde_json::json!({
+                "sessionUpdate": "tool_call",
+                "title": "edit src/pi.rs",
+                "status": "in_progress",
+                "locations": [{"path": "src/pi.rs"}],
+                "pi": {"type": "tool_execution_start"}
+            })),
+        ));
+        app.handle_event(event(
+            sid,
+            EventKind::FileEdited {
+                path: "src/pi.rs".into(),
+            },
+        ));
+        assert_eq!(app.touched_files(), vec!["src/pi.rs".to_string()]);
+    }
+
+    /// Relay markers summarize pi passthrough records by `type` — a pi
+    /// delta picks its text, lifecycle gets a label, never a JSON wall.
+    #[test]
+    fn event_summary_handles_pi_records() {
+        let sid = SessionId::new();
+        let delta = event(
+            sid,
+            EventKind::SessionUpdate(serde_json::json!({"type":"message_update",
+                "assistantMessageEvent":{"type":"text_delta","delta":"pi reply"}})),
+        );
+        assert_eq!(event_summary(&delta), "message: pi reply");
+
+        let settled = event(
+            sid,
+            EventKind::SessionUpdate(serde_json::json!({"type": "agent_settled"})),
+        );
+        assert_eq!(event_summary(&settled), "run settled");
     }
 
     // --- helpers -----------------------------------------------------------

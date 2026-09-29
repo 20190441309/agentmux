@@ -134,6 +134,59 @@ fn summarize_event_maps_tool_call_updates_when_a_path_is_visible() {
     );
 }
 
+/// pi-native `tool_execution_*` records (raw passthrough or persisted
+/// pre-translation events) summarize too — `edited`/`touched` by tool
+/// name and path, lifecycle/delta records stay out of the log.
+#[test]
+fn summarize_event_maps_pi_tool_records() {
+    let edit = EventKind::SessionUpdate(serde_json::json!({
+        "type": "tool_execution_start",
+        "toolCallId": "tc-1",
+        "toolName": "edit",
+        "args": {"path": "src/edited.rs", "oldText": "a", "newText": "b"},
+    }));
+    assert_eq!(
+        summarize_event(&edit).as_deref(),
+        Some("edited src/edited.rs")
+    );
+
+    let read = EventKind::SessionUpdate(serde_json::json!({
+        "type": "tool_execution_start",
+        "toolCallId": "tc-2",
+        "toolName": "read",
+        "args": {"path": "src/main.rs"},
+    }));
+    assert_eq!(
+        summarize_event(&read).as_deref(),
+        Some("touched src/main.rs")
+    );
+
+    let failed = EventKind::SessionUpdate(serde_json::json!({
+        "type": "tool_execution_end",
+        "toolCallId": "tc-1",
+        "toolName": "edit",
+        "isError": true,
+    }));
+    assert_eq!(
+        summarize_event(&failed).as_deref(),
+        Some("tool edit failed")
+    );
+
+    // Deltas, lifecycle and progress pings produce no activity line.
+    for v in [
+        serde_json::json!({"type":"message_update","assistantMessageEvent":
+            {"type":"text_delta","delta":"hi"}}),
+        serde_json::json!({"type":"agent_settled"}),
+        serde_json::json!({"type":"tool_execution_update","toolCallId":"t","toolName":"edit"}),
+    ] {
+        assert_eq!(
+            summarize_event(&EventKind::SessionUpdate(v)),
+            None,
+            "should not summarize"
+        );
+    }
+}
+
 #[test]
 fn preamble_is_none_for_a_lone_session() {
     let dir = tempfile::tempdir().unwrap();

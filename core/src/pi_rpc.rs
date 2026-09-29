@@ -49,8 +49,17 @@
 //! - `cancel(session_id)` — sends `abort`, which waits for the session to
 //!   go idle before responding.
 //!
-//! Events stream onto the broadcast bus as [`EventKind::SessionUpdate`]
-//! carrying the raw record JSON; process exit produces
+//! Events stream onto the broadcast bus *normalized* by
+//! [`PiTranslator`]: pi records that map cleanly onto the ACP-shaped
+//! `sessionUpdate` vocabulary (`message_update` text deltas →
+//! `agent_message_chunk`, `tool_execution_*` → `tool_call` /
+//! `tool_call_update`, a completed file edit →
+//! [`EventKind::FileEdited`]) arrive as `SessionUpdate`s downstream
+//! consumers already understand, with the original record preserved
+//! under a `"pi"` key. Everything else (`agent_start`, `turn_end`,
+//! `agent_settled`, extension/retry records, …) passes through as a
+//! `SessionUpdate` holding the raw pi JSON — see [`crate::pi_shape`]
+//! for the helpers consumers use to read those. Process exit produces
 //! [`EventKind::AgentExited`]; protocol anomalies (unparseable lines,
 //! unroutable responses) surface as [`EventKind::Orchestrator`].
 //! `Event::seq` is `0` — the orchestrator assigns real sequence numbers.
@@ -171,31 +180,259 @@ fn classify_line(line: &str) -> Classified {
     Classified::Event(value)
 }
 
-/// Translate one raw stdout line into a bus [`Event`], if it carries one.
+/// Stateful pi-record → [`EventKind`] normalizer — the translation half
+/// of this adapter. One instance lives in the stdout `read_loop` so
+/// records that reference earlier ones (`tool_execution_end` carries no
+/// `args`, only the `toolCallId` minted at `start`) resolve correctly.
 ///
-/// - a pi event record (any JSON object that is not a command response) →
-///   `Some(Event)` with [`EventKind::SessionUpdate`] holding the raw JSON
-/// - a command response (`type:"response"`) → `None`: responses are routed
-///   to the pending-command map, never onto the bus
-/// - blank/garbage/non-object lines → `None`
+/// What maps onto the existing ACP-shaped consumer vocabulary:
 ///
-/// The returned event carries a nil `session_id` placeholder — callers
-/// broadcasting it must stamp their connection's real session id first —
-/// and `seq` 0 (the orchestrator assigns real sequence numbers).
+/// - `message_update` + `assistantMessageEvent.type == "text_delta"` →
+///   `SessionUpdate({"sessionUpdate":"agent_message_chunk",
+///   "content":{"type":"text","text":<delta>}})`
+/// - `thinking_delta` → same shape with `agent_thought_chunk`
+/// - `tool_execution_start` → `SessionUpdate({"sessionUpdate":
+///   "tool_call", "toolCallId", "title", "status":"in_progress",
+///   "locations":[{"path"}]?})`
+/// - `tool_execution_update` → `tool_call_update` (`in_progress`)
+/// - `tool_execution_end` → `tool_call_update` (`completed`/`failed`),
+///   plus an [`EventKind::FileEdited`] when the tracked tool is
+///   file-editing (`edit`/`write`/…, see [`pi_shape::tool_edits_file`]),
+///   a path was captured from `args`, and `isError` is not true
 ///
-/// Pure and I/O-free: the framing guarantee is that `line` is already one
-/// complete LF-delimited record — a line containing raw U+2028/U+2029
-/// inside a string payload translates as a single record, unsplit.
-pub fn translate_line(line: &str) -> Option<Event> {
-    match classify_line(line) {
-        Classified::Event(value) => Some(Event {
-            session_id: SessionId(Uuid::nil()),
-            seq: 0,
-            ts: Utc::now(),
-            kind: EventKind::SessionUpdate(value),
-        }),
-        _ => None,
+/// Every normalized update keeps the original pi record under a `"pi"`
+/// key — nothing is lost, but `update.get("update")` envelope-unwraps in
+/// consumers must never see it (hence `"pi"`, not `"update"`).
+///
+/// Everything else passes through untouched as `SessionUpdate(raw)` —
+/// `agent_start`/`turn_*`/`message_*`/`agent_end`/`agent_settled`/
+/// `bash_execution_update`/`queue_update`/retry/compaction/extension
+/// records have no ACP `sessionUpdate` counterpart, and consumers read
+/// them via [`crate::pi_shape`]. `agent_settled` in particular MUST keep
+/// passing through: [`SettledWatch`] detects it on the raw record before
+/// translation, but bus subscribers (and the persisted log) still see
+/// the real record.
+///
+/// Command *responses* never reach here — [`classify_line`] routes them
+/// to the pending map first.
+#[derive(Default)]
+pub struct PiTranslator {
+    /// `toolCallId` → tool info captured at `tool_execution_start`,
+    /// so a path-less `tool_execution_end` can still attribute the
+    /// completed edit. Entries drop on their `end`.
+    tools: HashMap<String, TrackedTool>,
+}
+
+/// A tool call tracked between `tool_execution_start` and `…_end`.
+struct TrackedTool {
+    name: String,
+    path: Option<PathBuf>,
+}
+
+impl PiTranslator {
+    pub fn new() -> Self {
+        Self::default()
     }
+
+    /// Translate one decoded pi *event* object into the [`EventKind`]s it
+    /// represents — usually one; a `tool_execution_end` for a completed
+    /// file edit yields the `tool_call_update` AND a `FileEdited`.
+    pub fn event_kinds(&mut self, value: &Value) -> Vec<EventKind> {
+        use crate::pi_shape as ps;
+        match ps::kind(value) {
+            Some("message_update") => {
+                match ps::delta(value) {
+                    Some((ps::Delta::Message, text)) => vec![EventKind::SessionUpdate(
+                        chunk_update("agent_message_chunk", text, value),
+                    )],
+                    Some((ps::Delta::Thought, text)) => vec![EventKind::SessionUpdate(
+                        chunk_update("agent_thought_chunk", text, value),
+                    )],
+                    // text_start/end, thinking_*_end, toolcall_*, done,
+                    // error — message plumbing; pass through.
+                    None => vec![EventKind::SessionUpdate(value.clone())],
+                }
+            }
+            Some("tool_execution_start") => vec![self.tool_execution_start(value)],
+            Some("tool_execution_update") => {
+                vec![self.tool_execution_update(value)]
+            }
+            Some("tool_execution_end") => self.tool_execution_end(value),
+            _ => vec![EventKind::SessionUpdate(value.clone())],
+        }
+    }
+
+    /// `tool_execution_start` → a `tool_call` update; records the call so
+    /// its `end` can resolve the edited path.
+    fn tool_execution_start(&mut self, value: &Value) -> EventKind {
+        use crate::pi_shape as ps;
+        let name = ps::tool_name(value).unwrap_or("tool").to_string();
+        let path = ps::tool_path(value).map(PathBuf::from);
+        if let Some(id) = ps::tool_call_id(value) {
+            self.tools.insert(
+                id.to_string(),
+                TrackedTool {
+                    name: name.clone(),
+                    path: path.clone(),
+                },
+            );
+        }
+        let title = match &path {
+            Some(p) => format!("{name} {}", p.display()),
+            None => name.clone(),
+        };
+        let mut update = serde_json::json!({
+            "sessionUpdate": "tool_call",
+            "title": title,
+            "status": "in_progress",
+            "pi": value,
+        });
+        if let Some(id) = ps::tool_call_id(value) {
+            update["toolCallId"] = Value::String(id.to_string());
+        }
+        if let Some(p) = &path {
+            update["locations"] = serde_json::json!([{"path": p.display().to_string()}]);
+        }
+        EventKind::SessionUpdate(update)
+    }
+
+    /// `tool_execution_update` → a `tool_call_update`; refreshes the
+    /// tracked path when `args` carries one (progress events keep args).
+    fn tool_execution_update(&mut self, value: &Value) -> EventKind {
+        use crate::pi_shape as ps;
+        if let (Some(id), Some(p)) = (ps::tool_call_id(value), ps::tool_path(value)) {
+            if let Some(t) = self.tools.get_mut(id) {
+                t.path = Some(PathBuf::from(p));
+            }
+        }
+        let mut update = serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "status": "in_progress",
+            "pi": value,
+        });
+        self.fill_tool_fields(&mut update, value);
+        EventKind::SessionUpdate(update)
+    }
+
+    /// `tool_execution_end` → a `tool_call_update` (completed/failed) —
+    /// plus [`EventKind::FileEdited`] when a file-editing tool finished
+    /// successfully on a known path.
+    fn tool_execution_end(&mut self, value: &Value) -> Vec<EventKind> {
+        use crate::pi_shape as ps;
+        let failed = ps::tool_end_failed(value);
+        let call_id = ps::tool_call_id(value).map(str::to_owned);
+        let tracked = call_id.as_ref().and_then(|id| self.tools.remove(id));
+
+        // Path and edit-ness come from the tracked `start` first (end
+        // records carry no `args`), then the record itself — some pi
+        // versions may still ship args on `end`, and a missed `start`
+        // (broadcast lag, log replay) shouldn't lose the edit.
+        let path = tracked
+            .as_ref()
+            .and_then(|t| t.path.clone())
+            .or_else(|| ps::tool_path(value).map(PathBuf::from));
+        let name = tracked
+            .map(|t| t.name)
+            .or_else(|| ps::tool_name(value).map(str::to_owned));
+        let edited =
+            !failed && path.is_some() && name.as_deref().map(ps::tool_edits_file).unwrap_or(false);
+
+        let mut update = serde_json::json!({
+            "sessionUpdate": "tool_call_update",
+            "status": if failed { "failed" } else { "completed" },
+            "pi": value,
+        });
+        if let Some(name) = &name {
+            let title = match &path {
+                Some(p) => format!("{name} {}", p.display()),
+                None => name.clone(),
+            };
+            update["title"] = Value::String(title);
+        }
+        if let Some(id) = &call_id {
+            update["toolCallId"] = Value::String(id.clone());
+        }
+        let mut kinds = vec![EventKind::SessionUpdate(update)];
+        if edited {
+            kinds.push(EventKind::FileEdited {
+                path: path.expect("checked above"),
+            });
+        }
+        kinds
+    }
+
+    /// Copy `toolCallId`/`title`(from `toolName`) onto a normalized
+    /// `tool_call_update`, preferring tracked-start info.
+    fn fill_tool_fields(&self, update: &mut Value, value: &Value) {
+        use crate::pi_shape as ps;
+        let id = ps::tool_call_id(value).map(str::to_owned);
+        let name = id
+            .as_ref()
+            .and_then(|id| self.tools.get(id))
+            .map(|t| t.name.clone())
+            .or_else(|| ps::tool_name(value).map(str::to_owned));
+        if let Some(id) = id {
+            update["toolCallId"] = Value::String(id);
+        }
+        if let Some(name) = name {
+            let path = ps::tool_path(value).map(PathBuf::from);
+            let title = match &path {
+                Some(p) => format!("{name} {}", p.display()),
+                None => name,
+            };
+            update["title"] = Value::String(title);
+        }
+    }
+
+    /// Translate one raw stdout line into bus [`Event`]s:
+    ///
+    /// - a pi event record → [`Self::event_kinds`] output (one or more)
+    /// - a command response (`type:"response"`) → empty: responses are
+    ///   routed to the pending-command map, never onto the bus
+    /// - blank/garbage/non-object lines → empty
+    ///
+    /// The returned events carry a nil `session_id` placeholder —
+    /// callers broadcasting them must stamp their connection's real
+    /// session id first — and `seq` 0 (the orchestrator assigns real
+    /// sequence numbers).
+    ///
+    /// The framing guarantee is that `line` is already one complete
+    /// LF-delimited record — a line containing raw U+2028/U+2029 inside
+    /// a string payload translates as a single record, unsplit.
+    pub fn translate_line(&mut self, line: &str) -> Vec<Event> {
+        match classify_line(line) {
+            Classified::Event(value) => self
+                .event_kinds(&value)
+                .into_iter()
+                .map(|kind| Event {
+                    session_id: SessionId(Uuid::nil()),
+                    seq: 0,
+                    ts: Utc::now(),
+                    kind,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// An `agent_*_chunk` update carrying a pi delta's text, with the source
+/// record preserved under `"pi"`.
+fn chunk_update(kind: &str, delta: &str, raw: &Value) -> Value {
+    serde_json::json!({
+        "sessionUpdate": kind,
+        "content": {"type": "text", "text": delta},
+        "pi": raw,
+    })
+}
+
+/// Translate one raw stdout line into bus [`Event`]s — a stateless
+/// convenience wrapper around [`PiTranslator::translate_line`] for tests
+/// and one-shot digs. Because a fresh translator has no `toolCallId`
+/// history, a lone `tool_execution_end` can only emit `FileEdited` when
+/// the record itself carries `args`.
+pub fn translate_line(line: &str) -> Vec<Event> {
+    PiTranslator::new().translate_line(line)
 }
 
 /// Extract the pi session identifier from a `get_state` `data` object:
@@ -702,13 +939,22 @@ async fn read_loop(
 ) {
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 8192];
+    // One translator per stream: toolCallId correlation spans records.
+    let mut translator = PiTranslator::new();
     loop {
         match stdout.read(&mut chunk).await {
             Ok(0) => break, // EOF
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
                 while let Some(rec) = take_record(&mut buf) {
-                    handle_record(&rec, &pending, &watch, &event_tx, session_id);
+                    handle_record(
+                        &rec,
+                        &pending,
+                        &watch,
+                        &mut translator,
+                        &event_tx,
+                        session_id,
+                    );
                 }
             }
             Err(e) => {
@@ -724,7 +970,14 @@ async fn read_loop(
     // Tolerate a torn tail: try to decode whatever the last partial
     // record left in the buffer before giving up on it.
     if !buf.is_empty() {
-        handle_record(&buf, &pending, &watch, &event_tx, session_id);
+        handle_record(
+            &buf,
+            &pending,
+            &watch,
+            &mut translator,
+            &event_tx,
+            session_id,
+        );
     }
     // The agent is gone: no response will ever arrive for these ids.
     for (_, tx) in pending.lock().unwrap().drain() {
@@ -742,6 +995,7 @@ fn handle_record(
     rec: &[u8],
     pending: &PendingMap,
     watch: &SettledWatch,
+    translator: &mut PiTranslator,
     event_tx: &broadcast::Sender<Event>,
     session_id: SessionId,
 ) {
@@ -793,10 +1047,15 @@ fn handle_record(
             ),
         },
         Classified::Event(value) => {
+            // Settle detection runs on the RAW record, before
+            // translation: `agent_settled` passes through unchanged, but
+            // the signal must not depend on what the translator emits.
             if value.get("type").and_then(|t| t.as_str()) == Some("agent_settled") {
                 watch.note_settled();
             }
-            emit(event_tx, session_id, EventKind::SessionUpdate(value));
+            for kind in translator.event_kinds(&value) {
+                emit(event_tx, session_id, kind);
+            }
         }
         Classified::Junk => {
             // Skip pure whitespace silently; report real garbage.

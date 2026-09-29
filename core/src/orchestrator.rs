@@ -1301,7 +1301,11 @@ fn describe_event(ev: &Event) -> Option<String> {
                     .and_then(|t| t.as_str())
                     .map(|t| format!("message: {t}")),
                 Some(other) => Some(format!("session update: {other}")),
-                None => None,
+                // No `sessionUpdate` key: a pi-native record that
+                // survived translation unnormalized (`agent_settled`,
+                // lifecycle records, raw `tool_execution_*`, …) or a
+                // persisted pre-translation pi event.
+                None => crate::pi_shape::summary(update),
             }
         }
         EventKind::StateChanged { from, to } => Some(format!("state {from:?} → {to:?}")),
@@ -1342,6 +1346,70 @@ mod tests {
             ts: Utc::now(),
             kind: EventKind::Orchestrator(format!("burst {i}")),
         }
+    }
+
+    fn update_event(session_id: SessionId, value: serde_json::Value) -> Event {
+        Event {
+            session_id,
+            seq: 1,
+            ts: Utc::now(),
+            kind: EventKind::SessionUpdate(value),
+        }
+    }
+
+    /// pi passthrough records must produce non-empty relay lines — a
+    /// `SessionRef` into a pi session is useless if every line drops.
+    /// `pi_shape::summary` does the digging; this pins the contract at
+    /// the relay-rendering seam.
+    #[test]
+    fn describe_event_summarizes_pi_records() {
+        let sid = SessionId::new();
+
+        // A text delta that arrived unnormalized (persisted log).
+        let delta = update_event(
+            sid,
+            serde_json::json!({"type":"message_update","assistantMessageEvent":
+                {"type":"text_delta","contentIndex":0,"delta":"half a reply"}}),
+        );
+        assert_eq!(
+            describe_event(&delta).as_deref(),
+            Some("message: half a reply")
+        );
+
+        // `message_end` carries the complete message — the best relay
+        // line a pi turn offers.
+        let end = update_event(
+            sid,
+            serde_json::json!({"type":"message_end","message":{"role":"assistant",
+                "content":[{"type":"text","text":"full reply"}]}}),
+        );
+        assert_eq!(describe_event(&end).as_deref(), Some("message: full reply"));
+
+        // Tool lifecycle passthrough and settle records summarize too.
+        let tool = update_event(
+            sid,
+            serde_json::json!({"type":"tool_execution_start","toolCallId":"t",
+                "toolName":"edit","args":{"path":"src/x.rs"}}),
+        );
+        assert!(
+            describe_event(&tool).unwrap().contains("src/x.rs"),
+            "tool start should name the path"
+        );
+        let settled = update_event(sid, serde_json::json!({"type": "agent_settled"}));
+        assert_eq!(describe_event(&settled).as_deref(), Some("run settled"));
+
+        // Pure scaffolding stays out of the context block.
+        let noise = update_event(sid, serde_json::json!({"type": "turn_start"}));
+        assert_eq!(describe_event(&noise), None);
+
+        // Normalized pi output takes the ACP path unchanged.
+        let chunk = update_event(
+            sid,
+            serde_json::json!({"sessionUpdate":"agent_message_chunk",
+                "content":{"type":"text","text":"hi"},
+                "pi":{"type":"message_update"}}),
+        );
+        assert_eq!(describe_event(&chunk).as_deref(), Some("message: hi"));
     }
 
     /// Regression: the conn-side event channel is bounded (256 deep); an

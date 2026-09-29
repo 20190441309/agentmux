@@ -14,6 +14,7 @@ pub mod id;
 pub mod model;
 pub mod orchestrator;
 pub mod pi_rpc;
+pub mod pi_shape;
 pub mod registry;
 pub mod rpc;
 pub mod store;

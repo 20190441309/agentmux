@@ -101,13 +101,17 @@ pub fn summarize_event(kind: &EventKind) -> Option<String> {
 ///
 /// Accepts both the bare update object (`{"sessionUpdate": "tool_call",
 /// ...}`) and the full notification envelope adapters actually emit
-/// (`{"sessionId": ..., "update": {...}}`).
+/// (`{"sessionId": ..., "update": {...}}`). A pi-native record
+/// (`{"type": "tool_execution_*", ...}`) summarizes too — normally the
+/// pi translator emits `tool_call` + `FileEdited` upstream, so this is
+/// the defensive path for records that arrived unnormalized (e.g. a
+/// persisted pre-translation log).
 fn summarize_session_update(update: &serde_json::Value) -> Option<String> {
     // Unwrap the notification envelope when present; a bare update object
     // has no `"update"` key of its own, so this is unambiguous.
     let update = update.get("update").unwrap_or(update);
     if update.get("sessionUpdate").and_then(|u| u.as_str()) != Some("tool_call") {
-        return None;
+        return summarize_pi_tool_update(update);
     }
 
     let kind = update.get("kind").and_then(|k| k.as_str()).unwrap_or("");
@@ -127,6 +131,28 @@ fn summarize_session_update(update: &serde_json::Value) -> Option<String> {
         (_, Some(p), _) => format!("touched {p}"),
         (_, None, Some(t)) => format!("tool call: {t}"),
         (_, None, None) => "tool call".to_string(),
+    })
+}
+
+/// Summary for a pi-native `tool_execution_*` record, or `None` for
+/// other pi kinds (deltas and lifecycle records aren't activity).
+/// `tool_execution_update` progress pings are skipped — start/end mark
+/// the meaningful moments; an errored `end` reports the failure rather
+/// than claiming the file was edited.
+fn summarize_pi_tool_update(update: &serde_json::Value) -> Option<String> {
+    use crate::pi_shape as ps;
+    if ps::kind(update) == Some("tool_execution_update") {
+        return None; // progress pings aren't activity
+    }
+    let name = ps::tool_name(update)?;
+    let path = ps::tool_path(update);
+    if ps::tool_end_failed(update) {
+        return Some(format!("tool {name} failed"));
+    }
+    Some(match (name, path) {
+        (n, Some(p)) if ps::tool_edits_file(n) => format!("edited {p}"),
+        (_, Some(p)) => format!("touched {p}"),
+        (n, None) => format!("tool call: {n}"),
     })
 }
 

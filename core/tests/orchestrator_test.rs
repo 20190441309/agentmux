@@ -27,7 +27,7 @@ use agentmux_core::collab::append_activity;
 use agentmux_core::orchestrator::Orchestrator;
 use agentmux_core::{
     AdapterKind, AgentId, AgentProfile, AgentRegistry, Config, Event, EventKind, Project,
-    ProjectId, SessionId, SessionState, Store, WorkspaceId,
+    ProjectId, SessionId, SessionRef, SessionState, Store, WorkspaceId,
 };
 use tempfile::TempDir;
 use tokio::sync::broadcast;
@@ -822,6 +822,98 @@ async fn respond_permission_on_pi_session_is_unsupported() {
     assert!(
         err.to_string().contains("do not support permission"),
         "{err}"
+    );
+}
+
+/// A `SessionRef` into a pi session must render real relay context: the
+/// pi session's persisted (normalized + passthrough) events feed
+/// `describe_event`, whose lines land in the referenced block the mock
+/// echoes back. Before pi-shape awareness this produced an empty
+/// "Context from" shell.
+#[tokio::test]
+async fn session_ref_into_pi_session_renders_event_text() {
+    let env = setup_with_pi();
+    let ws = env
+        .orch
+        .create_workspace(env.project_id, "pi-ws", "main")
+        .await
+        .unwrap();
+    let sa = env
+        .orch
+        .create_session(ws, &AgentId::new("pi"), None)
+        .await
+        .expect("pi session should start");
+    let sb = env
+        .orch
+        .create_session(ws, &AgentId::new("mock"), None)
+        .await
+        .expect("mock session should start");
+
+    // Run the pi turn so its log has content worth relaying.
+    prompt(&env.orch, sa, "relay me")
+        .await
+        .expect("pi prompt should settle");
+
+    // The fan-out persists asynchronously; wait until the turn's
+    // `agent_settled` is in the log before referencing it.
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    loop {
+        let log = env.orch.read_events(sa).unwrap();
+        if log.iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::SessionUpdate(v) if v["type"] == "agent_settled"
+            )
+        }) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "pi events never persisted");
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    // Prompt the mock session with a reference into the pi session; the
+    // mock echoes the whole composed prompt back as a chunk.
+    let mut rx = env.orch.subscribe();
+    env.orch
+        .prompt(
+            sb,
+            "absorb this".to_string(),
+            vec![SessionRef {
+                session_id: sa,
+                event_seq: 0,
+            }],
+        )
+        .await
+        .expect("relay prompt should complete");
+
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |e| {
+        chunk_text(e, sb).is_some_and(|t| t.contains("Context from session"))
+    })
+    .await;
+    let text = events
+        .iter()
+        .find_map(|e| chunk_text(e, sb))
+        .expect("expected the echoed prompt for session B");
+
+    assert!(
+        text.contains(&format!("Context from session {sa}")),
+        "the ref block header should name the pi session, got: {text}"
+    );
+    // The pi turn's text (normalized `agent_message_chunk` on the wire,
+    // plus the passthrough `message_end`) renders as `message:` lines.
+    // The delta itself echoes sa's composed prompt, which includes the
+    // shared-context preamble — so match the prefix, not the tail.
+    assert!(
+        text.contains("- message: fake pi reply:"),
+        "the pi delta text must render in the relay block, got: {text}"
+    );
+    assert!(
+        text.contains("- run settled"),
+        "the passthrough agent_settled should summarize, got: {text}"
+    );
+    assert!(
+        !text.contains("{\"type\""),
+        "no raw pi JSON should leak into the block, got: {text}"
     );
 }
 
