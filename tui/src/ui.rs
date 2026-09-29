@@ -568,7 +568,12 @@ fn tool_call_lines(ev: &Event, update: &serde_json::Value) -> Vec<Line<'static>>
         .get("title")
         .and_then(|t| t.as_str())
         .filter(|t| !t.is_empty())
-        .or_else(|| update.get("kind").and_then(|k| k.as_str()))
+        .or_else(|| {
+            update
+                .get("kind")
+                .and_then(|k| k.as_str())
+                .filter(|k| !k.is_empty())
+        })
         .or_else(|| {
             update
                 .get("toolCallId")
@@ -720,16 +725,27 @@ fn body_lines(text: &str, style: Style, tail: bool) -> Vec<Line<'static>> {
     if looks_like_diff(text) {
         return patch_lines(text, tail);
     }
-    let mut lines: Vec<Line> = text
-        .lines()
-        .take(MAX_BLOCK_LINES + 1)
-        .map(|l| {
-            Line::from(vec![
-                Span::raw(BODY_INDENT),
-                Span::styled(l.to_string(), style),
-            ])
-        })
-        .collect();
+    let mk = |l: &str| {
+        Line::from(vec![
+            Span::raw(BODY_INDENT),
+            Span::styled(l.to_string(), style),
+        ])
+    };
+    // Early bound either way: tail keeps the LAST `MAX + 1` source
+    // lines (scan the end of the text, not the start), head keeps the
+    // first — neither materialises a full paste.
+    let mut lines: Vec<Line> = if tail {
+        let mut v: Vec<Line> = text
+            .lines()
+            .rev()
+            .take(MAX_BLOCK_LINES + 1)
+            .map(mk)
+            .collect();
+        v.reverse();
+        v
+    } else {
+        text.lines().take(MAX_BLOCK_LINES + 1).map(mk).collect()
+    };
     if lines.is_empty() && !text.is_empty() {
         lines.push(Line::from(Span::styled(text.to_string(), style)));
     }
@@ -759,8 +775,16 @@ fn looks_like_diff(text: &str) -> bool {
 /// Render a unified-diff-ish text block: `+` lines green, `-` lines red,
 /// `@@`/`diff`/`index`/`---`/`+++` headers accent/faint, context dim.
 fn patch_lines(text: &str, tail: bool) -> Vec<Line<'static>> {
+    // Same bound as `body_lines`: tail semantics scan the LAST lines.
+    let source: Vec<&str> = if tail {
+        let mut v: Vec<&str> = text.lines().rev().take(MAX_BLOCK_LINES + 1).collect();
+        v.reverse();
+        v
+    } else {
+        text.lines().take(MAX_BLOCK_LINES + 1).collect()
+    };
     let mut lines = Vec::new();
-    for l in text.lines().take(MAX_BLOCK_LINES + 1) {
+    for l in source {
         let style = if l.starts_with("+++") || l.starts_with("---") {
             THEME.faint
         } else if l.starts_with('+') {
@@ -1807,14 +1831,19 @@ mod tests {
             })
             .collect();
         let app = app_with_events(kinds);
-        // 80x30 → events pane body occupies rows 0..26; its inner rows
-        // are 1..25 — row 24 is the last line before the bottom border.
         let backend = TestBackend::new(80, 30);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let buf = terminal.backend().buffer();
         let w = buf.area.width as usize;
-        let last_inner: String = buf.content[24 * w..25 * w]
+        let h = buf.area.height as usize;
+        // Events-pane geometry, derived not hardcoded: the pane spans
+        // x = LIST_WIDTH..w, so its inner columns are LIST_WIDTH+1..w-1;
+        // the body strip is rows 0..h-4 (status+input take the last 4),
+        // so the pane's inner rows are 1..=h-6 and h-6 is the last.
+        let last_inner_y = h - 4 - 2;
+        let x0 = LIST_WIDTH as usize + 1;
+        let last_inner: String = buf.content[last_inner_y * w + x0..last_inner_y * w + (w - 1)]
             .iter()
             .map(|c| c.symbol())
             .collect();
