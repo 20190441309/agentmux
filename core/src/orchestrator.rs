@@ -47,6 +47,7 @@ use tokio::sync::{broadcast, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
 use crate::collab;
+use crate::config::{ConnTimeouts, SpawnOptions};
 use crate::id::{AgentId, ProjectId, SessionId, WorkspaceId};
 use crate::model::{
     AdapterKind, AgentProfile, Event, EventKind, PermissionDecision, Project, Session, SessionRef,
@@ -77,13 +78,18 @@ pub enum SpawnedConn {
 
 impl SpawnedConn {
     /// Spawn the adapter process described by `profile`, working in `cwd`.
-    pub fn spawn(profile: &AgentProfile, cwd: &Path) -> Result<SpawnedConn> {
+    /// `options` carries the config-derived connection timeouts.
+    pub fn spawn(
+        profile: &AgentProfile,
+        cwd: &Path,
+        options: &SpawnOptions,
+    ) -> Result<SpawnedConn> {
         match &profile.adapter {
             AdapterKind::Acp { command, args } => {
-                AcpConn::spawn(command, args, &profile.env, cwd).map(SpawnedConn::Acp)
+                AcpConn::spawn(command, args, &profile.env, cwd, options).map(SpawnedConn::Acp)
             }
             AdapterKind::PiRpc { command, args } => {
-                PiConn::spawn(command, args, &profile.env, cwd).map(SpawnedConn::Pi)
+                PiConn::spawn(command, args, &profile.env, cwd, options).map(SpawnedConn::Pi)
             }
         }
     }
@@ -383,6 +389,9 @@ pub struct Orchestrator {
     registry: Mutex<AgentRegistry>,
     sessions: Mutex<HashMap<SessionId, Arc<SessionSlot>>>,
     data_dir: PathBuf,
+    /// Connection timeouts handed to every spawned conn — captured from
+    /// the registry's [`crate::config::Config`] at construction.
+    timeouts: ConnTimeouts,
 }
 
 impl Orchestrator {
@@ -396,6 +405,7 @@ impl Orchestrator {
     /// live session and `kill`/`resume` can reach them again.
     pub fn new(store: Store, registry: AgentRegistry, data_dir: PathBuf) -> Orchestrator {
         let (bus, _) = broadcast::channel(BUS_CAPACITY);
+        let timeouts = registry.timeouts();
         let orch = Orchestrator {
             sink: EventSink {
                 store: Arc::new(Mutex::new(store)),
@@ -405,6 +415,7 @@ impl Orchestrator {
             registry: Mutex::new(registry),
             sessions: Mutex::new(HashMap::new()),
             data_dir,
+            timeouts,
         };
         orch.sweep_restarted_sessions();
         orch
@@ -831,9 +842,14 @@ impl Orchestrator {
         // handshake; keep that off the async executor.
         let profile = profile.clone();
         let cwd = worktree.to_path_buf();
-        let conn = tokio::task::spawn_blocking(move || SpawnedConn::spawn(&profile, &cwd))
-            .await
-            .context("spawn task failed")??;
+        let options = SpawnOptions {
+            timeouts: self.timeouts,
+            stderr_log: None,
+        };
+        let conn =
+            tokio::task::spawn_blocking(move || SpawnedConn::spawn(&profile, &cwd, &options))
+                .await
+                .context("spawn task failed")??;
         let conn = Arc::new(conn);
 
         // Grab the replay receiver *before* the handshake so events the

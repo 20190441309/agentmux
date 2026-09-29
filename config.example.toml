@@ -3,8 +3,22 @@
 # Location: ~/.config/agentmux/config.toml
 # Override with `agentmux-server --config PATH` or $AGENTMUX_CONFIG.
 #
-# Only the [[agents]] tables are read; every other key is ignored, so newer
-# fields can appear in the file without breaking older binaries.
+# The [[agents]] tables plus the timeout keys below are read; every other
+# key is ignored, so newer fields can appear in the file without breaking
+# older binaries.
+
+# ---------------------------------------------------------------------------
+# Connection timeouts (seconds), applied to every spawned agent.
+#
+# init_timeout_secs   — bound on the initialize/get_state handshake
+#                       (default: 10)
+# prompt_timeout_secs — bound on one prompt turn (default: 600).
+#                       0 = wait forever (the pre-v1.1 behavior). A timed-out
+#                       turn ends on the caller's side and moves the session
+#                       to Error; `session/cancel` can still unwedge it.
+
+# init_timeout_secs = 10
+# prompt_timeout_secs = 600
 
 # ---------------------------------------------------------------------------
 # Built-in agents (always present — no config needed)

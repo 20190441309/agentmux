@@ -28,7 +28,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use agentmux_core::pi_rpc::{translate_line, PiTranslator};
-use agentmux_core::{Event, EventKind, PiConn};
+use agentmux_core::{ConnTimeouts, Event, EventKind, PiConn, SpawnOptions};
 
 /// Generous deadline for event collection; the stub replies instantly, so
 /// this only bites on regression.
@@ -46,12 +46,18 @@ fn fake_pi_args() -> Vec<String> {
 
 /// Spawn a connection to the fake pi stub; the tempdir is the child's cwd.
 fn spawn_fake() -> (PiConn, tempfile::TempDir) {
+    spawn_fake_opts(&SpawnOptions::default())
+}
+
+/// [`spawn_fake`] with explicit spawn options (timeouts, stderr log).
+fn spawn_fake_opts(opts: &SpawnOptions) -> (PiConn, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let conn = PiConn::spawn(
         Path::new("python3"),
         &fake_pi_args(),
         &BTreeMap::new(),
         dir.path(),
+        opts,
     )
     .expect("fake pi should spawn");
     (conn, dir)
@@ -331,6 +337,7 @@ fn spawn_fails_for_missing_command() {
         &[],
         &BTreeMap::new(),
         dir.path(),
+        &SpawnOptions::default(),
     );
     assert!(result.is_err());
 }
@@ -723,6 +730,7 @@ async fn initialize_times_out_when_agent_never_responds() {
         &["60".to_string()],
         &BTreeMap::new(),
         dir.path(),
+        &SpawnOptions::default(),
     )
     .unwrap();
 
@@ -741,8 +749,14 @@ async fn initialize_times_out_when_agent_never_responds() {
 async fn events_survive_without_consumers_and_shutdown_is_clean() {
     let dir = tempfile::tempdir().unwrap();
     let args = vec!["-c".to_string(), "sleep 0.05".to_string()];
-    let mut conn =
-        PiConn::spawn(Path::new("/bin/sh"), &args, &BTreeMap::new(), dir.path()).unwrap();
+    let mut conn = PiConn::spawn(
+        Path::new("/bin/sh"),
+        &args,
+        &BTreeMap::new(),
+        dir.path(),
+        &SpawnOptions::default(),
+    )
+    .unwrap();
 
     // Let the child exit before anyone subscribes; broadcast must not
     // deadlock the connection.
@@ -753,5 +767,89 @@ async fn events_survive_without_consumers_and_shutdown_is_clean() {
 
     conn.shutdown().await.unwrap();
     // Second shutdown is a no-op, not an error.
+    conn.shutdown().await.unwrap();
+}
+
+/// The configured `prompt` bound: `hang` leaves the request pending on
+/// the worker forever; under the paused clock the 30 s virtual deadline
+/// fires the instant the caller parks on the reply (external replies
+/// always lose to auto-advance — this pins the timeout path itself).
+/// An `Orchestrator` "timed out" note lands on the bus, and `cancel`
+/// (its own code path, no timeout) still resolves.
+#[tokio::test(start_paused = true)]
+async fn prompt_times_out_on_the_configured_bound_virtual() {
+    let opts = SpawnOptions {
+        timeouts: ConnTimeouts {
+            init: Duration::from_secs(10),
+            prompt: Duration::from_secs(30),
+        },
+        ..SpawnOptions::default()
+    };
+    let (mut conn, _dir) = spawn_fake_opts(&opts);
+    let mut rx = conn.events();
+
+    let err = conn
+        .prompt("pi-session-1", "hang".to_string())
+        .await
+        .expect_err("a wedged turn must error at the prompt bound");
+    assert!(
+        err.to_string().contains("timed out"),
+        "expected a timeout error, got: {err}"
+    );
+
+    let mut notes = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        notes.push(ev);
+    }
+    assert!(
+        notes.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::Orchestrator(m) if m.contains("timed out")
+        )),
+        "expected a 'timed out' Orchestrator note, got {notes:?}"
+    );
+
+    conn.cancel("pi-session-1")
+        .await
+        .expect("cancel must resolve immediately");
+    conn.shutdown().await.unwrap();
+}
+
+/// Real-clock counterpart: `prompt_timeout = 1s` frees the caller from
+/// the stub's `hang` (~1 s, not forever), and a healthy turn under the
+/// same conn resolves well inside the bound.
+#[tokio::test]
+async fn prompt_timeout_frees_the_caller_and_cancel_still_works() {
+    let opts = SpawnOptions {
+        timeouts: ConnTimeouts {
+            init: Duration::from_secs(10),
+            prompt: Duration::from_secs(1),
+        },
+        ..SpawnOptions::default()
+    };
+    let (mut conn, dir) = spawn_fake_opts(&opts);
+    conn.initialize().await.unwrap();
+    let session_id = conn.new_session(dir.path()).await.unwrap();
+
+    // Healthy turn first: the bound must not bite a fast agent.
+    conn.prompt(&session_id, "healthy".to_string())
+        .await
+        .expect("a healthy prompt resolves inside the bound");
+
+    let start = std::time::Instant::now();
+    let err = conn
+        .prompt(&session_id, "hang".to_string())
+        .await
+        .expect_err("a wedged turn must fail at the prompt bound");
+    let elapsed = start.elapsed();
+    assert!(err.to_string().contains("timed out"), "{err}");
+    assert!(
+        elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(5),
+        "bound should fire near 1s, took {elapsed:?}"
+    );
+
+    conn.cancel(&session_id)
+        .await
+        .expect("abort should resolve");
     conn.shutdown().await.unwrap();
 }

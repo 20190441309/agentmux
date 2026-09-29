@@ -41,11 +41,8 @@ use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
+use crate::config::SpawnOptions;
 use crate::{Event, EventKind, PermissionDecision, Result, SessionId};
-
-/// Timeout for the ACP `initialize` handshake.
-// TODO(config): allow overriding this via `Config` in a later task.
-const INIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a parked `session/request_permission` waits for a
 /// `session/permission` answer before resolving itself `cancelled`. A UI
@@ -226,6 +223,9 @@ pub struct AcpConn {
     pending: PendingPermissions,
     /// Worker thread driving the `!Send` ACP machinery.
     thread: Option<JoinHandle<()>>,
+    /// Connection timeouts from config (`ConnTimeouts`, resolved through
+    /// the registry into [`SpawnOptions`] at spawn).
+    timeouts: crate::config::ConnTimeouts,
 }
 
 impl AcpConn {
@@ -234,13 +234,15 @@ impl AcpConn {
     ///
     /// `env` is layered on top of the inherited environment; `cwd` becomes the
     /// child's working directory and the default root for `fs/*` requests.
-    /// A background thread takes over io immediately; call
-    /// [`AcpConn::initialize`] to perform the ACP handshake.
+    /// `options` carries the config-derived timeouts (see
+    /// [`crate::config::ConnTimeouts`]). A background thread takes over io
+    /// immediately; call [`AcpConn::initialize`] to perform the ACP handshake.
     pub fn spawn(
         command: &Path,
         args: &[String],
         env: &BTreeMap<String, String>,
         cwd: &Path,
+        options: &SpawnOptions,
     ) -> Result<AcpConn> {
         let session_id = SessionId::new();
         let (event_tx, first_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
@@ -284,6 +286,7 @@ impl AcpConn {
             cmd_tx: Mutex::new(Some(cmd_tx)),
             pending,
             thread: Some(thread),
+            timeouts: options.timeouts,
         })
     }
 
@@ -293,7 +296,8 @@ impl AcpConn {
     }
 
     /// Perform the ACP `initialize` handshake, advertising fs read/write and
-    /// terminal client capabilities. Times out after [`INIT_TIMEOUT`].
+    /// terminal client capabilities. Times out after the configured
+    /// `init` bound ([`crate::config::ConnTimeouts::init`], default 10 s).
     ///
     /// Resolves to the serialized `InitializeResponse` so callers can inspect
     /// agent capabilities without depending on the ACP crate's types.
@@ -304,24 +308,28 @@ impl AcpConn {
     pub async fn initialize(&self) -> Result<serde_json::Value> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::Initialize(tx))?;
-        tokio::time::timeout(INIT_TIMEOUT, rx)
-            .await
-            .map_err(|_| anyhow!("acp initialize timed out after {INIT_TIMEOUT:?}"))?
-            .map_err(|_| anyhow!("acp connection closed before initialize completed"))?
+        self.await_reply(rx, self.timeouts.init, "initialize").await
     }
 
     /// Create a new ACP session rooted at `cwd`; returns the acp session id.
+    /// Unbounded: session/new cost is agent-defined (v1 keeps the
+    /// pre-existing behavior rather than inventing a bound).
     pub async fn new_session(&self, cwd: &Path) -> Result<String> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::NewSession {
             cwd: cwd.to_path_buf(),
             reply: tx,
         })?;
-        rx.await
-            .map_err(|_| anyhow!("acp connection closed before session/new completed"))?
+        self.await_reply(rx, Duration::ZERO, "session/new").await
     }
 
     /// Send a user prompt; resolves when the agent finishes its turn.
+    /// Times out after the configured `prompt` bound
+    /// ([`crate::config::ConnTimeouts::prompt`], default 600 s; `0`
+    /// disables) — the timeout fires on the caller's side; the wedged
+    /// worker-side request is abandoned in place and dies with the conn.
+    /// An [`EventKind::Orchestrator`] "timed out" note is emitted so the
+    /// orchestrator's fan-out persists it into the session log.
     pub async fn prompt(&self, session_id: &str, text: String) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::Prompt {
@@ -329,8 +337,38 @@ impl AcpConn {
             text,
             reply: tx,
         })?;
-        rx.await
-            .map_err(|_| anyhow!("acp connection closed before session/prompt completed"))?
+        self.await_reply(rx, self.timeouts.prompt, "session/prompt")
+            .await
+    }
+
+    /// Await a command reply, bounding the wait to `bound`
+    /// ([`Duration::ZERO`] = wait forever). A timeout emits an
+    /// `Orchestrator` note and resolves to a `timed out` error; the
+    /// worker-side request keeps running (the reply oneshot is simply
+    /// dropped) so machinery that *un*wedges it — `cancel`, `close` —
+    /// is never blocked by the timeout.
+    async fn await_reply<T>(
+        &self,
+        rx: oneshot::Receiver<Result<T>>,
+        bound: Duration,
+        what: &'static str,
+    ) -> Result<T> {
+        let outcome = if bound.is_zero() {
+            rx.await
+        } else {
+            match tokio::time::timeout(bound, rx).await {
+                Err(_) => {
+                    emit(
+                        &self.event_tx,
+                        self.session_id,
+                        EventKind::Orchestrator(format!("acp {what} timed out after {bound:?}")),
+                    );
+                    return Err(anyhow!("acp {what} timed out after {bound:?}"));
+                }
+                Ok(outcome) => outcome,
+            }
+        };
+        outcome.map_err(|_| anyhow!("acp connection closed before {what} completed"))?
     }
 
     /// Send `session/cancel` for an in-flight prompt turn.

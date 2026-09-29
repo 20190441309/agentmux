@@ -134,6 +134,7 @@ async fn start_daemon() -> TestDaemon {
     let store = Store::open(data.path()).unwrap();
     let cfg = Config {
         agents: vec![mock_profile()],
+        ..Config::default()
     };
     let orch = Orchestrator::new(
         store,

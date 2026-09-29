@@ -22,7 +22,7 @@ pub mod worktree;
 
 pub use acp_conn::AcpConn;
 pub use anyhow::Result;
-pub use config::Config;
+pub use config::{Config, ConnTimeouts, SpawnOptions};
 pub use id::{AgentId, ProjectId, SessionId, WorkspaceId};
 pub use model::{
     AdapterKind, AgentProfile, Event, EventKind, PermissionDecision, Project, Session, SessionRef,

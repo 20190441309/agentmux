@@ -7,8 +7,9 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
-use agentmux_core::{AdapterKind, AgentId, AgentProfile, AgentRegistry, Config};
+use agentmux_core::{AdapterKind, AgentId, AgentProfile, AgentRegistry, Config, ConnTimeouts};
 use tempfile::TempDir;
 
 /// Write `contents` to `<dir>/config.toml` and return its path.
@@ -299,6 +300,7 @@ fn from_config_collapses_duplicate_ids_last_wins() {
             mk("solo", "/solo"),
             mk("dup", "/second"),
         ],
+        ..Config::default()
     };
 
     let registry = AgentRegistry::from_config(&cfg);
@@ -315,4 +317,49 @@ fn from_config_collapses_duplicate_ids_last_wins() {
             args: vec![]
         }
     );
+}
+
+/// The `*_timeout_secs` top-level keys feed `Config::timeouts`: unset
+/// keys fall back to the built-in defaults (the point is "not forever"),
+/// set keys parse as whole seconds, and `prompt_timeout_secs = 0` is the
+/// documented "wait forever" escape hatch.
+#[test]
+fn timeout_keys_parse_and_default() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Defaults: missing file and a file without the keys agree.
+    let defaults = Config::load(&dir.path().join("missing.toml")).unwrap();
+    assert_eq!(defaults.timeouts, ConnTimeouts::default());
+    let path = write_config(&dir, "theme = \"dark\"\n");
+    assert_eq!(
+        Config::load(&path).unwrap().timeouts,
+        ConnTimeouts::default()
+    );
+    assert_eq!(defaults.timeouts.init, Duration::from_secs(10));
+    assert_eq!(defaults.timeouts.prompt, Duration::from_secs(600));
+
+    // Both keys parse and survive the registry handoff.
+    let path = write_config(&dir, "init_timeout_secs = 3\nprompt_timeout_secs = 42\n");
+    let cfg = Config::load(&path).unwrap();
+    assert_eq!(cfg.timeouts.init, Duration::from_secs(3));
+    assert_eq!(cfg.timeouts.prompt, Duration::from_secs(42));
+    let registry = AgentRegistry::from_config(&cfg);
+    assert_eq!(registry.timeouts(), cfg.timeouts);
+
+    // `0` disables the prompt timeout (documented escape hatch).
+    let path = write_config(&dir, "prompt_timeout_secs = 0\n");
+    let cfg = Config::load(&path).unwrap();
+    assert_eq!(cfg.timeouts.prompt, Duration::ZERO);
+    assert_eq!(
+        cfg.timeouts.init,
+        ConnTimeouts::default().init,
+        "an unset key keeps its default"
+    );
+
+    // A registry built from a hand-constructed Config still defaults.
+    let hand = Config {
+        agents: vec![],
+        ..Config::default()
+    };
+    assert_eq!(hand.timeouts, ConnTimeouts::default());
 }

@@ -94,10 +94,8 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::config::{ConnTimeouts, SpawnOptions};
 use crate::{Event, EventKind, Result, SessionId};
-
-/// Timeout for the `get_state` handshake performed by [`PiConn::initialize`].
-const INIT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Capacity of the per-connection event broadcast channel.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -541,6 +539,9 @@ pub struct PiConn {
     cmd_tx: Mutex<Option<mpsc::UnboundedSender<Cmd>>>,
     /// Worker thread driving the child process io.
     thread: Option<JoinHandle<()>>,
+    /// Connection timeouts from config ([`ConnTimeouts`], resolved
+    /// through the registry into [`SpawnOptions`] at spawn).
+    timeouts: ConnTimeouts,
 }
 
 impl PiConn {
@@ -549,13 +550,15 @@ impl PiConn {
     /// `"--mode", "rpc"` (supplied by the `AdapterKind::PiRpc` profile).
     ///
     /// `env` is layered on top of the inherited environment; `cwd` becomes
-    /// the child's working directory. A background thread takes over io
+    /// the child's working directory. `options` carries the config-derived
+    /// timeouts (see [`ConnTimeouts`]). A background thread takes over io
     /// immediately; call [`PiConn::initialize`] to probe the protocol.
     pub fn spawn(
         command: &Path,
         args: &[String],
         env: &BTreeMap<String, String>,
         cwd: &Path,
+        options: &SpawnOptions,
     ) -> Result<PiConn> {
         let session_id = SessionId::new();
         let (event_tx, first_rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
@@ -589,6 +592,7 @@ impl PiConn {
             session_id,
             cmd_tx: Mutex::new(Some(cmd_tx)),
             thread: Some(thread),
+            timeouts: options.timeouts,
         })
     }
 
@@ -599,7 +603,8 @@ impl PiConn {
 
     /// Handshake: pi RPC mode has no initialize phase, so this issues
     /// `get_state` — proving the subprocess speaks the protocol and
-    /// yielding the initial session state. Times out after 10s.
+    /// yielding the initial session state. Times out after the
+    /// configured `init` bound ([`ConnTimeouts::init`], default 10 s).
     ///
     /// Resolves to the response's `data` (an `RpcSessionState` object).
     ///
@@ -609,24 +614,21 @@ impl PiConn {
     pub async fn initialize(&self) -> Result<Value> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::Initialize(tx))?;
-        tokio::time::timeout(INIT_TIMEOUT, rx)
-            .await
-            .map_err(|_| anyhow!("pi initialize timed out after {INIT_TIMEOUT:?}"))?
-            .map_err(|_| anyhow!("pi connection closed before initialize completed"))?
+        self.await_reply(rx, self.timeouts.init, "initialize").await
     }
 
     /// Start a fresh pi session: sends `new_session`, then `get_state`,
     /// resolving to the pi session id (`data.sessionId`). `cwd` is
     /// accepted for signature parity with `AcpConn` but unused — pi's
     /// working directory is fixed at spawn.
+    /// Unbounded, matching `AcpConn::new_session`.
     pub async fn new_session(&self, cwd: &Path) -> Result<String> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::NewSession {
             cwd: cwd.to_path_buf(),
             reply: tx,
         })?;
-        rx.await
-            .map_err(|_| anyhow!("pi connection closed before new_session completed"))?
+        self.await_reply(rx, Duration::ZERO, "new_session").await
     }
 
     /// Send a user prompt; resolves when the agent settles (the
@@ -641,6 +643,13 @@ impl PiConn {
     /// session. A stray `agent_settled` emitted between this call and
     /// the run's start — e.g. a concurrent `abort` — can resolve the
     /// wait early; pi events carry no run id to disambiguate.
+    ///
+    /// Times out after the configured `prompt` bound
+    /// ([`ConnTimeouts::prompt`], default 600 s; `0` disables) — the
+    /// timeout fires on the caller's side; the wedged worker-side wait
+    /// is abandoned in place and dies with the conn. An
+    /// [`EventKind::Orchestrator`] "timed out" note is emitted so the
+    /// orchestrator's fan-out persists it into the session log.
     pub async fn prompt(&self, session_id: &str, text: String) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::Prompt {
@@ -648,8 +657,36 @@ impl PiConn {
             text,
             reply: tx,
         })?;
-        rx.await
-            .map_err(|_| anyhow!("pi connection closed before prompt completed"))?
+        self.await_reply(rx, self.timeouts.prompt, "prompt").await
+    }
+
+    /// Await a command reply, bounding the wait to `bound`
+    /// ([`Duration::ZERO`] = wait forever). A timeout emits an
+    /// `Orchestrator` note and resolves to a `timed out` error; the
+    /// worker-side request keeps running (the reply oneshot is simply
+    /// dropped) so `cancel`/`close` are never blocked by the timeout.
+    async fn await_reply<T>(
+        &self,
+        rx: oneshot::Receiver<Result<T>>,
+        bound: Duration,
+        what: &'static str,
+    ) -> Result<T> {
+        let outcome = if bound.is_zero() {
+            rx.await
+        } else {
+            match tokio::time::timeout(bound, rx).await {
+                Err(_) => {
+                    emit(
+                        &self.event_tx,
+                        self.session_id,
+                        EventKind::Orchestrator(format!("pi {what} timed out after {bound:?}")),
+                    );
+                    return Err(anyhow!("pi {what} timed out after {bound:?}"));
+                }
+                Ok(outcome) => outcome,
+            }
+        };
+        outcome.map_err(|_| anyhow!("pi connection closed before {what} completed"))?
     }
 
     /// Send `abort` for an in-flight run; pi waits for the session to go

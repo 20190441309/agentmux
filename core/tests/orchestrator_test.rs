@@ -26,8 +26,8 @@ use std::time::{Duration, Instant};
 use agentmux_core::collab::append_activity;
 use agentmux_core::orchestrator::Orchestrator;
 use agentmux_core::{
-    AdapterKind, AgentId, AgentProfile, AgentRegistry, Config, Event, EventKind, Project,
-    ProjectId, SessionId, SessionRef, SessionState, Store, WorkspaceId,
+    AdapterKind, AgentId, AgentProfile, AgentRegistry, Config, ConnTimeouts, Event, EventKind,
+    Project, ProjectId, SessionId, SessionRef, SessionState, Store, WorkspaceId,
 };
 use tempfile::TempDir;
 use tokio::sync::broadcast;
@@ -114,6 +114,7 @@ fn setup() -> TestEnv {
 
     let cfg = Config {
         agents: vec![mock_profile(), unavailable_profile()],
+        ..Config::default()
     };
     let orch = Orchestrator::new(
         store,
@@ -547,6 +548,7 @@ async fn restart_sweeps_stale_sessions_to_error_and_resumable() {
             .unwrap();
         let cfg = Config {
             agents: vec![mock_profile()],
+            ..Config::default()
         };
         let orch = Orchestrator::new(
             store,
@@ -570,6 +572,7 @@ async fn restart_sweeps_stale_sessions_to_error_and_resumable() {
     // Second daemon lifetime over the same data dir.
     let cfg = Config {
         agents: vec![mock_profile()],
+        ..Config::default()
     };
     let orch = Orchestrator::new(
         Store::open(data.path()).unwrap(),
@@ -660,6 +663,7 @@ fn setup_with_pi() -> TestEnv {
 
     let cfg = Config {
         agents: vec![mock_profile(), pi_profile()],
+        ..Config::default()
     };
     let orch = Orchestrator::new(
         store,
@@ -957,4 +961,77 @@ async fn kill_during_waiting_permission_ends_done() {
         )),
         "no transition may leave Done: {log:?}"
     );
+}
+
+/// The configured `prompt_timeout` unwedges a stuck turn end to end:
+/// the conn's prompt resolves with a timeout error, the orchestrator's
+/// existing error path moves the session to `Error`, and the conn's
+/// "timed out" `Orchestrator` note is persisted into the event log.
+/// `kill` still cleans the wedged session up.
+#[tokio::test]
+async fn prompt_timeout_marks_session_error() {
+    let repo = init_repo();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let project_id = ProjectId::new();
+    store
+        .insert_project(&Project {
+            id: project_id,
+            root_path: repo.path().to_path_buf(),
+            name: "test-project".into(),
+        })
+        .unwrap();
+    let cfg = Config {
+        agents: vec![mock_profile()],
+        timeouts: ConnTimeouts {
+            init: Duration::from_secs(10),
+            prompt: Duration::from_secs(1),
+        },
+    };
+    let orch = Orchestrator::new(
+        store,
+        AgentRegistry::from_config(&cfg),
+        data.path().to_path_buf(),
+    );
+    let ws = orch
+        .create_workspace(project_id, "ws", "main")
+        .await
+        .unwrap();
+    let sid = orch
+        .create_session(ws, &AgentId::new("mock"), None)
+        .await
+        .expect("create_session should succeed");
+
+    // The mock's `hang` trigger never answers — the 1 s prompt bound is
+    // the only way this resolves.
+    let err = orch
+        .prompt(sid, "hang".to_string(), vec![])
+        .await
+        .expect_err("a wedged turn must fail at the prompt bound");
+    assert!(err.to_string().contains("timed out"), "{err}");
+
+    let state = wait_state(&orch, sid, |s| matches!(s, SessionState::Error(_))).await;
+    assert!(
+        matches!(&state, SessionState::Error(m) if m.contains("timed out")),
+        "the timeout error should land in the session state, got {state:?}"
+    );
+
+    // The conn emitted an Orchestrator note; the fan-out persists it.
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    loop {
+        let log = orch.read_events(sid).unwrap();
+        if log
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::Orchestrator(m) if m.contains("timed out")))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the 'timed out' note was never persisted: {log:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    orch.kill(sid).await.expect("kill should succeed");
 }

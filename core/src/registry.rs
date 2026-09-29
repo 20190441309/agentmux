@@ -10,13 +10,16 @@
 use std::env;
 use std::path::Path;
 
-use crate::config::Config;
+use crate::config::{Config, ConnTimeouts};
 use crate::id::AgentId;
 use crate::model::{AdapterKind, AgentProfile};
 
 /// The agents the orchestrator knows about, in config order.
 pub struct AgentRegistry {
     profiles: Vec<AgentProfile>,
+    /// Connection timeouts carried over from the [`Config`] — global,
+    /// not per-profile, so `register`/`probe` never touch them.
+    timeouts: ConnTimeouts,
 }
 
 impl AgentRegistry {
@@ -34,7 +37,10 @@ impl AgentRegistry {
                 None => profiles.push(agent.clone()),
             }
         }
-        AgentRegistry { profiles }
+        AgentRegistry {
+            profiles,
+            timeouts: cfg.timeouts,
+        }
     }
 
     /// Build a registry and probe every profile's adapter `command` —
@@ -47,12 +53,18 @@ impl AgentRegistry {
         let registry = Self::from_config(cfg);
         AgentRegistry {
             profiles: registry.probe(),
+            timeouts: registry.timeouts,
         }
     }
 
     /// All profiles, in config order.
     pub fn profiles(&self) -> &[AgentProfile] {
         &self.profiles
+    }
+
+    /// The connection timeouts this registry was configured with.
+    pub fn timeouts(&self) -> ConnTimeouts {
+        self.timeouts
     }
 
     /// Look up a profile by id.

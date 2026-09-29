@@ -31,7 +31,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use agentmux_core::{AcpConn, Event, EventKind, PermissionDecision};
+use agentmux_core::{AcpConn, ConnTimeouts, Event, EventKind, PermissionDecision, SpawnOptions};
 
 /// Generous deadline for event collection; the mock replies instantly, so
 /// this only bites on regression.
@@ -84,9 +84,14 @@ fn mock_agent_binary() -> PathBuf {
 
 /// Spawn a connection to the mock agent; the tempdir is the child's cwd.
 async fn spawn_mock() -> (AcpConn, tempfile::TempDir) {
+    spawn_mock_opts(&SpawnOptions::default()).await
+}
+
+/// [`spawn_mock`] with explicit spawn options (timeouts, stderr log).
+async fn spawn_mock_opts(opts: &SpawnOptions) -> (AcpConn, tempfile::TempDir) {
     let binary = mock_agent_binary();
     let dir = tempfile::tempdir().unwrap();
-    let conn = AcpConn::spawn(&binary, &[], &BTreeMap::new(), dir.path())
+    let conn = AcpConn::spawn(&binary, &[], &BTreeMap::new(), dir.path(), opts)
         .expect("mock agent should spawn");
     (conn, dir)
 }
@@ -429,4 +434,88 @@ async fn close_cancels_a_parked_permission() {
     let _ = tokio::time::timeout(EVENT_TIMEOUT, prompt)
         .await
         .expect("a killed conn must not leave the prompt hanging");
+}
+
+/// The configured `prompt` bound: a wedged turn resolves with a timeout
+/// error exactly at the bound — under the paused clock the 30 s virtual
+/// deadline fires the instant the caller parks on the reply (external
+/// replies always lose to auto-advance, so this pins the timeout path
+/// itself). `cancel` takes no timeout and still resolves.
+#[tokio::test(start_paused = true)]
+async fn prompt_times_out_on_the_configured_bound_virtual() {
+    let opts = SpawnOptions {
+        timeouts: ConnTimeouts {
+            init: Duration::from_secs(10),
+            prompt: Duration::from_secs(30),
+        },
+        ..SpawnOptions::default()
+    };
+    let (mut conn, _dir) = spawn_mock_opts(&opts).await;
+    let mut rx = conn.events();
+
+    let err = conn
+        .prompt("mock-session-1", "hang".to_string())
+        .await
+        .expect_err("a wedged turn must error at the prompt bound");
+    assert!(
+        err.to_string().contains("timed out"),
+        "expected a timeout error, got: {err}"
+    );
+
+    // The conn emitted an Orchestrator note naming the timeout — the
+    // orchestrator's fan-out persists these into the session log.
+    let mut notes = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        notes.push(ev);
+    }
+    assert!(
+        notes.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::Orchestrator(m) if m.contains("timed out")
+        )),
+        "expected a 'timed out' Orchestrator note, got {notes:?}"
+    );
+
+    // CANCEL is not subject to the prompt bound — it answers right away
+    // even with the turn still wedged agent-side.
+    conn.cancel("mock-session-1")
+        .await
+        .expect("cancel must resolve immediately");
+    conn.shutdown().await.unwrap();
+}
+
+/// Real-clock counterpart: the 1 s bound frees the caller from the mock's
+/// `hang` turn (~1 s, not forever), while a healthy turn under the same
+/// conn completes well inside the bound.
+#[tokio::test]
+async fn prompt_timeout_frees_the_caller_and_cancel_still_works() {
+    let opts = SpawnOptions {
+        timeouts: ConnTimeouts {
+            init: Duration::from_secs(10),
+            prompt: Duration::from_secs(1),
+        },
+        ..SpawnOptions::default()
+    };
+    let (mut conn, dir) = spawn_mock_opts(&opts).await;
+    conn.initialize().await.unwrap();
+    let session_id = conn.new_session(dir.path()).await.unwrap();
+
+    let start = std::time::Instant::now();
+    let err = conn
+        .prompt(&session_id, "hang".to_string())
+        .await
+        .expect_err("a wedged turn must fail at the prompt bound");
+    let elapsed = start.elapsed();
+    assert!(err.to_string().contains("timed out"), "{err}");
+    assert!(
+        elapsed >= Duration::from_secs(1) && elapsed < Duration::from_secs(5),
+        "bound should fire near 1s, took {elapsed:?}"
+    );
+
+    // The wedged worker-side request does not wedge the conn: cancel
+    // resolves, and the next prompt works once the turn unwinds.
+    conn.cancel(&session_id)
+        .await
+        .expect("cancel should resolve");
+    conn.shutdown().await.unwrap();
 }
