@@ -481,23 +481,21 @@ fn event_block(ev: &Event) -> EventBlock {
             Span::styled("· ", THEME.faint),
             Span::styled(msg.clone(), THEME.dim_italic),
         ])]),
-        EventKind::PermissionRequest { request, .. } => EventBlock::Static(vec![Line::from(
-            vec![
-                ts_span(ev),
-                Span::styled("⚠ ", THEME.warning),
-                Span::styled(
-                    format!("permission requested — {}", permission_summary(request)),
-                    THEME.warning_bold,
-                ),
-            ],
-        )]),
-        EventKind::PermissionResolved { outcome, .. } => EventBlock::Static(vec![Line::from(
-            vec![
+        EventKind::PermissionRequest { request, .. } => EventBlock::Static(vec![Line::from(vec![
+            ts_span(ev),
+            Span::styled("⚠ ", THEME.warning),
+            Span::styled(
+                format!("permission requested — {}", permission_summary(request)),
+                THEME.warning_bold,
+            ),
+        ])]),
+        EventKind::PermissionResolved { outcome, .. } => {
+            EventBlock::Static(vec![Line::from(vec![
                 ts_span(ev),
                 Span::styled("⚠ ", THEME.faint),
                 Span::styled(format!("permission {outcome}"), THEME.dim),
-            ],
-        )]),
+            ])])
+        }
     }
 }
 
@@ -1115,10 +1113,7 @@ fn draw_permission(frame: &mut Frame, app: &App) {
         Line::default(),
     ];
     if notice.pending {
-        lines.push(Line::from(Span::styled(
-            "  answering…",
-            THEME.dim_italic,
-        )));
+        lines.push(Line::from(Span::styled("  answering…", THEME.dim_italic)));
     } else {
         let mut hints = vec![
             Span::styled("  y", THEME.warning_bold),

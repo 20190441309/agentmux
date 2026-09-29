@@ -129,11 +129,7 @@ impl SpawnedConn {
     /// Answer a parked `session/request_permission`. Only ACP agents can
     /// emit permission requests; pi sessions get a clean unsupported
     /// error (they have no permission protocol to answer).
-    pub fn respond_permission(
-        &self,
-        request_id: &str,
-        decision: PermissionDecision,
-    ) -> Result<()> {
+    pub fn respond_permission(&self, request_id: &str, decision: PermissionDecision) -> Result<()> {
         match self {
             SpawnedConn::Acp(c) => c.respond_permission(request_id, decision),
             SpawnedConn::Pi(c) => c.respond_permission(request_id, decision),
@@ -1320,9 +1316,7 @@ fn describe_event(ev: &Event) -> Option<String> {
                 .unwrap_or("tool call");
             Some(format!("permission requested: {title}"))
         }
-        EventKind::PermissionResolved { outcome, .. } => {
-            Some(format!("permission {outcome}"))
-        }
+        EventKind::PermissionResolved { outcome, .. } => Some(format!("permission {outcome}")),
         // summarize_event handled FileEdited above.
         EventKind::FileEdited { .. } => None,
     }

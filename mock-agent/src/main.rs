@@ -110,11 +110,7 @@ impl MockAgent {
                     "Always allow",
                     acp::PermissionOptionKind::AllowAlways,
                 ),
-                acp::PermissionOption::new(
-                    "deny",
-                    "Reject",
-                    acp::PermissionOptionKind::RejectOnce,
-                ),
+                acp::PermissionOption::new("deny", "Reject", acp::PermissionOptionKind::RejectOnce),
             ],
         );
         let (tx, rx) = oneshot::channel();

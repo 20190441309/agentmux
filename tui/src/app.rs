@@ -155,13 +155,11 @@ impl PermissionNotice {
             .get("options")
             .and_then(|o| o.as_array())
             .map(|opts| {
-                opts.iter().any(|o| {
-                    o.get("kind").and_then(|k| k.as_str()) == Some("allow_always")
-                })
+                opts.iter()
+                    .any(|o| o.get("kind").and_then(|k| k.as_str()) == Some("allow_always"))
             })
             .unwrap_or(false)
     }
-
 }
 
 /// A [`Session`] decorated with the display names of its agent and
@@ -545,7 +543,9 @@ impl App {
         if let Some(notice) = &mut self.permission {
             if notice.request_id == request_id {
                 notice.pending = false;
-                self.set_status(format!("permission response failed: {error} — answer again"));
+                self.set_status(format!(
+                    "permission response failed: {error} — answer again"
+                ));
                 return;
             }
         }
@@ -625,9 +625,7 @@ fn truncate(text: String, max: usize) -> String {
 /// `RequestPermissionRequest`, camelCase) as a one-line notice. `ui`
 /// reuses it for the banner line the same event leaves in the stream.
 pub(crate) fn permission_summary(request: &serde_json::Value) -> String {
-    let title = request
-        .pointer("/toolCall/title")
-        .and_then(|t| t.as_str());
+    let title = request.pointer("/toolCall/title").and_then(|t| t.as_str());
     let options: Vec<&str> = request
         .get("options")
         .and_then(|o| o.as_array())

@@ -579,7 +579,11 @@ async fn respond_permission_unparks_a_parked_turn() {
     };
 
     answerer
-        .respond_permission(session.id, &request_id, agentmux_client::PermissionDecision::AllowOnce)
+        .respond_permission(
+            session.id,
+            &request_id,
+            agentmux_client::PermissionDecision::AllowOnce,
+        )
         .await
         .expect("respond_permission should ack");
 

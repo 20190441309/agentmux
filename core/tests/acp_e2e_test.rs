@@ -403,10 +403,7 @@ async fn respond_permission_unknown_or_consumed_id_errors() {
     );
     prompt.await.expect("cancel resolves the turn");
 
-    let events = recv_until(&mut rx, EVENT_TIMEOUT, |k| {
-        is_perm_outcome(k, "cancelled")
-    })
-    .await;
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |k| is_perm_outcome(k, "cancelled")).await;
     assert!(
         events.iter().any(|e| matches!(
             &e.kind,

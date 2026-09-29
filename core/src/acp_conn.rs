@@ -89,9 +89,10 @@ type PendingPermissions = Arc<Mutex<HashMap<String, PendingPermission>>>;
 /// stays parked so the caller can answer differently.
 ///
 /// `Reject` prefers `reject_once` over `reject_always` (the narrowest
-/// refusal) and degrades to `cancelled` — the deny-equivalent — when the
-/// agent offered no rejection option at all (mirroring ACP's own
-/// fallback guidance). `Cancel` needs no option.
+/// refusal) — by *preference* order, not the agent's offer order — and
+/// degrades to `cancelled`, the deny-equivalent, when the agent offered
+/// no rejection option at all (mirroring ACP's own fallback guidance).
+/// `Cancel` needs no option.
 fn decision_outcome(
     decision: PermissionDecision,
     options: &[acp::PermissionOption],
@@ -113,7 +114,8 @@ fn decision_outcome(
         PermissionDecision::AllowAlways => find(&[K::AllowAlways])
             .map(selected)
             .ok_or_else(|| anyhow!("agent offered no allow-always option")),
-        PermissionDecision::Reject => Ok(find(&[K::RejectOnce, K::RejectAlways])
+        PermissionDecision::Reject => Ok(find(&[K::RejectOnce])
+            .or_else(|| find(&[K::RejectAlways]))
             .map(selected)
             .unwrap_or(acp::RequestPermissionOutcome::Cancelled)),
         PermissionDecision::Cancel => Ok(acp::RequestPermissionOutcome::Cancelled),
@@ -129,20 +131,25 @@ fn resolve_pending(
     request_id: &str,
     decision: PermissionDecision,
 ) -> Result<()> {
-    let outcome = {
-        let map = pending.lock().unwrap();
+    // Lookup, mapping and removal run under one lock: a racing second
+    // answer or drain can't slip between the check and the removal —
+    // a decision must never return Ok and then be silently dropped.
+    let (entry, outcome) = {
+        let mut map = pending.lock().unwrap();
         let entry = map
             .get(request_id)
             .ok_or_else(|| anyhow!("no pending permission request {request_id}"))?;
         // Compute the outcome *before* consuming the entry: an unoffered
         // kind must leave the request parked.
-        decision_outcome(decision, &entry.options)?
+        let outcome = decision_outcome(decision, &entry.options)?;
+        let entry = map
+            .remove(request_id)
+            .expect("the map was locked across get and remove");
+        (entry, outcome)
     };
-    if let Some(entry) = pending.lock().unwrap().remove(request_id) {
-        // A dropped receiver means the handler went away (worker
-        // teardown) — the request is concluded either way.
-        let _ = entry.tx.send(outcome);
-    }
+    // A dropped receiver means the handler went away (worker teardown) —
+    // the request is concluded either way.
+    let _ = entry.tx.send(outcome);
     Ok(())
 }
 
@@ -253,7 +260,14 @@ impl AcpConn {
         let thread = std::thread::Builder::new()
             .name(format!("acp-conn-{session_id}"))
             .spawn(move || {
-                actor_main(spec, session_id, thread_event_tx, thread_pending, cmd_rx, ready_tx);
+                actor_main(
+                    spec,
+                    session_id,
+                    thread_event_tx,
+                    thread_pending,
+                    cmd_rx,
+                    ready_tx,
+                );
             })
             .map_err(|e| anyhow!("failed to spawn acp io thread: {e}"))?;
 
@@ -1093,6 +1107,40 @@ mod tests {
                 acp::RequestPermissionOutcome::Selected(sel) if sel.option_id.to_string() == "deny"
             ),
             "reject must select the RejectOnce option: {:?}",
+            resp.outcome
+        );
+    }
+
+    /// `reject` honours preference order, not offer order: with
+    /// `reject_always` listed first it still picks the `reject_once`
+    /// option — the narrowest refusal.
+    #[tokio::test]
+    async fn reject_prefers_once_even_when_always_is_offered_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let (h, mut rx, pending) = handler_with(dir.path());
+        let h: &'static _ = Box::leak(Box::new(h));
+        let req = acp::RequestPermissionRequest::new(
+            "mock-session-1",
+            acp::ToolCallUpdate::new("tc-1", acp::ToolCallUpdateFields::new()),
+            vec![
+                acp::PermissionOption::new(
+                    "always-deny",
+                    "Always reject",
+                    acp::PermissionOptionKind::RejectAlways,
+                ),
+                acp::PermissionOption::new("deny", "Reject", acp::PermissionOptionKind::RejectOnce),
+            ],
+        );
+
+        let (fut, request_id) = park_request(h, &mut rx, req).await;
+        resolve_pending(&pending, &request_id, PermissionDecision::Reject).unwrap();
+        let resp = fut.await.unwrap();
+        assert!(
+            matches!(
+                &resp.outcome,
+                acp::RequestPermissionOutcome::Selected(sel) if sel.option_id.to_string() == "deny"
+            ),
+            "reject must prefer the RejectOnce option over RejectAlways: {:?}",
             resp.outcome
         );
     }

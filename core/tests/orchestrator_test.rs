@@ -712,8 +712,12 @@ async fn permission_roundtrip_walks_waiting_permission_states() {
         .expect_err("concurrent prompt must be rejected while parked");
     assert!(err.to_string().contains("session busy"), "{err}");
 
-    orch.respond_permission(sid, &request_id, agentmux_core::PermissionDecision::AllowAlways)
-        .expect("respond_permission should accept the parked request");
+    orch.respond_permission(
+        sid,
+        &request_id,
+        agentmux_core::PermissionDecision::AllowAlways,
+    )
+    .expect("respond_permission should accept the parked request");
     turn.await
         .expect("prompt task panicked")
         .expect("prompt should complete once answered");
@@ -782,10 +786,7 @@ async fn respond_permission_without_a_parked_request_errors() {
         .orch
         .respond_permission(sid, "req-1", agentmux_core::PermissionDecision::AllowOnce)
         .expect_err("a killed session has no conn to answer on");
-    assert!(
-        err.to_string().contains("no live connection"),
-        "{err}"
-    );
+    assert!(err.to_string().contains("no live connection"), "{err}");
 
     let err = env
         .orch
@@ -857,7 +858,10 @@ async fn kill_during_waiting_permission_ends_done() {
     assert!(
         !log.iter().any(|e| matches!(
             &e.kind,
-            EventKind::StateChanged { from: SessionState::Done, .. }
+            EventKind::StateChanged {
+                from: SessionState::Done,
+                ..
+            }
         )),
         "no transition may leave Done: {log:?}"
     );
