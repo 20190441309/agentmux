@@ -256,26 +256,56 @@ fn draw_events(frame: &mut Frame, app: &App, area: Rect) {
     // Bound per-frame work to the visible region: scan the log backwards
     // and stop once the collected events cover the viewport in wrapped
     // rows. The per-event estimate counts a message's header even though
-    // merging may drop it later — never an under-count of its own body,
-    // so the scan still collects enough.
+    // merging may drop it later — never an under-count of its own body.
+    // `max_blocks` is the hard work bound: ~4 viewports of events is
+    // plenty of slack for merge-shrink top-ups without ever letting a
+    // pathological log turn drawing into O(log) work.
+    let mut iter = app.events_for_selected().rev();
+    let mut blocks: Vec<EventBlock> = Vec::new(); // newest first
+    let mut exhausted = false;
     let mut est = 0usize;
-    let mut blocks: Vec<EventBlock> = Vec::new();
-    for ev in app.events_for_selected().rev() {
-        let block = event_block(ev);
-        est += block_rows(&block, inner_width);
-        blocks.push(block);
-        if est >= inner_height {
-            break;
+    let max_blocks = inner_height.saturating_mul(4).max(16);
+    while est < inner_height && blocks.len() < max_blocks {
+        match iter.next() {
+            Some(ev) => {
+                let block = event_block(ev);
+                est += block_rows(&block, inner_width);
+                blocks.push(block);
+            }
+            None => {
+                exhausted = true;
+                break;
+            }
         }
     }
-    blocks.reverse();
-    let lines = render_blocks(blocks, agent);
+
+    // Render oldest → newest. Merging makes the render *shorter* than
+    // the estimate (N chunks share one header), so when it comes up
+    // short of the viewport keep pulling events and re-rendering until
+    // the pane fills, the log runs dry, or the block cap hits.
+    let mut lines = render_blocks(blocks.iter().rev(), agent);
+    let mut rows: usize = lines.iter().map(|l| wrapped_rows(l, inner_width)).sum();
+    while rows < inner_height && !exhausted && blocks.len() < max_blocks {
+        for _ in 0..inner_height - rows {
+            match iter.next() {
+                Some(ev) => blocks.push(event_block(ev)),
+                None => {
+                    exhausted = true;
+                    break;
+                }
+            }
+            if blocks.len() >= max_blocks {
+                break;
+            }
+        }
+        lines = render_blocks(blocks.iter().rev(), agent);
+        rows = lines.iter().map(|l| wrapped_rows(l, inner_width)).sum();
+    }
 
     // Bottom-anchor in wrapped rows: `.scroll` offsets count *post-wrap*
     // rows, so subtracting `lines.len()` (source lines) under-scrolls
     // whenever any line wraps and the newest events end up below the
     // fold. `rows` is the true wrapped-row count instead.
-    let rows: usize = lines.iter().map(|l| wrapped_rows(l, inner_width)).sum();
     let scroll = u16::try_from(rows.saturating_sub(inner_height)).unwrap_or(u16::MAX);
 
     let lines = if lines.is_empty() {
@@ -335,9 +365,10 @@ enum EventBlock {
     Static(Vec<Line<'static>>),
 }
 
-/// The wrapped rows `block` will occupy — the scan bound. `Msg` counts
-/// its header plus per-source-line body wrap, an over-estimate of the
-/// merged contribution (merging only ever drops header lines).
+/// The wrapped rows `block` will occupy when rendered alone — the phase-1
+/// scan bound. `Msg` counts its header plus per-source-line body wrap,
+/// an over-estimate of the merged contribution (merging drops headers);
+/// the top-up pass in `draw_events` corrects the resulting shortfall.
 fn block_rows(block: &EventBlock, width: usize) -> usize {
     match block {
         EventBlock::Static(lines) => lines.iter().map(|l| wrapped_rows(l, width)).sum(),
@@ -351,26 +382,31 @@ fn block_rows(block: &EventBlock, width: usize) -> usize {
     }
 }
 
-/// Render collected blocks to lines, coalescing consecutive same-role
-/// message chunks into one header + flowing prose body (agents stream
-/// replies as many small chunks — one header each would drown the text).
-fn render_blocks(blocks: Vec<EventBlock>, agent: &str) -> Vec<Line<'static>> {
+/// Render collected blocks (oldest → newest) to lines, coalescing
+/// consecutive same-role message chunks into one header + flowing prose
+/// body (agents stream replies as many small chunks — one header each
+/// would drown the text). Borrows the blocks so the caller can top-up
+/// the collection and re-render.
+fn render_blocks<'a>(
+    blocks: impl Iterator<Item = &'a EventBlock>,
+    agent: &str,
+) -> Vec<Line<'static>> {
     let mut out: Vec<Line> = Vec::new();
     let mut pending: Option<(MsgRole, DateTime<Utc>, String)> = None;
     for block in blocks {
         match block {
             EventBlock::Msg { role, ts, text } => match &mut pending {
-                Some((r, _, buf)) if *r == role => {
-                    buf.push_str(&text);
+                Some((r, _, buf)) if *r == *role => {
+                    buf.push_str(text);
                 }
                 _ => {
                     flush_msg(&mut out, pending.take(), agent);
-                    pending = Some((role, ts, text));
+                    pending = Some((*role, *ts, text.clone()));
                 }
             },
             EventBlock::Static(lines) => {
                 flush_msg(&mut out, pending.take(), agent);
-                out.extend(lines);
+                out.extend(lines.iter().cloned());
             }
         }
     }
@@ -414,7 +450,8 @@ fn flush_msg(
         MsgRole::Thought => THEME.dim_italic,
         _ => THEME.text,
     };
-    out.extend(body_lines(&text, body_style));
+    // Bottom-anchored stream: an over-long message keeps its tail.
+    out.extend(body_lines(&text, body_style, true));
 }
 
 /// One event → its renderable block (timestamped; `Msg` defers text).
@@ -525,23 +562,23 @@ fn ts_span(ev: &Event) -> Span<'static> {
 /// A `tool_call`/`tool_call_update` as a card: `⚙ title · status`
 /// header, then locations, diff hunks and text content underneath.
 fn tool_call_lines(ev: &Event, update: &serde_json::Value) -> Vec<Line<'static>> {
+    // title → kind → toolCallId: the most specific human-readable name
+    // wins; a bare `kind` ("edit") still beats a raw call id.
     let title = update
         .get("title")
         .and_then(|t| t.as_str())
         .filter(|t| !t.is_empty())
-        .map(str::to_string)
+        .or_else(|| update.get("kind").and_then(|k| k.as_str()))
         .or_else(|| {
             update
                 .get("toolCallId")
                 .and_then(|t| t.as_str())
                 .map(short_id)
-                .map(str::to_string)
         })
-        .unwrap_or_else(|| "tool call".to_string());
+        .unwrap_or("tool call")
+        .to_string();
     let status = update.get("status").and_then(|s| s.as_str());
 
-    // `kind` is deliberately not prefixed — agent titles already read
-    // like "Edit src/x.rs"; the status chip is the second semantic datum.
     let mut header = vec![ts_span(ev), Span::styled("⚙ ", THEME.accent)];
     header.push(Span::styled(title, THEME.text));
     if let Some(status) = status {
@@ -555,7 +592,7 @@ fn tool_call_lines(ev: &Event, update: &serde_json::Value) -> Vec<Line<'static>>
     let mut lines = vec![Line::from(header)];
 
     if let Some(locations) = update.get("locations").and_then(|l| l.as_array()) {
-        for loc in locations {
+        for loc in locations.iter().take(MAX_BLOCK_LINES) {
             let Some(path) = loc.get("path").and_then(|p| p.as_str()) else {
                 continue;
             };
@@ -574,6 +611,10 @@ fn tool_call_lines(ev: &Event, update: &serde_json::Value) -> Vec<Line<'static>>
 
     if let Some(content) = update.get("content").and_then(|c| c.as_array()) {
         for item in content {
+            // One card never floods the pane: stop once the cap is hit.
+            if lines.len() >= MAX_BLOCK_LINES {
+                break;
+            }
             match item.get("type").and_then(|t| t.as_str()) {
                 Some("diff") => {
                     let path = item.get("path").and_then(|p| p.as_str()).unwrap_or("?");
@@ -585,7 +626,7 @@ fn tool_call_lines(ev: &Event, update: &serde_json::Value) -> Vec<Line<'static>>
                 }
                 Some("content") => {
                     if let Some(text) = item.pointer("/content/text").and_then(|t| t.as_str()) {
-                        lines.extend(body_lines(text, THEME.dim));
+                        lines.extend(body_lines(text, THEME.dim, false));
                     }
                 }
                 Some("terminal") => lines.push(Line::from(vec![
@@ -603,7 +644,7 @@ fn tool_call_lines(ev: &Event, update: &serde_json::Value) -> Vec<Line<'static>>
             }
         }
     }
-    cap_lines(lines)
+    cap_head(lines)
 }
 
 /// A `plan` update: header plus one status-glyph row per entry.
@@ -614,7 +655,7 @@ fn plan_lines(ev: &Event, update: &serde_json::Value) -> Vec<Line<'static>> {
         Span::styled("plan", THEME.title),
     ])];
     if let Some(entries) = update.get("entries").and_then(|e| e.as_array()) {
-        for entry in entries {
+        for entry in entries.iter().take(MAX_BLOCK_LINES) {
             let status = entry.get("status").and_then(|s| s.as_str()).unwrap_or("");
             let (glyph, style) = match status {
                 "completed" => ("✓", THEME.success),
@@ -633,7 +674,7 @@ fn plan_lines(ev: &Event, update: &serde_json::Value) -> Vec<Line<'static>> {
             ]));
         }
     }
-    cap_lines(lines)
+    cap_head(lines)
 }
 
 /// `available_commands_update` → one dim summary line.
@@ -672,13 +713,16 @@ fn fallback_update_line(ev: &Event, update: &serde_json::Value) -> Line<'static>
 }
 
 /// Prose body lines: `BODY_INDENT`-indented in `style`, or diff-colored
-/// when the text looks like a patch.
-fn body_lines(text: &str, style: Style) -> Vec<Line<'static>> {
+/// when the text looks like a patch. `tail` selects the cap direction —
+/// message bodies keep their newest lines, tool output keeps its head.
+/// At most `MAX_BLOCK_LINES + 1` source lines are ever materialised.
+fn body_lines(text: &str, style: Style, tail: bool) -> Vec<Line<'static>> {
     if looks_like_diff(text) {
-        return patch_lines(text);
+        return patch_lines(text, tail);
     }
     let mut lines: Vec<Line> = text
         .lines()
+        .take(MAX_BLOCK_LINES + 1)
         .map(|l| {
             Line::from(vec![
                 Span::raw(BODY_INDENT),
@@ -689,7 +733,11 @@ fn body_lines(text: &str, style: Style) -> Vec<Line<'static>> {
     if lines.is_empty() && !text.is_empty() {
         lines.push(Line::from(Span::styled(text.to_string(), style)));
     }
-    cap_lines(lines)
+    if tail {
+        cap_tail(lines)
+    } else {
+        cap_head(lines)
+    }
 }
 
 /// Whether a text block is a unified-diff-shaped patch: an explicit
@@ -710,9 +758,9 @@ fn looks_like_diff(text: &str) -> bool {
 
 /// Render a unified-diff-ish text block: `+` lines green, `-` lines red,
 /// `@@`/`diff`/`index`/`---`/`+++` headers accent/faint, context dim.
-fn patch_lines(text: &str) -> Vec<Line<'static>> {
+fn patch_lines(text: &str, tail: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    for l in text.lines() {
+    for l in text.lines().take(MAX_BLOCK_LINES + 1) {
         let style = if l.starts_with("+++") || l.starts_with("---") {
             THEME.faint
         } else if l.starts_with('+') {
@@ -729,7 +777,11 @@ fn patch_lines(text: &str) -> Vec<Line<'static>> {
             Span::styled(l.to_string(), style),
         ]));
     }
-    cap_lines(lines)
+    if tail {
+        cap_tail(lines)
+    } else {
+        cap_head(lines)
+    }
 }
 
 /// An ACP `diff` content item: highlighted path header, then `-` old
@@ -742,14 +794,14 @@ fn diff_lines(path: &str, old: Option<&str>, new: &str) -> Vec<Line<'static>> {
         Span::styled(path.to_string(), THEME.accent),
     ])];
     if let Some(old) = old {
-        for l in old.lines() {
+        for l in old.lines().take(MAX_BLOCK_LINES) {
             lines.push(Line::from(vec![
                 Span::raw(BODY_INDENT),
                 Span::styled(format!("-{l}"), THEME.error),
             ]));
         }
     }
-    for l in new.lines() {
+    for l in new.lines().take(MAX_BLOCK_LINES) {
         lines.push(Line::from(vec![
             Span::raw(BODY_INDENT),
             Span::styled(format!("+{l}"), THEME.success),
@@ -758,16 +810,38 @@ fn diff_lines(path: &str, old: Option<&str>, new: &str) -> Vec<Line<'static>> {
     lines
 }
 
-/// Bound a block's height — a paste/diff beyond `MAX_BLOCK_LINES` ends
-/// with a dim ellipsis note.
-fn cap_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+/// The ellipsis row a capped block ends (head-cap) or begins
+/// (tail-cap) with.
+fn cap_note(tail: bool) -> Line<'static> {
+    let text = if tail {
+        "… earlier lines"
+    } else {
+        "… more lines"
+    };
+    Line::from(vec![
+        Span::raw(BODY_INDENT),
+        Span::styled(text, THEME.faint),
+    ])
+}
+
+/// Bound a block's height keeping its HEAD — for card-ish content
+/// (tool calls, plans) the header must stay visible.
+fn cap_head(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
     if lines.len() > MAX_BLOCK_LINES {
-        let more = lines.len() - MAX_BLOCK_LINES;
-        lines.truncate(MAX_BLOCK_LINES);
-        lines.push(Line::from(vec![
-            Span::raw(BODY_INDENT),
-            Span::styled(format!("… {more} more lines"), THEME.faint),
-        ]));
+        lines.truncate(MAX_BLOCK_LINES - 1);
+        lines.push(cap_note(false));
+    }
+    lines
+}
+
+/// Bound a block's height keeping its TAIL — in a bottom-anchored
+/// stream the newest lines are the ones that matter.
+fn cap_tail(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    if lines.len() > MAX_BLOCK_LINES {
+        let dropped = lines.len() - (MAX_BLOCK_LINES - 1);
+        let mut kept = lines.split_off(dropped);
+        kept.insert(0, cap_note(true));
+        return kept;
     }
     lines
 }
@@ -1715,6 +1789,39 @@ mod tests {
         );
         let text = buffer_text(terminal.backend());
         assert!(text.contains("chunk 9999"), "newest chunk renders: {text}");
+    }
+
+    /// Regression: a stream of same-role message chunks merges under one
+    /// header, so the estimate-based scan comes up short — the top-up
+    /// pass must keep pulling events until the pane actually fills
+    /// (pre-fix the bottom rows stayed blank mid-stream).
+    #[test]
+    fn chunk_stream_fills_the_viewport() {
+        let kinds: Vec<EventKind> = (0..60)
+            .map(|i| {
+                EventKind::SessionUpdate(serde_json::json!({
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text",
+                        "text": format!("lorem ipsum dolor sit amet {i} consectetur adipiscing elit sed do ")}
+                }))
+            })
+            .collect();
+        let app = app_with_events(kinds);
+        // 80x30 → events pane body occupies rows 0..26; its inner rows
+        // are 1..25 — row 24 is the last line before the bottom border.
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let w = buf.area.width as usize;
+        let last_inner: String = buf.content[24 * w..25 * w]
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            !last_inner.trim().is_empty(),
+            "merged chunk stream must fill to the pane bottom: {last_inner:?}"
+        );
     }
 
     /// Scratch: eyeball a representative frame.
