@@ -519,3 +519,98 @@ async fn prompt_timeout_frees_the_caller_and_cancel_still_works() {
         .expect("cancel should resolve");
     conn.shutdown().await.unwrap();
 }
+
+/// Agent stderr is piped, drained into the configured log file, and the
+/// retained tail surfaces twice: appended to the failed prompt's error
+/// and as an `Orchestrator` note emitted before `AgentExited`. The
+/// mock's `noisy` trigger writes 15 lines then exits 3 — one more than
+/// the 12-line tail, so truncation is exercised too.
+#[tokio::test]
+async fn stderr_is_logged_and_tail_surfaces_on_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("agent.stderr.log");
+    let opts = SpawnOptions {
+        stderr_log: Some(log_path.clone()),
+        ..SpawnOptions::default()
+    };
+    let (mut conn, work) = spawn_mock_opts(&opts).await;
+    conn.initialize().await.unwrap();
+    let session_id = conn.new_session(work.path()).await.unwrap();
+    let mut rx = conn.events();
+
+    let err = conn
+        .prompt(&session_id, "noisy".to_string())
+        .await
+        .expect_err("a crashing prompt must fail");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("mock stderr line 15"),
+        "error should carry the stderr tail, got: {msg}"
+    );
+    assert!(
+        !msg.contains("mock stderr line 3"),
+        "tail should keep only the last ~12 lines, got: {msg}"
+    );
+
+    // The exit watcher emits the tail as an Orchestrator note, then
+    // AgentExited{Some(3)} — order asserted by position.
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |k| {
+        matches!(k, EventKind::AgentExited { .. })
+    })
+    .await;
+    let note_pos = events
+        .iter()
+        .position(|e| matches!(&e.kind, EventKind::Orchestrator(m) if m.contains("stderr tail")))
+        .expect("a stderr-tail Orchestrator note should precede AgentExited");
+    let note = match &events[note_pos].kind {
+        EventKind::Orchestrator(m) => m,
+        _ => unreachable!(),
+    };
+    assert!(note.contains("mock stderr line 15"), "{note}");
+    assert!(!note.contains("mock stderr line 3"), "{note}");
+    assert!(
+        note_pos < events.len() - 1
+            && matches!(
+                events.last().unwrap().kind,
+                EventKind::AgentExited { code: Some(3) }
+            ),
+        "expected note then AgentExited{{3}}, got {events:?}"
+    );
+
+    // The on-disk log keeps ALL 15 lines — tail truncation is in-memory
+    // only.
+    let content = std::fs::read_to_string(&log_path).unwrap();
+    assert!(content.contains("mock stderr line 1\n"), "{content:?}");
+    assert!(content.contains("mock stderr line 15\n"), "{content:?}");
+
+    conn.shutdown().await.unwrap();
+}
+
+/// An agent that dies during the initialize handshake fails the call
+/// with its last stderr line on the error — no `noisy` trigger needed,
+/// `sh` exits before answering.
+#[tokio::test]
+async fn init_failure_error_carries_stderr_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let conn = AcpConn::spawn(
+        Path::new("sh"),
+        &[
+            "-c".to_string(),
+            "echo 'init boom on stderr' >&2; exit 7".to_string(),
+        ],
+        &BTreeMap::new(),
+        dir.path(),
+        &SpawnOptions::default(),
+    )
+    .expect("sh should spawn");
+
+    let err = conn
+        .initialize()
+        .await
+        .expect_err("a dead agent must fail initialize");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("init boom on stderr"),
+        "init failure should carry the stderr tail, got: {msg}"
+    );
+}

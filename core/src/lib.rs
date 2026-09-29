@@ -17,6 +17,7 @@ pub mod pi_rpc;
 pub mod pi_shape;
 pub mod registry;
 pub mod rpc;
+pub mod stderr;
 pub mod store;
 pub mod worktree;
 

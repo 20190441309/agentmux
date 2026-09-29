@@ -72,7 +72,7 @@ impl Default for ConnTimeouts {
 /// Per-connection spawn options handed to `AcpConn::spawn` /
 /// `PiConn::spawn`: the config-derived [`ConnTimeouts`] plus where the
 /// agent's stderr should be captured.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SpawnOptions {
     /// Connection timeouts (see [`ConnTimeouts`]).
     pub timeouts: ConnTimeouts,
@@ -80,15 +80,6 @@ pub struct SpawnOptions {
     /// `<data_dir>/sessions/<id>.stderr.log` in the orchestrator. `None`
     /// keeps capture in-memory only (the tail still surfaces on errors).
     pub stderr_log: Option<PathBuf>,
-}
-
-impl Default for SpawnOptions {
-    fn default() -> Self {
-        SpawnOptions {
-            timeouts: ConnTimeouts::default(),
-            stderr_log: None,
-        }
-    }
 }
 
 /// Parsed agentmux configuration.

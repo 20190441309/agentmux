@@ -23,6 +23,10 @@
 //! - Prompt text containing the token `crash` → `std::process::exit(1)`.
 //! - Prompt text containing the token `exit42` → `std::process::exit(42)`
 //!   (distinct code for `AgentExited` coverage).
+//! - Prompt text containing the token `noisy` → writes 15 stderr lines
+//!   (`mock stderr line 1..15`) then `std::process::exit(3)` — stderr
+//!   capture + tail coverage (more lines than the retained tail, so
+//!   truncation is exercised too).
 //! - Prompt text containing the token `hang` → the prompt future never
 //!   resolves (for timeout/cancel tests); the agent process stays alive.
 //! - Prompt text containing the token `perm` → between steps 1 and 2 the
@@ -186,6 +190,13 @@ impl acp::Agent for MockAgent {
         }
         if has_trigger(&text, "exit42") {
             std::process::exit(42);
+        }
+        if has_trigger(&text, "noisy") {
+            // 15 > the 12-line stderr tail, so only the freshest survive.
+            for i in 1..=15 {
+                eprintln!("mock stderr line {i}");
+            }
+            std::process::exit(3);
         }
         if has_trigger(&text, "hang") {
             // Never resolves: the request stays pending until the client

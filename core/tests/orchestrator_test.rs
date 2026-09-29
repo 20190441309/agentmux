@@ -1035,3 +1035,79 @@ async fn prompt_timeout_marks_session_error() {
 
     orch.kill(sid).await.expect("kill should succeed");
 }
+
+/// Agent stderr end to end: a `noisy` turn kills the mock with 15
+/// stderr lines; the drain writes `<data_dir>/sessions/<id>.stderr.log`
+/// (all 15 lines — the ~12-line truncation is in-memory only), the
+/// session lands in `Error`, and a persisted `Orchestrator` note carries
+/// the tail. `delete_workspace` removes the stderr log alongside the
+/// event log.
+#[tokio::test]
+async fn stderr_log_is_written_and_cleaned_on_workspace_delete() {
+    let env = setup();
+    let (ws, sid) = new_session(&env, "ws-stderr").await;
+
+    let err = prompt(&env.orch, sid, "noisy")
+        .await
+        .expect_err("a crashing turn must fail the prompt");
+    assert!(
+        format!("{err:#}").contains("mock stderr line 15"),
+        "orchestrator error should carry the stderr tail: {err:#}"
+    );
+
+    let state = wait_state(&env.orch, sid, |s| matches!(s, SessionState::Error(_))).await;
+    assert!(matches!(state, SessionState::Error(_)), "{state:?}");
+
+    // The session-scoped stderr log exists and holds every line.
+    let log_path = env
+        .data
+        .path()
+        .join("sessions")
+        .join(format!("{sid}.stderr.log"));
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    loop {
+        if log_path
+            .exists()
+            .then(|| std::fs::read_to_string(&log_path).unwrap())
+            .is_some_and(|c| c.contains("mock stderr line 15\n"))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stderr log never materialized at {}",
+            log_path.display()
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    let content = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        content.contains("mock stderr line 1\n") && content.contains("mock stderr line 15\n"),
+        "log should hold all 15 lines: {content:?}"
+    );
+
+    // The tail note is persisted into the session's JSONL event log.
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    loop {
+        let log = env.orch.read_events(sid).unwrap();
+        if log
+            .iter()
+            .any(|e| matches!(&e.kind, EventKind::Orchestrator(m) if m.contains("stderr tail")))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the stderr-tail note was never persisted: {log:?}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    // Workspace removal removes the stderr log along with the event log
+    // (the session is `Error`, i.e. non-live, so removal is allowed).
+    assert!(env.orch.remove_workspace(ws).unwrap());
+    assert!(
+        !log_path.exists(),
+        "stderr log should be removed on workspace delete"
+    );
+}

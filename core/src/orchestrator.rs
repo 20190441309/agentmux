@@ -628,6 +628,7 @@ impl Orchestrator {
             let store = self.sink.store.lock().unwrap();
             for session_id in session_ids {
                 let _ = store.delete_event_log(session_id); // best-effort
+                let _ = store.delete_stderr_log(session_id); // best-effort
             }
         }
         Ok(true)
@@ -842,9 +843,13 @@ impl Orchestrator {
         // handshake; keep that off the async executor.
         let profile = profile.clone();
         let cwd = worktree.to_path_buf();
+        let stderr_log = {
+            let store = self.sink.store.lock().unwrap();
+            Some(store.stderr_log_path(session_id))
+        };
         let options = SpawnOptions {
             timeouts: self.timeouts,
-            stderr_log: None,
+            stderr_log,
         };
         let conn =
             tokio::task::spawn_blocking(move || SpawnedConn::spawn(&profile, &cwd, &options))

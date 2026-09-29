@@ -21,6 +21,11 @@ Contract exercised by `pi_rpc_test.rs`:
                   documented framing trap the reader must survive.
 - prompt containing `crash`   → process exits 1
 - prompt containing `exit42`  → process exits 42
+- prompt containing `noisy`   → writes 15 stderr lines
+                                (`fake-pi stderr line 1..15`) then exits 3 —
+                                stderr capture + tail coverage (more lines
+                                than the retained tail, so truncation is
+                                exercised too)
 - prompt containing `reject`  → `success:false` error response
 - prompt containing `handled` → `disposition:"handled"`, no event run
 - prompt containing `slow`    → `disposition:"started"` + `agent_start`,
@@ -185,6 +190,11 @@ def main():
                 os._exit(1)
             if triggered(msg, "exit42"):
                 os._exit(42)
+            if triggered(msg, "noisy"):
+                # 15 > the 12-line stderr tail, so only the freshest survive.
+                for i in range(1, 16):
+                    print(f"fake-pi stderr line {i}", file=sys.stderr, flush=True)
+                os._exit(3)
             if triggered(msg, "hang"):
                 continue  # blackhole: no response, the request stays pending
             if triggered(msg, "reject"):

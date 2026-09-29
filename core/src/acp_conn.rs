@@ -42,6 +42,7 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
 use crate::config::SpawnOptions;
+use crate::stderr::{self, StderrCapture};
 use crate::{Event, EventKind, PermissionDecision, Result, SessionId};
 
 /// How long a parked `session/request_permission` waits for a
@@ -226,6 +227,9 @@ pub struct AcpConn {
     /// Connection timeouts from config (`ConnTimeouts`, resolved through
     /// the registry into [`SpawnOptions`] at spawn).
     timeouts: crate::config::ConnTimeouts,
+    /// Agent stderr drain: holds the shared tail and aborts the drain
+    /// task on drop. The drain task itself lives on the worker runtime.
+    stderr: StderrCapture,
 }
 
 impl AcpConn {
@@ -255,6 +259,7 @@ impl AcpConn {
             args: args.to_vec(),
             env: env.clone(),
             cwd: cwd.to_path_buf(),
+            stderr_log: options.stderr_log.clone(),
         };
         let thread_event_tx = event_tx.clone();
         let thread_pending = pending.clone();
@@ -275,7 +280,8 @@ impl AcpConn {
 
         // Block until the worker reports whether the child spawned. If the
         // worker dies first, `ready_tx` is dropped and `recv` errors out.
-        ready_rx
+        // On success the worker hands back the stderr-drain handle.
+        let stderr = ready_rx
             .recv()
             .map_err(|_| anyhow!("acp io thread died before reporting spawn status"))??;
 
@@ -287,6 +293,7 @@ impl AcpConn {
             pending,
             thread: Some(thread),
             timeouts: options.timeouts,
+            stderr,
         })
     }
 
@@ -363,12 +370,35 @@ impl AcpConn {
                         self.session_id,
                         EventKind::Orchestrator(format!("acp {what} timed out after {bound:?}")),
                     );
-                    return Err(anyhow!("acp {what} timed out after {bound:?}"));
+                    return Err(anyhow!(
+                        "acp {what} timed out after {bound:?}{}",
+                        self.stderr.tail_suffix()
+                    ));
                 }
                 Ok(outcome) => outcome,
             }
         };
-        outcome.map_err(|_| anyhow!("acp connection closed before {what} completed"))?
+        match outcome {
+            // Worker-side failure — most often the child died under the
+            // request. Wait briefly for the stderr drain to flush so the
+            // error carries the agent's last lines when they exist.
+            Ok(Err(e)) => {
+                let tail = self.stderr.tail();
+                tail.wait_eof(stderr::EOF_WAIT).await;
+                Err(anyhow!("{e:#}{}", tail.suffix()))
+            }
+            Ok(Ok(v)) => Ok(v),
+            // The reply channel dropped before the worker answered —
+            // the conn itself is gone.
+            Err(_) => {
+                let tail = self.stderr.tail();
+                tail.wait_eof(stderr::EOF_WAIT).await;
+                Err(anyhow!(
+                    "acp connection closed before {what} completed{}",
+                    tail.suffix()
+                ))
+            }
+        }
     }
 
     /// Send `session/cancel` for an in-flight prompt turn.
@@ -494,6 +524,9 @@ struct SpawnSpec {
     args: Vec<String>,
     env: BTreeMap<String, String>,
     cwd: PathBuf,
+    /// Optional on-disk destination for the stderr drain; `None` keeps
+    /// only the in-memory tail.
+    stderr_log: Option<PathBuf>,
 }
 
 /// The worker thread: builds its own `current_thread` runtime, spawns the
@@ -505,7 +538,7 @@ fn actor_main(
     event_tx: broadcast::Sender<Event>,
     pending: PendingPermissions,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
-    ready_tx: std::sync::mpsc::Sender<Result<()>>,
+    ready_tx: std::sync::mpsc::Sender<Result<StderrCapture>>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -525,9 +558,9 @@ fn actor_main(
             .current_dir(&spec.cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            // TODO(observability): route agent stderr into the event stream
-            // instead of discarding it.
-            .stderr(std::process::Stdio::null())
+            // Piped, then drained by `stderr::spawn_drain` into the
+            // session log + shared tail (v1.1 observability).
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
         {
@@ -543,6 +576,13 @@ fn actor_main(
 
         let child_stdin = child.stdin.take().expect("stdin was piped");
         let child_stdout = child.stdout.take().expect("stdout was piped");
+        let child_stderr = child.stderr.take().expect("stderr was piped");
+
+        // Drain stderr line-wise on this runtime: last N lines are kept
+        // for error reporting, every line is appended to the session's
+        // stderr log when a path was configured.
+        let stderr = stderr::spawn_drain(child_stderr, spec.stderr_log.clone());
+        let stderr_tail = stderr.tail();
 
         // Working directory the `fs/*` handlers are confined to; replaced by
         // the `session/new` cwd once a session exists.
@@ -581,9 +621,13 @@ fn actor_main(
             }
         });
 
-        // Report child exit as `AgentExited`.
+        // Report child exit as `AgentExited`. On a nonzero (or unknown)
+        // exit first wait briefly for the stderr drain to flush, then
+        // emit the captured tail as an `Orchestrator` note so the
+        // agent's dying words land in the session log.
         tokio::task::spawn_local({
             let event_tx = event_tx.clone();
+            let tail = stderr_tail.clone();
             async move {
                 let code = match child.wait().await {
                     Ok(status) => status.code(),
@@ -592,11 +636,24 @@ fn actor_main(
                         None
                     }
                 };
+                if code != Some(0) {
+                    tail.wait_eof(stderr::EOF_WAIT).await;
+                    let suffix = tail.suffix();
+                    if !suffix.is_empty() {
+                        emit(
+                            &event_tx,
+                            session_id,
+                            EventKind::Orchestrator(format!(
+                                "agent exited with code {code:?}{suffix}"
+                            )),
+                        );
+                    }
+                }
                 emit(&event_tx, session_id, EventKind::AgentExited { code });
             }
         });
 
-        if ready_tx.send(Ok(())).is_err() {
+        if ready_tx.send(Ok(stderr)).is_err() {
             // The caller went away while we were starting up.
             return;
         }
