@@ -572,3 +572,161 @@ async fn invalid_utf8_line_gets_parse_error_and_connection_survives() {
 
     shutdown(td).await;
 }
+
+/// ⑦ `session/permission`: a `perm` prompt parks on the mock's
+/// `session/request_permission`. The parked request arrives on the
+/// subscribed connection as a `PermissionRequest` event, a second
+/// connection answers it, the prompt completes, and the paired
+/// `PermissionResolved` + the mock's outcome chunk land on the bus.
+#[tokio::test]
+async fn session_permission_roundtrip_resolves_parked_prompt() {
+    let td = start_daemon().await;
+    let mut c1 = Client::connect(&td.sock).await;
+    let resp = c1.request("session/subscribe", Value::Null).await;
+    assert_eq!(resp["result"], json!(null), "subscribe should ack: {resp}");
+
+    let session_id = create_session_via_rpc(&mut c1, td.repo.path(), "ws1").await;
+    let sid: agentmux_core::SessionId =
+        serde_json::from_value(session_id.clone()).expect("session id");
+
+    // Sent as a raw line, not `request()`: the response only arrives
+    // after the permission is answered, so the read loop must interleave
+    // notifications below instead of blocking inside `request`.
+    let prompt_id = json!(9001);
+    c1.send_line(
+        &serde_json::to_string(&RpcRequest::new(
+            "session/prompt",
+            json!({"session_id": session_id, "text": "perm please"}),
+            prompt_id.clone(),
+        ))
+        .unwrap(),
+    )
+    .await;
+
+    // Pump messages until the parked PermissionRequest notification lands.
+    let request_id = loop {
+        if let Some(id) = c1.events.iter().find_map(|e| match &e.kind {
+            EventKind::PermissionRequest { request_id, .. } if e.session_id == sid => {
+                Some(request_id.clone())
+            }
+            _ => None,
+        }) {
+            break id;
+        }
+        let msg = c1.read_msg().await;
+        assert!(
+            msg.get("id") != Some(&prompt_id),
+            "prompt finished before its permission was answered: {msg}"
+        );
+        c1.stash_notification(&msg);
+    };
+
+    // A second connection answers — the first is still mid-prompt.
+    let mut c2 = Client::connect(&td.sock).await;
+    let resp = c2
+        .request(
+            "session/permission",
+            json!({
+                "session_id": session_id,
+                "request_id": request_id,
+                "outcome": "allow_once",
+            }),
+        )
+        .await;
+    assert_eq!(
+        resp["result"],
+        json!(null),
+        "session/permission should ack: {resp}"
+    );
+
+    // The turn resumes: the prompt response lands, then the paired
+    // PermissionResolved and the mock's own outcome chunk.
+    let resp = loop {
+        let msg = c1.read_msg().await;
+        if msg.get("id") == Some(&prompt_id) {
+            break msg;
+        }
+        c1.stash_notification(&msg);
+    };
+    assert_eq!(
+        resp["result"],
+        json!(null),
+        "prompt should complete once answered: {resp}"
+    );
+
+    let events = c1
+        .collect_events_until(|e| chunk_text(e, sid) == Some("permission outcome: selected:allow"))
+        .await;
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::PermissionResolved { request_id: r, outcome }
+                if *r == request_id && outcome == "selected:allow"
+        )),
+        "expected a paired PermissionResolved: {events:?}"
+    );
+
+    shutdown(td).await;
+}
+
+/// ⑧ `session/permission` param validation: missing fields and a bogus
+/// outcome string are `-32602`; a well-formed call on an unknown session
+/// is the orchestrator's `-32603`.
+#[tokio::test]
+async fn session_permission_validates_params() {
+    let td = start_daemon().await;
+    let mut client = Client::connect(&td.sock).await;
+
+    let resp = client
+        .request(
+            "session/permission",
+            json!({"session_id": agentmux_core::SessionId::new()}),
+        )
+        .await;
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32602),
+        "missing request_id/outcome should be invalid params: {resp}"
+    );
+
+    let resp = client
+        .request(
+            "session/permission",
+            json!({
+                "session_id": agentmux_core::SessionId::new(),
+                "request_id": "req-1",
+                "outcome": "shrug",
+            }),
+        )
+        .await;
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32602),
+        "an unknown outcome string should be invalid params: {resp}"
+    );
+
+    let resp = client
+        .request(
+            "session/permission",
+            json!({
+                "session_id": agentmux_core::SessionId::new(),
+                "request_id": "req-1",
+                "outcome": "allow_once",
+            }),
+        )
+        .await;
+    assert_eq!(
+        resp["error"]["code"],
+        json!(-32603),
+        "a well-formed call on an unknown session should be internal: {resp}"
+    );
+
+    // The connection is still usable.
+    let resp = client.request("server/status", Value::Null).await;
+    assert!(
+        resp["result"].is_object(),
+        "post-error request failed: {resp}"
+    );
+
+    shutdown(td).await;
+}

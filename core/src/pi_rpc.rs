@@ -427,6 +427,21 @@ impl PiConn {
             .map_err(|_| anyhow!("pi connection closed before abort completed"))?
     }
 
+    /// Pi's RPC protocol has no `session/request_permission` counterpart —
+    /// agents on this adapter never emit `PermissionRequest` events, so
+    /// there is never a parked request to answer. Kept as an explicit
+    /// method (rather than the enum dispatching an inline error) so the
+    /// unsupported case has one clean, greppable home.
+    pub fn respond_permission(
+        &self,
+        request_id: &str,
+        _decision: crate::PermissionDecision,
+    ) -> Result<()> {
+        Err(anyhow!(
+            "pi sessions do not support permission responses (request {request_id})"
+        ))
+    }
+
     /// Subscribe to this connection's event stream.
     ///
     /// The *first* call returns the receiver that has been buffering since

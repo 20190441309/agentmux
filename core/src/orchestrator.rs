@@ -49,8 +49,8 @@ use tokio::task::JoinHandle;
 use crate::collab;
 use crate::id::{AgentId, ProjectId, SessionId, WorkspaceId};
 use crate::model::{
-    AdapterKind, AgentProfile, Event, EventKind, Project, Session, SessionRef, SessionState,
-    Workspace,
+    AdapterKind, AgentProfile, Event, EventKind, PermissionDecision, Project, Session, SessionRef,
+    SessionState, Workspace,
 };
 use crate::registry::AgentRegistry;
 use crate::store::Store;
@@ -123,6 +123,20 @@ impl SpawnedConn {
         match self {
             SpawnedConn::Acp(c) => c.cancel(acp_session_id).await,
             SpawnedConn::Pi(c) => c.cancel(acp_session_id).await,
+        }
+    }
+
+    /// Answer a parked `session/request_permission`. Only ACP agents can
+    /// emit permission requests; pi sessions get a clean unsupported
+    /// error (they have no permission protocol to answer).
+    pub fn respond_permission(
+        &self,
+        request_id: &str,
+        decision: PermissionDecision,
+    ) -> Result<()> {
+        match self {
+            SpawnedConn::Acp(c) => c.respond_permission(request_id, decision),
+            SpawnedConn::Pi(c) => c.respond_permission(request_id, decision),
         }
     }
 
@@ -274,6 +288,38 @@ impl EventSink {
         }
         if session.state == to {
             return Ok(true);
+        }
+        store.update_session_state(session_id, &to)?;
+        let mut ev = Event {
+            session_id,
+            seq: 0,
+            ts: Utc::now(),
+            kind: EventKind::StateChanged {
+                from: session.state,
+                to,
+            },
+        };
+        self.ingest_locked(&store, &mut ev);
+        Ok(true)
+    }
+
+    /// Transition only while the session is in `from` — one atomic
+    /// check-and-set under the store lock. The permission flow uses
+    /// this to step `Prompting → WaitingPermission → Prompting`: a
+    /// resolved event racing a `cancel`/`kill` (which already moved the
+    /// session to `Ready`/`Done`) must not drag it back into `Prompting`.
+    fn transition_from(
+        &self,
+        session_id: SessionId,
+        from: SessionState,
+        to: SessionState,
+    ) -> Result<bool> {
+        let store = self.store.lock().unwrap();
+        let session = store
+            .get_session(session_id)?
+            .ok_or_else(|| anyhow!("no such session {session_id}"))?;
+        if session.state != from {
+            return Ok(false);
         }
         store.update_session_state(session_id, &to)?;
         let mut ev = Event {
@@ -975,6 +1021,33 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// Answer a parked permission request (`session/permission`). The
+    /// `request_id` came from a `PermissionRequest` event; `decision`
+    /// maps onto the options the agent offered (see
+    /// [`AcpConn::respond_permission`] for the mapping and its errors).
+    ///
+    /// No state transition happens here: the conn emits
+    /// `PermissionResolved` when the parked agent request unwinds, and
+    /// the fan-out moves `WaitingPermission → Prompting` off that event —
+    /// so a response racing a `kill`/`cancel` can't resurrect the
+    /// session. Not async: the conn's resolve is a sync channel send.
+    pub fn respond_permission(
+        &self,
+        session_id: SessionId,
+        request_id: &str,
+        decision: PermissionDecision,
+    ) -> Result<()> {
+        let slot = self.slot(session_id)?;
+        let live = slot
+            .conn
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("session {session_id} has no live connection"))?;
+        live.conn.respond_permission(request_id, decision)
+    }
+
     /// Stop a slot's fan-out and close its conn — the shared teardown used
     /// by `kill`, `resume` and the post-`connect` kill-race cleanup.
     /// Idempotent; a slot may hold neither.
@@ -1160,6 +1233,28 @@ fn spawn_fanout(
                     ev.session_id = session_id;
                     let exited = matches!(ev.kind, EventKind::AgentExited { .. });
                     sink.ingest(&mut ev);
+                    // Permission bookkeeping rides the event stream so
+                    // the WaitingPermission step lands strictly after the
+                    // PermissionRequest it answers. `transition_from`
+                    // (not the generic `transition`) keeps a resolved
+                    // racing a cancel/kill from resurrecting the session.
+                    match &ev.kind {
+                        EventKind::PermissionRequest { .. } => {
+                            let _ = sink.transition_from(
+                                session_id,
+                                SessionState::Prompting,
+                                SessionState::WaitingPermission,
+                            );
+                        }
+                        EventKind::PermissionResolved { .. } => {
+                            let _ = sink.transition_from(
+                                session_id,
+                                SessionState::WaitingPermission,
+                                SessionState::Prompting,
+                            );
+                        }
+                        _ => {}
+                    }
                     if let Some(summary) = collab::summarize_event(&ev.kind) {
                         let _ = collab::append_activity(&worktree_path, &agent_name, &summary);
                     }
@@ -1216,6 +1311,18 @@ fn describe_event(ev: &Event) -> Option<String> {
         EventKind::StateChanged { from, to } => Some(format!("state {from:?} → {to:?}")),
         EventKind::AgentExited { code } => Some(format!("agent exited (code {code:?})")),
         EventKind::Orchestrator(note) => Some(note.clone()),
+        EventKind::PermissionRequest { request, .. } => {
+            // Best-effort title dig — the serialized shape is
+            // `{"toolCall": {"title": …, …}, "options": […]}`.
+            let title = request
+                .pointer("/toolCall/title")
+                .and_then(|t| t.as_str())
+                .unwrap_or("tool call");
+            Some(format!("permission requested: {title}"))
+        }
+        EventKind::PermissionResolved { outcome, .. } => {
+            Some(format!("permission {outcome}"))
+        }
         // summarize_event handled FileEdited above.
         EventKind::FileEdited { .. } => None,
     }

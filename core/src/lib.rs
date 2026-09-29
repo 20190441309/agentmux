@@ -24,8 +24,8 @@ pub use anyhow::Result;
 pub use config::Config;
 pub use id::{AgentId, ProjectId, SessionId, WorkspaceId};
 pub use model::{
-    AdapterKind, AgentProfile, Event, EventKind, Project, Session, SessionRef, SessionState,
-    Workspace,
+    AdapterKind, AgentProfile, Event, EventKind, PermissionDecision, Project, Session, SessionRef,
+    SessionState, Workspace,
 };
 pub use orchestrator::{Orchestrator, SpawnedConn};
 pub use pi_rpc::PiConn;

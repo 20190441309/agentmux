@@ -621,3 +621,244 @@ async fn restart_sweeps_stale_sessions_to_error_and_resumable() {
         SessionState::Ready
     );
 }
+
+/// A `pi` profile backed by the `tests/fake_pi.py` stub — same trick as
+/// `pi_rpc_test.rs`'s `spawn_fake`, routed through the adapter registry.
+fn pi_profile() -> AgentProfile {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_pi.py");
+    assert!(
+        script.is_file(),
+        "fake pi stub missing at {}",
+        script.display()
+    );
+    AgentProfile {
+        id: AgentId::new("pi"),
+        name: "Fake Pi".into(),
+        adapter: AdapterKind::PiRpc {
+            command: PathBuf::from("python3"),
+            args: vec![script.to_string_lossy().into_owned()],
+        },
+        env: BTreeMap::new(),
+        available: true,
+    }
+}
+
+/// `setup()` with an extra pi agent alongside the mock.
+fn setup_with_pi() -> TestEnv {
+    let repo = init_repo();
+    let data = tempfile::tempdir().unwrap();
+
+    let store = Store::open(data.path()).unwrap();
+    let project_id = ProjectId::new();
+    store
+        .insert_project(&Project {
+            id: project_id,
+            root_path: repo.path().to_path_buf(),
+            name: "test-project".into(),
+        })
+        .unwrap();
+
+    let cfg = Config {
+        agents: vec![mock_profile(), pi_profile()],
+    };
+    let orch = Orchestrator::new(
+        store,
+        AgentRegistry::from_config(&cfg),
+        data.path().to_path_buf(),
+    );
+    TestEnv {
+        _repo: repo,
+        data,
+        orch,
+        project_id,
+    }
+}
+
+/// The `perm` trigger's full lifecycle through the orchestrator: the bus
+/// carries `PermissionRequest`, the fan-out steps
+/// `Prompting → WaitingPermission`, `respond_permission` selects the
+/// offered `always` option, `PermissionResolved` steps
+/// `WaitingPermission → Prompting`, and the turn ends back at `Ready`.
+#[tokio::test]
+async fn permission_roundtrip_walks_waiting_permission_states() {
+    let env = setup();
+    let (_ws, sid) = new_session(&env, "ws1").await;
+    let orch = Arc::new(env.orch);
+    let mut rx = orch.subscribe();
+
+    let o2 = orch.clone();
+    let turn = tokio::spawn(async move { o2.prompt(sid, "perm".into(), vec![]).await });
+
+    // The request is parked: bus event + WaitingPermission state.
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |e| {
+        e.session_id == sid && matches!(e.kind, EventKind::PermissionRequest { .. })
+    })
+    .await;
+    let request_id = events
+        .iter()
+        .find_map(|e| match &e.kind {
+            EventKind::PermissionRequest { request_id, .. } if e.session_id == sid => {
+                Some(request_id.clone())
+            }
+            _ => None,
+        })
+        .expect("PermissionRequest event should reach the bus");
+    wait_state(&orch, sid, |s| matches!(s, SessionState::WaitingPermission)).await;
+
+    // The turn still holds the session while it parks.
+    let err = orch
+        .prompt(sid, "second".to_string(), vec![])
+        .await
+        .expect_err("concurrent prompt must be rejected while parked");
+    assert!(err.to_string().contains("session busy"), "{err}");
+
+    orch.respond_permission(sid, &request_id, agentmux_core::PermissionDecision::AllowAlways)
+        .expect("respond_permission should accept the parked request");
+    turn.await
+        .expect("prompt task panicked")
+        .expect("prompt should complete once answered");
+
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |e| {
+        e.session_id == sid
+            && matches!(&e.kind, EventKind::SessionUpdate(v)
+                if v["update"]["sessionUpdate"] == "agent_message_chunk"
+                    && v["update"]["content"]["text"] == "permission outcome: selected:always")
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::PermissionResolved { request_id: r, outcome }
+                if *r == request_id && outcome == "selected:always"
+        )),
+        "expected a paired PermissionResolved: {events:?}"
+    );
+
+    assert_eq!(
+        wait_state(&orch, sid, |s| matches!(s, SessionState::Ready)).await,
+        SessionState::Ready,
+        "the session should return to Ready after the resolved turn"
+    );
+
+    // Both transitions were persisted in order — WaitingPermission is a
+    // real state, not a UI fiction.
+    let log = orch.read_events(sid).unwrap();
+    let mut waiting = false;
+    let mut back = false;
+    for e in &log {
+        match &e.kind {
+            EventKind::StateChanged {
+                from: SessionState::Prompting,
+                to: SessionState::WaitingPermission,
+            } => waiting = true,
+            EventKind::StateChanged {
+                from: SessionState::WaitingPermission,
+                to: SessionState::Prompting,
+            } if waiting => back = true,
+            _ => {}
+        }
+    }
+    assert!(
+        waiting && back,
+        "expected Prompting→WaitingPermission→Prompting in {log:?}"
+    );
+}
+
+/// `respond_permission` on a session with no parked request fails, and so
+/// does one on a session with no live connection.
+#[tokio::test]
+async fn respond_permission_without_a_parked_request_errors() {
+    let env = setup();
+    let (_ws, sid) = new_session(&env, "ws1").await;
+
+    let err = env
+        .orch
+        .respond_permission(sid, "req-1", agentmux_core::PermissionDecision::AllowOnce)
+        .expect_err("nothing is parked — this must fail");
+    assert!(err.to_string().contains("req-1"), "{err}");
+
+    env.orch.kill(sid).await.unwrap();
+    let err = env
+        .orch
+        .respond_permission(sid, "req-1", agentmux_core::PermissionDecision::AllowOnce)
+        .expect_err("a killed session has no conn to answer on");
+    assert!(
+        err.to_string().contains("no live connection"),
+        "{err}"
+    );
+
+    let err = env
+        .orch
+        .respond_permission(
+            SessionId::new(),
+            "req-1",
+            agentmux_core::PermissionDecision::AllowOnce,
+        )
+        .expect_err("an unknown session id must fail");
+    assert!(err.to_string().contains("not running"), "{err}");
+}
+
+/// Pi sessions have no permission protocol: `respond_permission` must
+/// report a clear unsupported error instead of silently doing nothing.
+#[tokio::test]
+async fn respond_permission_on_pi_session_is_unsupported() {
+    let env = setup_with_pi();
+    let ws = env
+        .orch
+        .create_workspace(env.project_id, "pi-ws", "main")
+        .await
+        .unwrap();
+    let sid = env
+        .orch
+        .create_session(ws, &AgentId::new("pi"), None)
+        .await
+        .expect("create_session with fake pi should succeed");
+
+    let err = env
+        .orch
+        .respond_permission(sid, "req-9", agentmux_core::PermissionDecision::AllowOnce)
+        .expect_err("pi has no permission protocol");
+    assert!(
+        err.to_string().contains("do not support permission"),
+        "{err}"
+    );
+}
+
+/// `kill` racing a parked permission: the conn teardown cancels the
+/// request, the session lands `Done`, and the `PermissionResolved`
+/// (or its `WaitingPermission → Prompting` step) can never resurrect it.
+#[tokio::test]
+async fn kill_during_waiting_permission_ends_done() {
+    let env = setup();
+    let (_ws, sid) = new_session(&env, "ws1").await;
+    let orch = Arc::new(env.orch);
+    let mut rx = orch.subscribe();
+
+    let o2 = orch.clone();
+    let turn = tokio::spawn(async move { o2.prompt(sid, "perm".into(), vec![]).await });
+
+    // Wait for the parked request, then kill mid-wait.
+    recv_until(&mut rx, EVENT_TIMEOUT, |e| {
+        e.session_id == sid && matches!(e.kind, EventKind::PermissionRequest { .. })
+    })
+    .await;
+    wait_state(&orch, sid, |s| matches!(s, SessionState::WaitingPermission)).await;
+
+    orch.kill(sid).await.expect("kill should succeed");
+    let _ = turn.await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        orch.get_session(sid).unwrap().unwrap().state,
+        SessionState::Done,
+        "a killed session must stay Done even if PermissionResolved lands late"
+    );
+    let log = orch.read_events(sid).unwrap();
+    assert!(
+        !log.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::StateChanged { from: SessionState::Done, .. }
+        )),
+        "no transition may leave Done: {log:?}"
+    );
+}

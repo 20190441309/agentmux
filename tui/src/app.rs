@@ -8,18 +8,13 @@
 use std::collections::HashSet;
 
 use agentmux_core::{
-    AgentId, AgentProfile, Event, EventKind, Project, Session, SessionId, SessionState, Workspace,
+    AgentId, AgentProfile, Event, EventKind, PermissionDecision, Project, Session, SessionId,
+    SessionState, Workspace,
 };
 use crossterm::event::{KeyEvent, KeyEventKind};
 
 use crate::input;
 use crate::newsession::{NewSessionWizard, WorkspacePick};
-
-/// `EventKind::Orchestrator` messages with this prefix are ACP
-/// `session/request_permission` payloads forwarded by `AcpConn`
-/// (deny-by-default — see `core::acp_conn`). The TUI shows them as a
-/// display-only notice; no RPC exists to answer them in v1.
-pub(crate) const PERMISSION_PREFIX: &str = "permission-request:";
 
 /// What the UI is currently doing with keystrokes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,10 +28,10 @@ pub enum InputMode {
     RelayPick,
     /// `n` new-session wizard: project → workspace → agent.
     NewSession,
-    /// Display-only permission notice. `AcpConn` answers
-    /// `session/request_permission` itself (deny-by-default); there is
-    /// no permission-response RPC, so this mode only shows what was
-    /// asked — any key dismisses and restores the interrupted mode.
+    /// Interactive permission dialog. `EventKind::PermissionRequest`
+    /// opens it; `y`/`a`/`n`/`Esc` answer via `session/permission` and
+    /// the overlay stays up (marked pending) until the matching
+    /// `PermissionResolved` event arrives.
     Permission,
 }
 
@@ -73,6 +68,14 @@ pub enum AppAction {
     /// (`session/resume`) — the only way back for sessions the daemon
     /// swept to `Error` at boot.
     ResumeSession,
+    /// `y`/`a`/`n`/`Esc` in Permission mode — answer the parked agent
+    /// permission request (`session/permission`). The overlay stays up
+    /// until the daemon's `PermissionResolved` event confirms it.
+    RespondPermission {
+        session_id: SessionId,
+        request_id: String,
+        outcome: PermissionDecision,
+    },
 }
 
 /// A relay staged by the `@` picker, consumed by the next
@@ -121,15 +124,44 @@ pub struct RelayPick {
     pub source: Option<RelaySource>,
 }
 
-/// A permission request surfaced for display (see [`PERMISSION_PREFIX`]).
+/// A permission request parked agent-side and awaiting the user's
+/// answer (see [`InputMode::Permission`]).
 #[derive(Debug, Clone)]
 pub struct PermissionNotice {
     /// Session whose agent asked.
     pub session_id: SessionId,
+    /// The id `session/permission` must echo back.
+    pub request_id: String,
     /// Human-readable rendering of the request (tool title + options).
     pub summary: String,
-    /// Mode to restore when the notice is dismissed.
+    /// The raw `RequestPermissionRequest` payload — the overlay lists
+    /// its `options`, and [`allows_always`](Self::allows_always) gates
+    /// the `a` key on an `allow_always` kind being offered.
+    pub request: serde_json::Value,
+    /// Mode to restore when the request resolves.
     pub resume: InputMode,
+    /// An answer key was pressed and the `session/permission` call is
+    /// in flight — the overlay stays up (keys ignored) until
+    /// `PermissionResolved` or an RPC error (which clears this flag so
+    /// the user can answer again).
+    pub pending: bool,
+}
+
+impl PermissionNotice {
+    /// Whether the agent offered an `allow_always` option — the `a`
+    /// key answers `allow_always` only then.
+    pub fn allows_always(&self) -> bool {
+        self.request
+            .get("options")
+            .and_then(|o| o.as_array())
+            .map(|opts| {
+                opts.iter().any(|o| {
+                    o.get("kind").and_then(|k| k.as_str()) == Some("allow_always")
+                })
+            })
+            .unwrap_or(false)
+    }
+
 }
 
 /// A [`Session`] decorated with the display names of its agent and
@@ -213,10 +245,10 @@ impl App {
     }
 
     /// Merge one daemon [`Event`] into the UI state: `StateChanged`
-    /// updates the matching session's badge state, `permission-request`
-    /// orchestrator notes open the observe-only [`InputMode::Permission`]
-    /// notice, and every event is appended to the log the right pane
-    /// renders.
+    /// updates the matching session's badge state, `PermissionRequest`
+    /// opens the interactive [`InputMode::Permission`] dialog,
+    /// `PermissionResolved` closes the matching one, and every event is
+    /// appended to the log the right pane renders.
     pub fn handle_event(&mut self, ev: Event) {
         if let EventKind::StateChanged { to, .. } = &ev.kind {
             if let Some(view) = self
@@ -227,8 +259,14 @@ impl App {
                 view.session.state = to.clone();
             }
         }
-        if let EventKind::Orchestrator(msg) = &ev.kind {
-            if let Some(payload) = msg.strip_prefix(PERMISSION_PREFIX) {
+        match &ev.kind {
+            EventKind::PermissionRequest {
+                request_id,
+                request,
+            } => {
+                // Stacked requests keep the original interrupted mode —
+                // `resume` of an existing notice wins over the current
+                // (already-Permission) mode.
                 let resume = self
                     .permission
                     .as_ref()
@@ -236,11 +274,29 @@ impl App {
                     .unwrap_or(self.mode);
                 self.permission = Some(PermissionNotice {
                     session_id: ev.session_id,
-                    summary: permission_summary(payload),
+                    request_id: request_id.clone(),
+                    summary: permission_summary(request),
+                    request: request.clone(),
                     resume,
+                    pending: false,
                 });
                 self.mode = InputMode::Permission;
             }
+            EventKind::PermissionResolved {
+                request_id,
+                outcome,
+            } => {
+                // Only a resolution for the *displayed* request dismisses
+                // the dialog; a stacked/unknown one just logs.
+                if let Some(notice) = &self.permission {
+                    if notice.request_id == *request_id {
+                        self.mode = notice.resume;
+                        self.permission = None;
+                        self.set_status(format!("permission {outcome}"));
+                    }
+                }
+            }
+            _ => {}
         }
         // Activity on a non-selected session is unread until viewed;
         // nil-id global notices belong to no session and never mark one.
@@ -481,6 +537,21 @@ impl App {
         self.status = Some(message.into());
     }
 
+    /// The `session/permission` RPC for `request_id` failed: un-pend the
+    /// matching notice (the request is still parked agent-side — the
+    /// overlay must stay up so the user can answer again) and show the
+    /// failure.
+    pub fn permission_answer_failed(&mut self, request_id: &str, error: String) {
+        if let Some(notice) = &mut self.permission {
+            if notice.request_id == request_id {
+                notice.pending = false;
+                self.set_status(format!("permission response failed: {error} — answer again"));
+                return;
+            }
+        }
+        self.set_status(format!("permission response failed: {error}"));
+    }
+
     /// Badge `(glyph, label)` for a session state — the contract between
     /// `handle_event` updates and the session list's rendering.
     /// Readable single glyphs that survive common terminal fonts:
@@ -528,6 +599,10 @@ pub(crate) fn event_summary(ev: &Event) -> String {
         EventKind::StateChanged { from, to } => format!("state {from:?} → {to:?}"),
         EventKind::AgentExited { code } => format!("agent exited (code {code:?})"),
         EventKind::Orchestrator(note) => note.clone(),
+        EventKind::PermissionRequest { request, .. } => {
+            format!("permission requested — {}", permission_summary(request))
+        }
+        EventKind::PermissionResolved { outcome, .. } => format!("permission {outcome}"),
         // `summarize_event` covers FileEdited above.
         EventKind::FileEdited { path } => format!("edited {}", path.display()),
     };
@@ -546,29 +621,19 @@ fn truncate(text: String, max: usize) -> String {
     }
 }
 
-/// Render a `permission-request` payload (`RequestPermissionRequest`
-/// JSON, camelCase) as a one-line notice. Best-effort: an unparseable
-/// payload degrades to a truncated raw dump. `ui` reuses it for the
-/// banner line the same event leaves in the stream.
-pub(crate) fn permission_summary(payload: &str) -> String {
-    let payload = payload.trim();
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
-        return truncate(format!("permission requested: {payload}"), 120);
-    };
-    let title = v
+/// Render a `PermissionRequest` payload (the serialized ACP
+/// `RequestPermissionRequest`, camelCase) as a one-line notice. `ui`
+/// reuses it for the banner line the same event leaves in the stream.
+pub(crate) fn permission_summary(request: &serde_json::Value) -> String {
+    let title = request
         .pointer("/toolCall/title")
-        .or_else(|| v.pointer("/tool_call/title"))
         .and_then(|t| t.as_str());
-    let options: Vec<&str> = v
+    let options: Vec<&str> = request
         .get("options")
         .and_then(|o| o.as_array())
         .map(|opts| {
             opts.iter()
-                .filter_map(|o| {
-                    o.get("name")
-                        .or_else(|| o.get("title"))
-                        .and_then(|n| n.as_str())
-                })
+                .filter_map(|o| o.get("name").and_then(|n| n.as_str()))
                 .collect()
         })
         .unwrap_or_default();
@@ -1036,20 +1101,41 @@ mod tests {
         assert_eq!(app.relay.as_ref().unwrap().event_cursor, 1);
     }
 
-    // --- permission events (Task 14: observe-only) ---------------------------
+    // --- permission events (interactive answers) ------------------------------
 
-    /// Brief test ③: a `permission-request` orchestrator event switches
-    /// the app into the confirm/notice mode.
+    fn perm_request_event(sid: SessionId, request_id: &str, options: serde_json::Value) -> Event {
+        event(
+            sid,
+            EventKind::PermissionRequest {
+                request_id: request_id.to_string(),
+                request: serde_json::json!({
+                    "sessionId": "mock",
+                    "toolCall": {"toolCallId": "tc-1", "title": "Write src/x.rs"},
+                    "options": options,
+                }),
+            },
+        )
+    }
+
+    fn perm_options(kinds: &[(&str, &str)]) -> serde_json::Value {
+        serde_json::json!(kinds
+            .iter()
+            .map(|(name, kind)| serde_json::json!({"name": name, "kind": kind}))
+            .collect::<Vec<_>>())
+    }
+
+    /// Brief test ③: a `PermissionRequest` event switches the app into
+    /// the answer dialog; `y` produces the `session/permission` action
+    /// carrying the request id, and the overlay stays pending until the
+    /// `PermissionResolved` event lands.
     #[test]
-    fn permission_event_switches_to_confirm_mode() {
+    fn permission_event_opens_dialog_and_y_answers_allow_once() {
         let mut app = app_with_sessions(&[SessionState::Prompting]);
         let sid = app.sessions[0].session.id;
-        app.handle_event(event(
+        app.handle_event(perm_request_event(
             sid,
-            EventKind::Orchestrator(
-                r#"permission-request: {"sessionId":"mock","toolCall":{"title":"Write src/x.rs"},"options":[{"name":"reject"},{"name":"allow"}]}"#
-                    .into(),
-            ),
+            "req-1",
+            perm_options(&[("Reject", "reject_once"), ("Allow", "allow_once")]),
         ));
         assert_eq!(app.mode, InputMode::Permission);
         let notice = app.permission.as_ref().expect("permission notice");
@@ -1058,30 +1144,153 @@ mod tests {
             "summary should name the tool call: {}",
             notice.summary
         );
-        assert!(notice.summary.contains("reject"), "options listed");
-        // Any key dismisses; the daemon already auto-denied the request.
-        assert_eq!(app.handle_key(key(KeyCode::Char('y'))), AppAction::None);
+        assert!(notice.summary.contains("Reject"), "options listed");
+        assert!(!notice.allows_always(), "no allow_always was offered");
+
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('y'))),
+            AppAction::RespondPermission {
+                session_id: sid,
+                request_id: "req-1".into(),
+                outcome: PermissionDecision::AllowOnce,
+            }
+        );
+        // The overlay stays up while the RPC is in flight; keys are
+        // ignored so a double press can't race a second answer.
+        assert_eq!(app.mode, InputMode::Permission);
+        assert!(app.permission.as_ref().unwrap().pending);
+        assert_eq!(app.handle_key(key(KeyCode::Char('n'))), AppAction::None);
+
+        // The resolved event dismisses and restores the mode.
+        app.handle_event(event(
+            sid,
+            EventKind::PermissionResolved {
+                request_id: "req-1".into(),
+                outcome: "selected:allow".into(),
+            },
+        ));
         assert_eq!(app.mode, InputMode::Normal);
         assert!(app.permission.is_none());
+        assert!(app.status.as_deref().unwrap().contains("selected:allow"));
     }
 
+    /// `n`/`Esc` reject; `a` answers allow-always only when the agent
+    /// offered that kind.
     #[test]
-    fn permission_dismiss_restores_interrupted_mode() {
+    fn permission_keys_reject_and_gate_allow_always() {
+        let mut app = app_with_sessions(&[SessionState::Prompting]);
+        let sid = app.sessions[0].session.id;
+        app.handle_event(perm_request_event(
+            sid,
+            "req-1",
+            perm_options(&[("Allow", "allow_once"), ("No", "reject_once")]),
+        ));
+        // `a` is a no-op — allow_always wasn't offered.
+        assert_eq!(app.handle_key(key(KeyCode::Char('a'))), AppAction::None);
+        assert!(!app.permission.as_ref().unwrap().pending);
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('n'))),
+            AppAction::RespondPermission {
+                session_id: sid,
+                request_id: "req-1".into(),
+                outcome: PermissionDecision::Reject,
+            }
+        );
+
+        // With allow_always offered, `a` answers it; Esc rejects.
+        let mut app = app_with_sessions(&[SessionState::Prompting]);
+        let sid = app.sessions[0].session.id;
+        app.handle_event(perm_request_event(
+            sid,
+            "req-2",
+            perm_options(&[("Always", "allow_always"), ("No", "reject_once")]),
+        ));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('a'))),
+            AppAction::RespondPermission {
+                session_id: sid,
+                request_id: "req-2".into(),
+                outcome: PermissionDecision::AllowAlways,
+            }
+        );
+
+        let mut app = app_with_sessions(&[SessionState::Prompting]);
+        let sid = app.sessions[0].session.id;
+        app.handle_event(perm_request_event(sid, "req-3", perm_options(&[])));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Esc)),
+            AppAction::RespondPermission {
+                session_id: sid,
+                request_id: "req-3".into(),
+                outcome: PermissionDecision::Reject,
+            }
+        );
+    }
+
+    /// The dialog interrupts whatever mode was active; resolution
+    /// restores it (and a stray resolved for another request_id doesn't
+    /// dismiss anything).
+    #[test]
+    fn permission_resolution_restores_interrupted_mode() {
         let mut app = app_with_sessions(&[SessionState::Ready]);
         app.mode = InputMode::Editing;
         app.input = "keep me".into();
-        app.handle_event(event(
+        app.handle_event(perm_request_event(
             app.sessions[0].session.id,
-            EventKind::Orchestrator("permission-request: {}".into()),
+            "req-1",
+            perm_options(&[]),
         ));
         assert_eq!(app.mode, InputMode::Permission);
-        app.handle_key(key(KeyCode::Esc));
+
+        // A resolved for a different request_id must not dismiss.
+        app.handle_event(event(
+            app.sessions[0].session.id,
+            EventKind::PermissionResolved {
+                request_id: "other".into(),
+                outcome: "cancelled".into(),
+            },
+        ));
+        assert_eq!(app.mode, InputMode::Permission);
+        assert!(app.permission.is_some());
+
+        app.handle_key(key(KeyCode::Char('y'))); // answer → pending
+        app.handle_event(event(
+            app.sessions[0].session.id,
+            EventKind::PermissionResolved {
+                request_id: "req-1".into(),
+                outcome: "selected:allow".into(),
+            },
+        ));
         assert_eq!(
             app.mode,
             InputMode::Editing,
-            "dismissal resumes the interrupted mode"
+            "resolution resumes the interrupted mode"
         );
         assert_eq!(app.input, "keep me", "input buffer survives the dialog");
+    }
+
+    /// A failed `session/permission` call un-pends the overlay so the
+    /// user can answer again.
+    #[test]
+    fn permission_answer_failure_allows_retry() {
+        let mut app = app_with_sessions(&[SessionState::Prompting]);
+        let sid = app.sessions[0].session.id;
+        app.handle_event(perm_request_event(sid, "req-1", perm_options(&[])));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert!(app.permission.as_ref().unwrap().pending);
+
+        app.permission_answer_failed("req-1", "daemon gone".into());
+        assert!(!app.permission.as_ref().unwrap().pending);
+        assert!(app.status.as_deref().unwrap().contains("answer again"));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('n'))),
+            AppAction::RespondPermission {
+                session_id: sid,
+                request_id: "req-1".into(),
+                outcome: PermissionDecision::Reject,
+            },
+            "a retry issues a fresh response"
+        );
     }
 
     // --- new-session wizard (Task 14) -----------------------------------------

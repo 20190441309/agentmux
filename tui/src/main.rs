@@ -23,7 +23,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use agentmux_client::DaemonClient;
-use agentmux_core::{AgentId, Event, SessionId, SessionRef, Workspace};
+use agentmux_core::{AgentId, Event, PermissionDecision, SessionId, SessionRef, Workspace};
 use crossterm::event::{Event as TermEvent, EventStream};
 use futures_util::{Stream, StreamExt};
 use tokio::sync::mpsc;
@@ -43,6 +43,11 @@ enum UiMsg {
         view: Box<SessionView>,
         new_workspace: Option<Workspace>,
     },
+    /// `session/permission` failed — the request is still parked, so
+    /// the overlay must un-pend and let the user answer again. Success
+    /// needs no message: `PermissionResolved` arrives on the event
+    /// stream and dismisses the dialog.
+    PermissionFailed { request_id: String, error: String },
 }
 
 /// A daemon operation the loop can run on a background task.
@@ -67,6 +72,12 @@ enum DaemonCall {
     /// `session/resume` — bring a `Done`/`Error` session back on a fresh
     /// adapter connection.
     Resume { session_id: SessionId },
+    /// `session/permission` — answer a parked permission request.
+    Permission {
+        session_id: SessionId,
+        request_id: String,
+        outcome: PermissionDecision,
+    },
 }
 
 /// Map staged relays onto the wire `SessionRef` shape: the referenced
@@ -294,6 +305,21 @@ fn dispatch(
             }
             None => app.set_status("no session selected"),
         },
+        AppAction::RespondPermission {
+            session_id,
+            request_id,
+            outcome,
+        } => {
+            spawn_call(
+                ui_tx,
+                socket_path,
+                DaemonCall::Permission {
+                    session_id,
+                    request_id,
+                    outcome,
+                },
+            );
+        }
     }
     false
 }
@@ -327,6 +353,20 @@ fn spawn_call(ui_tx: &mpsc::Sender<UiMsg>, socket_path: &Path, call: DaemonCall)
                 DaemonCall::Resume { session_id } => match client.resume(session_id).await {
                     Ok(()) => UiMsg::Status("session resumed".to_string()),
                     Err(e) => UiMsg::Status(format!("resume failed: {e}")),
+                },
+                DaemonCall::Permission {
+                    session_id,
+                    request_id,
+                    outcome,
+                } => match client
+                    .respond_permission(session_id, &request_id, outcome)
+                    .await
+                {
+                    Ok(()) => UiMsg::Status("permission answered".to_string()),
+                    Err(e) => UiMsg::PermissionFailed {
+                        request_id,
+                        error: format!("{e}"),
+                    },
                 },
                 DaemonCall::Create {
                     workspace,
@@ -399,6 +439,9 @@ fn apply_msg(app: &mut App, msg: UiMsg) {
             app.selected = index;
             app.mark_selected_viewed();
             app.set_status("session created");
+        }
+        UiMsg::PermissionFailed { request_id, error } => {
+            app.permission_answer_failed(&request_id, error);
         }
     }
 }

@@ -22,10 +22,13 @@
 //! | RelayPick | `j`/`k`        | move cursor within the stage        |
 //! | RelayPick | `Enter`/`Esc`  | advance stage / abort               |
 //! | NewSession| `j`/`k`/`Enter`/`Esc` | wizard steps (see newsession)  |
-//! | Permission| any            | dismiss (observe-only — the daemon  |
-//! |           |                | already auto-denied the request)    |
+//! | Permission| `y`            | allow once                        |
+//! | Permission| `a`            | allow always (when offered)       |
+//! | Permission| `n`/`Esc`      | reject                            |
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use agentmux_core::PermissionDecision;
 
 use crate::app::{event_summary, App, AppAction, InputMode, RelaySource, RelayStage};
 
@@ -198,17 +201,32 @@ pub(crate) fn relay_pick_key(app: &mut App, key: KeyEvent) -> AppAction {
     AppAction::None
 }
 
-/// Keystroke in [`InputMode::Permission`] — display-only: the daemon
-/// (AcpConn) already auto-denied the ACP `session/request_permission`,
-/// and no permission-response RPC exists in v1. Any key dismisses the
-/// notice and restores the interrupted mode.
-pub(crate) fn permission_key(app: &mut App, _key: KeyEvent) -> AppAction {
-    let resume = app
-        .permission
-        .take()
-        .map(|p| p.resume)
-        .unwrap_or(InputMode::Normal);
-    app.mode = resume;
-    app.set_status("permission request auto-denied by the daemon (v1 is observe-only)");
-    AppAction::None
+/// Keystroke in [`InputMode::Permission`] — answer the parked agent
+/// request: `y` allow-once, `a` allow-always (only when the agent
+/// offered that kind), `n`/`Esc` reject. The key sets `pending` and
+/// returns [`AppAction::RespondPermission`]; the overlay stays up until
+/// the daemon's `PermissionResolved` event (or an RPC error, which
+/// un-pends it for a retry). Keys while pending are ignored so a double
+/// press can't race two answers.
+pub(crate) fn permission_key(app: &mut App, key: KeyEvent) -> AppAction {
+    let Some(notice) = app.permission.as_mut() else {
+        // Mode without state — recover to Normal rather than wedging.
+        app.mode = InputMode::Normal;
+        return AppAction::None;
+    };
+    if notice.pending {
+        return AppAction::None;
+    }
+    let outcome = match key.code {
+        KeyCode::Char('y') => PermissionDecision::AllowOnce,
+        KeyCode::Char('a') if notice.allows_always() => PermissionDecision::AllowAlways,
+        KeyCode::Char('n') | KeyCode::Esc => PermissionDecision::Reject,
+        _ => return AppAction::None,
+    };
+    notice.pending = true;
+    AppAction::RespondPermission {
+        session_id: notice.session_id,
+        request_id: notice.request_id.clone(),
+        outcome,
+    }
 }

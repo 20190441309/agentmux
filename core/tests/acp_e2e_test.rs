@@ -21,6 +21,9 @@
 //! - prompt containing `"crash"` → process exits with code 1
 //! - prompt containing `"exit42"` → process exits with code 42
 //! - prompt containing `"hang"` → never responds (for timeout tests)
+//! - prompt containing `"perm"` → the agent calls
+//!   `session/request_permission` (allow/always/deny options) mid-turn,
+//!   then reports the answer as a `"permission outcome: …"` chunk
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -28,7 +31,7 @@ use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use agentmux_core::{AcpConn, Event, EventKind};
+use agentmux_core::{AcpConn, Event, EventKind, PermissionDecision};
 
 /// Generous deadline for event collection; the mock replies instantly, so
 /// this only bites on regression.
@@ -269,4 +272,164 @@ async fn hang_prompt_never_resolves_but_connection_stays_alive() {
     // The worker dispatches each command on its own task, so a stuck
     // prompt does not wedge the connection.
     conn.shutdown().await.unwrap();
+}
+
+/// The parked prompt future, boxed so it can leave this helper's frame.
+type ParkedPrompt<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = agentmux_core::Result<()>> + 'a>>;
+
+/// Run `conn.prompt` against the `perm` trigger and pull events until the
+/// `PermissionRequest` lands; returns the still-parked prompt future (so
+/// the caller can keep asserting "not done yet") and the request_id.
+async fn park_perm_prompt<'a>(
+    conn: &'a AcpConn,
+    session_id: &'a str,
+    rx: &mut tokio::sync::broadcast::Receiver<Event>,
+) -> (ParkedPrompt<'a>, String) {
+    let mut prompt: ParkedPrompt<'_> =
+        Box::pin(conn.prompt(session_id, "please perm now".to_string()));
+    let request_id = loop {
+        tokio::select! {
+            r = &mut prompt => panic!("prompt finished before its permission was answered: {r:?}"),
+            e = rx.recv() => {
+                if let Ok(Event { kind: EventKind::PermissionRequest { request_id, request }, .. }) = e {
+                    // The raw request is on the wire for the UI: three
+                    // offered options, the tool call, the session id.
+                    assert_eq!(
+                        request["options"].as_array().map(|o| o.len()),
+                        Some(3),
+                        "expected allow/always/deny options: {request}"
+                    );
+                    assert_eq!(
+                        request["toolCall"]["title"],
+                        serde_json::json!("mock edit of src/lib.rs"),
+                        "{request}"
+                    );
+                    break request_id;
+                }
+            }
+        }
+    };
+    (prompt, request_id)
+}
+
+/// Whether `k` is the mock's `"permission outcome: <text>"` chunk.
+fn is_perm_outcome(k: &EventKind, text: &str) -> bool {
+    matches!(k, EventKind::SessionUpdate(v)
+        if v["update"]["sessionUpdate"] == "agent_message_chunk"
+            && v["update"]["content"]["text"] == format!("permission outcome: {text}"))
+}
+
+/// `perm` parks the turn on `session/request_permission`; answering
+/// `allow_once` selects the mock's `allow` option — visible both in the
+/// paired `PermissionResolved` event and the agent's own outcome chunk.
+#[tokio::test]
+async fn perm_prompt_parks_until_allowed() {
+    let (mut conn, dir) = spawn_mock().await;
+    let mut rx = conn.events();
+    conn.initialize().await.unwrap();
+    let session_id = conn.new_session(dir.path()).await.unwrap();
+
+    let (prompt, request_id) = park_perm_prompt(&conn, &session_id, &mut rx).await;
+
+    conn.respond_permission(&request_id, PermissionDecision::AllowOnce)
+        .expect("respond_permission should accept a parked request");
+    prompt.await.expect("the prompt completes once answered");
+
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |k| {
+        is_perm_outcome(k, "selected:allow")
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::PermissionResolved { request_id: r, outcome }
+                if *r == request_id && outcome == "selected:allow"
+        )),
+        "expected a paired PermissionResolved: {events:?}"
+    );
+    conn.shutdown().await.unwrap();
+}
+
+/// `reject` maps onto the mock's `deny` option (kind `reject_once`).
+#[tokio::test]
+async fn perm_prompt_reject_selects_deny() {
+    let (mut conn, dir) = spawn_mock().await;
+    let mut rx = conn.events();
+    conn.initialize().await.unwrap();
+    let session_id = conn.new_session(dir.path()).await.unwrap();
+
+    let (prompt, request_id) = park_perm_prompt(&conn, &session_id, &mut rx).await;
+
+    conn.respond_permission(&request_id, PermissionDecision::Reject)
+        .unwrap();
+    prompt.await.expect("a rejected prompt still completes");
+
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |k| {
+        is_perm_outcome(k, "selected:deny")
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::PermissionResolved { outcome, .. } if outcome == "selected:deny"
+        )),
+        "expected PermissionResolved selected:deny: {events:?}"
+    );
+    conn.shutdown().await.unwrap();
+}
+
+/// `respond_permission` on an unknown request id errors cleanly; a
+/// resolved id errors the same way (the entry was consumed).
+#[tokio::test]
+async fn respond_permission_unknown_or_consumed_id_errors() {
+    let (mut conn, dir) = spawn_mock().await;
+    let mut rx = conn.events();
+    conn.initialize().await.unwrap();
+    let session_id = conn.new_session(dir.path()).await.unwrap();
+
+    let (prompt, request_id) = park_perm_prompt(&conn, &session_id, &mut rx).await;
+    let err = conn
+        .respond_permission("no-such-request", PermissionDecision::AllowOnce)
+        .expect_err("unknown request_id must fail");
+    assert!(err.to_string().contains("no-such-request"), "{err}");
+
+    conn.respond_permission(&request_id, PermissionDecision::Cancel)
+        .unwrap();
+    assert!(
+        conn.respond_permission(&request_id, PermissionDecision::AllowOnce)
+            .is_err(),
+        "an already-answered request_id must fail"
+    );
+    prompt.await.expect("cancel resolves the turn");
+
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |k| {
+        is_perm_outcome(k, "cancelled")
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.kind,
+            EventKind::PermissionResolved { outcome, .. } if outcome == "cancelled"
+        )),
+        "cancel resolves as the cancelled outcome: {events:?}"
+    );
+    conn.shutdown().await.unwrap();
+}
+
+/// Closing the conn mid-parked-request resolves it `cancelled` — the
+/// agent's turn unwinds instead of parking forever.
+#[tokio::test]
+async fn close_cancels_a_parked_permission() {
+    let (conn, dir) = spawn_mock().await;
+    let mut rx = conn.events();
+    conn.initialize().await.unwrap();
+    let session_id = conn.new_session(dir.path()).await.unwrap();
+
+    let (prompt, _request_id) = park_perm_prompt(&conn, &session_id, &mut rx).await;
+    conn.close();
+    // The prompt unwinds one way or another — conn death fails it.
+    let _ = tokio::time::timeout(EVENT_TIMEOUT, prompt)
+        .await
+        .expect("a killed conn must not leave the prompt hanging");
 }

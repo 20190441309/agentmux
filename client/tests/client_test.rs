@@ -530,3 +530,88 @@ async fn is_closed_flips_when_the_peer_drops() {
     let err = client.server_status().await.unwrap_err();
     assert!(matches!(err, ClientError::Transport(_)), "{err}");
 }
+
+/// ⑥ `respond_permission`: the `perm` trigger parks the turn on a
+/// `PermissionRequest` event; a second client connection answers it and
+/// the prompt completes — the typed wrapper round-trips the real RPC.
+#[tokio::test]
+async fn respond_permission_unparks_a_parked_turn() {
+    let td = spawn_daemon(Some(&mock_config()));
+    let mut prompter = DaemonClient::connect_to(&td.sock).await.unwrap();
+    let mut answerer = DaemonClient::connect_to(&td.sock).await.unwrap();
+
+    // The answerer subscribes: it watches for the PermissionRequest.
+    let events = answerer
+        .subscribe_events()
+        .await
+        .expect("subscribe_events should ack");
+    tokio::pin!(events);
+
+    let project = prompter
+        .register_project(td.repo.path(), None)
+        .await
+        .unwrap();
+    let workspace = prompter
+        .create_workspace(project.id, "ws1", Some("main"))
+        .await
+        .unwrap();
+    let session = prompter
+        .create_session(workspace.id, AgentId::new("mock"), None)
+        .await
+        .unwrap();
+
+    // The prompt parks mid-turn; move the client into the task and get
+    // it back when the turn ends.
+    let turn = tokio::spawn(async move {
+        let r = prompter.prompt(session.id, "perm", vec![]).await;
+        (prompter, r)
+    });
+
+    let request_id = loop {
+        let ev = tokio::time::timeout(TIMEOUT, events.next())
+            .await
+            .expect("timed out waiting for PermissionRequest")
+            .expect("event stream ended while the daemon is alive");
+        if let EventKind::PermissionRequest { request_id, .. } = &ev.kind {
+            assert_eq!(ev.session_id, session.id);
+            break request_id.clone();
+        }
+    };
+
+    answerer
+        .respond_permission(session.id, &request_id, agentmux_client::PermissionDecision::AllowOnce)
+        .await
+        .expect("respond_permission should ack");
+
+    let (prompter, result) = turn.await.expect("prompt task panicked");
+    result.expect("prompt should complete once answered");
+
+    // PermissionResolved and the mock's outcome chunk land on the stream.
+    let mut saw_resolved = false;
+    let mut saw_outcome = false;
+    let deadline = Instant::now() + TIMEOUT;
+    while !(saw_resolved && saw_outcome) {
+        let ev = tokio::time::timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            events.next(),
+        )
+        .await
+        .expect("timed out waiting for the resolved events")
+        .expect("event stream ended while the daemon is alive");
+        if ev.session_id != session.id {
+            continue;
+        }
+        saw_resolved |= matches!(
+            &ev.kind,
+            EventKind::PermissionResolved { request_id: r, outcome }
+                if *r == request_id && outcome == "selected:allow"
+        );
+        saw_outcome |= is_chunk(&ev, session.id, "permission outcome: selected:allow");
+    }
+    drop(prompter);
+
+    // The answering connection is still usable afterwards.
+    answerer.shutdown().await.unwrap();
+    let mut td = td;
+    td.wait_exited();
+}

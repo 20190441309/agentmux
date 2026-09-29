@@ -26,9 +26,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{
-    permission_summary, short_id, App, InputMode, RelayStage, SessionView, PERMISSION_PREFIX,
-};
+use crate::app::{permission_summary, short_id, App, InputMode, RelayStage, SessionView};
 use crate::newsession::WizardStep;
 use crate::theme::THEME;
 use ratatui::style::Style;
@@ -478,28 +476,29 @@ fn event_block(ev: &Event) -> EventBlock {
             Span::styled("✗ ", THEME.error),
             Span::styled(format!("agent exited (code {code:?})"), THEME.error),
         ])]),
-        EventKind::Orchestrator(msg) => EventBlock::Static(vec![orchestrator_line(ev, msg)]),
-    }
-}
-
-/// An orchestrator notice: permission requests become warning banners,
-/// everything else a quiet prefixed line.
-fn orchestrator_line(ev: &Event, msg: &str) -> Line<'static> {
-    if let Some(payload) = msg.strip_prefix(PERMISSION_PREFIX) {
-        return Line::from(vec![
+        EventKind::Orchestrator(msg) => EventBlock::Static(vec![Line::from(vec![
             ts_span(ev),
-            Span::styled("⚠ ", THEME.warning),
-            Span::styled(
-                format!("permission requested — {}", permission_summary(payload)),
-                THEME.warning_bold,
-            ),
-        ]);
+            Span::styled("· ", THEME.faint),
+            Span::styled(msg.clone(), THEME.dim_italic),
+        ])]),
+        EventKind::PermissionRequest { request, .. } => EventBlock::Static(vec![Line::from(
+            vec![
+                ts_span(ev),
+                Span::styled("⚠ ", THEME.warning),
+                Span::styled(
+                    format!("permission requested — {}", permission_summary(request)),
+                    THEME.warning_bold,
+                ),
+            ],
+        )]),
+        EventKind::PermissionResolved { outcome, .. } => EventBlock::Static(vec![Line::from(
+            vec![
+                ts_span(ev),
+                Span::styled("⚠ ", THEME.faint),
+                Span::styled(format!("permission {outcome}"), THEME.dim),
+            ],
+        )]),
     }
-    Line::from(vec![
-        ts_span(ev),
-        Span::styled("· ", THEME.faint),
-        Span::styled(msg.to_string(), THEME.dim_italic),
-    ])
 }
 
 /// `session/update` payloads → blocks: message chunks stay `Msg` for
@@ -1100,27 +1099,42 @@ fn draw_wizard(frame: &mut Frame, app: &App) {
     frame.render_stateful_widget(list, rect, &mut state);
 }
 
-/// The permission notice overlay. `AcpConn` answers
-/// `session/request_permission` itself (deny-by-default) before the
-/// event reaches the TUI and no permission-response RPC exists, so this
-/// is strictly observe-only — any key dismisses it.
+/// The permission dialog: the agent's request is parked daemon-side —
+/// `y`/`a`/`n`/`Esc` send `session/permission`. While the answer is in
+/// flight (`pending`) the dialog stays up with an "answering…" row and
+/// keys are ignored; the `PermissionResolved` event dismisses it.
 fn draw_permission(frame: &mut Frame, app: &App) {
     let Some(notice) = &app.permission else {
         return;
     };
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::styled("⚠ ", THEME.warning),
             Span::styled(notice.summary.clone(), THEME.warning_bold),
         ]),
         Line::default(),
-        Line::from(Span::styled(
-            "the daemon auto-denied this request (v1 is observe-only)",
-            THEME.dim,
-        )),
-        Line::from(Span::styled("press any key to dismiss", THEME.faint)),
     ];
-    let rect = centered(frame.area(), 60, 7);
+    if notice.pending {
+        lines.push(Line::from(Span::styled(
+            "  answering…",
+            THEME.dim_italic,
+        )));
+    } else {
+        let mut hints = vec![
+            Span::styled("  y", THEME.warning_bold),
+            Span::styled(" allow once", THEME.dim),
+        ];
+        if notice.allows_always() {
+            hints.push(Span::styled(" · ", THEME.faint));
+            hints.push(Span::styled("a", THEME.warning_bold));
+            hints.push(Span::styled(" always", THEME.dim));
+        }
+        hints.push(Span::styled(" · ", THEME.faint));
+        hints.push(Span::styled("n/esc", THEME.warning_bold));
+        hints.push(Span::styled(" reject", THEME.dim));
+        lines.push(Line::from(hints));
+    }
+    let rect = centered(frame.area(), 60, lines.len() as u16 + 2);
     draw_backdrop(frame);
     frame.render_widget(Clear, rect);
     let block = pane(Line::from(Span::styled(
@@ -1181,7 +1195,11 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             _ => "j/k pick target · enter relay · esc abort",
         },
         InputMode::NewSession => "enter select · esc back",
-        InputMode::Permission => "auto-denied by the daemon · any key dismisses",
+        InputMode::Permission => match app.permission.as_ref() {
+            Some(n) if n.pending => "answering…",
+            Some(n) if n.allows_always() => "y allow once · a always · n/esc reject",
+            _ => "y allow once · n/esc reject",
+        },
     };
 
     let mut spans = vec![
@@ -1598,14 +1616,17 @@ mod tests {
         assert!(text.contains("ready → prompting"), "{text}");
     }
 
-    /// A permission-request orchestrator note becomes a warning banner,
-    /// not raw JSON.
+    /// A `PermissionRequest` event becomes a warning banner in the
+    /// stream — not raw JSON.
     #[test]
     fn permission_event_renders_warning_banner() {
-        let app = app_with_events(vec![EventKind::Orchestrator(
-            r#"permission-request: {"toolCall":{"title":"Write src/x.rs"},"options":[{"name":"reject"}]}"#
-                .into(),
-        )]);
+        let app = app_with_events(vec![EventKind::PermissionRequest {
+            request_id: "req-1".into(),
+            request: serde_json::json!({
+                "toolCall": {"title": "Write src/x.rs"},
+                "options": [{"name": "reject"}],
+            }),
+        }]);
         let backend = TestBackend::new(100, 24);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
@@ -1675,13 +1696,26 @@ mod tests {
         assert!(text.contains("smoke"), "{text}");
     }
 
+    /// The permission dialog is interactive: it names the tool call and
+    /// shows the answer keys. While the `session/permission` call is in
+    /// flight it swaps the hints for "answering…" and stays up.
     #[test]
-    fn permission_overlay_renders_observe_only_notice() {
+    fn permission_overlay_renders_interactive_dialog() {
         let mut app = app_with_events(vec![]);
         app.permission = Some(PermissionNotice {
             session_id: SessionId(uuid::Uuid::nil()),
+            request_id: "req-1".into(),
             summary: "agent asks: Write src/x.rs (options: allow, reject)".into(),
+            request: serde_json::json!({
+                "toolCall": {"title": "Write src/x.rs"},
+                "options": [
+                    {"name": "allow", "kind": "allow_once"},
+                    {"name": "always", "kind": "allow_always"},
+                    {"name": "reject", "kind": "reject_once"},
+                ],
+            }),
             resume: InputMode::Normal,
+            pending: false,
         });
         app.mode = InputMode::Permission;
         let backend = TestBackend::new(80, 24);
@@ -1690,7 +1724,16 @@ mod tests {
         let text = buffer_text(terminal.backend());
         assert!(text.contains("permission requested"), "{text}");
         assert!(text.contains("Write src/x.rs"), "{text}");
-        assert!(text.contains("auto-denied"), "{text}");
+        assert!(text.contains("allow once"), "{text}");
+        assert!(text.contains("always"), "{text}");
+        assert!(text.contains("reject"), "{text}");
+
+        // In-flight answer: hints swap to "answering…".
+        app.permission.as_mut().unwrap().pending = true;
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend());
+        assert!(text.contains("answering"), "{text}");
+        assert!(!text.contains("allow once"), "{text}");
     }
 
     #[test]
@@ -1913,7 +1956,13 @@ mod tests {
                 "content": [{"type": "diff", "path": "tui/src/theme.rs",
                     "oldText": "const FG: u8 = 1;", "newText": "const FG: u8 = 2;"}]
             })),
-            EventKind::Orchestrator("permission-request: {\"toolCall\":{\"title\":\"Write src/x.rs\"},\"options\":[{\"name\":\"reject\"}]}".into()),
+            EventKind::PermissionRequest {
+                request_id: "req-1".into(),
+                request: serde_json::json!({
+                    "toolCall": {"title": "Write src/x.rs"},
+                    "options": [{"name": "reject"}],
+                }),
+            },
             EventKind::Orchestrator("event stream lagged, skipped 3".into()),
         ];
         for (seq, kind) in kinds.into_iter().enumerate() {
