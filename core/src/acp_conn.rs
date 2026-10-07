@@ -28,8 +28,13 @@
 use std::{
     collections::{BTreeMap, HashMap},
     path::{Component, Path, PathBuf},
+    pin::Pin,
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    task::{Context, Poll},
     thread::JoinHandle,
     time::Duration,
 };
@@ -37,7 +42,8 @@ use std::{
 use agent_client_protocol::{self as acp, Agent as _};
 use anyhow::anyhow;
 use chrono::Utc;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::io::{AsyncRead, ReadBuf};
+use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
@@ -618,12 +624,14 @@ fn actor_main(
         // the `session/new` cwd once a session exists.
         let session_cwd = Arc::new(Mutex::new(spec.cwd.clone()));
 
+        let order = Arc::new(NotificationOrder::default());
         let handler = AcpClientHandler {
             session_id,
             cwd: session_cwd.clone(),
             event_tx: event_tx.clone(),
             pending,
             commands,
+            order: order.clone(),
         };
 
         // The returned io future and the `spawn` callback are `!Send`; both
@@ -631,7 +639,12 @@ fn actor_main(
         let (conn, io_task) = acp::ClientSideConnection::new(
             handler,
             child_stdin.compat_write(),
-            child_stdout.compat(),
+            StdoutTap {
+                inner: child_stdout,
+                line: Vec::new(),
+                order: order.clone(),
+            }
+            .compat(),
             |fut| {
                 tokio::task::spawn_local(fut);
             },
@@ -700,7 +713,12 @@ fn actor_main(
                 // `Shutdown`, and so a dropped `AcpConn` cannot strand the
                 // loop inside one RPC.
                 cmd => {
-                    tokio::task::spawn_local(handle_cmd(conn.clone(), session_cwd.clone(), cmd));
+                    tokio::task::spawn_local(handle_cmd(
+                        conn.clone(),
+                        session_cwd.clone(),
+                        order.clone(),
+                        cmd,
+                    ));
                 }
             }
         }
@@ -718,6 +736,7 @@ fn log_noop_wait_error(_e: &std::io::Error) {
 async fn handle_cmd(
     conn: Rc<acp::ClientSideConnection>,
     session_cwd: Arc<Mutex<PathBuf>>,
+    order: Arc<NotificationOrder>,
     cmd: Cmd,
 ) {
     match cmd {
@@ -766,6 +785,11 @@ async fn handle_cmd(
                 .await
                 .map(|_| ())
                 .map_err(|e| anyhow!("acp session/load failed: {e}"));
+            // The replay must reach the event channel before the caller
+            // resumes and drains it (see `NotificationOrder`).
+            if result.is_ok() {
+                order.settle().await;
+            }
             let _ = reply.send(result);
         }
         Cmd::Prompt {
@@ -809,6 +833,104 @@ struct AcpClientHandler {
     /// (so a timed-out request can never be answered into a void).
     pending: PendingPermissions,
     commands: CommandCatalog,
+    order: Arc<NotificationOrder>,
+}
+
+/// How long `session/load` waits for its replayed notifications to be
+/// handled before replying anyway.
+const REPLAY_SETTLE: Duration = Duration::from_secs(2);
+
+/// Arrival order of `session/update` notifications vs. responses.
+///
+/// The ACP crate resolves a response inside its io task, but hands each
+/// notification to a separately spawned handler task — so a request's
+/// caller can resume before notifications the agent sent *earlier* were
+/// handled. `session/load` relies on the agent's replay landing before
+/// the reply (the orchestrator drops replayed transcript); [`StdoutTap`]
+/// counts notifications in true arrival order and records the count at
+/// each response, and the handler counts what it has emitted, so the load
+/// can wait exactly for the replay it was sent.
+#[derive(Default)]
+struct NotificationOrder {
+    /// `session/update` notifications read from the agent's stdout.
+    read: AtomicU64,
+    /// `read` as of the most recent response line.
+    at_response: AtomicU64,
+    /// Notifications the handler has emitted.
+    handled: AtomicU64,
+    progress: Notify,
+}
+
+impl NotificationOrder {
+    /// Wait until every notification that preceded the latest response
+    /// has been handled (bounded by [`REPLAY_SETTLE`]).
+    async fn settle(&self) {
+        let target = self.at_response.load(Ordering::SeqCst);
+        let wait = async {
+            loop {
+                let progress = self.progress.notified();
+                tokio::pin!(progress);
+                progress.as_mut().enable();
+                if self.handled.load(Ordering::SeqCst) >= target {
+                    return;
+                }
+                progress.await;
+            }
+        };
+        let _ = tokio::time::timeout(REPLAY_SETTLE, wait).await;
+    }
+
+    /// Classify one complete JSON-RPC line read from the agent.
+    fn observe(&self, line: &[u8]) {
+        #[derive(serde::Deserialize)]
+        struct Peek<'a> {
+            id: Option<serde::de::IgnoredAny>,
+            #[serde(borrow)]
+            method: Option<std::borrow::Cow<'a, str>>,
+        }
+        let Ok(peek) = serde_json::from_slice::<Peek<'_>>(line) else {
+            return;
+        };
+        match (peek.id.is_some(), peek.method.as_deref()) {
+            (false, Some("session/update")) => {
+                self.read.fetch_add(1, Ordering::SeqCst);
+            }
+            (true, None) => self
+                .at_response
+                .store(self.read.load(Ordering::SeqCst), Ordering::SeqCst),
+            _ => {}
+        }
+    }
+}
+
+/// The agent's stdout as the ACP io task reads it, with every complete
+/// line also classified by [`NotificationOrder::observe`].
+struct StdoutTap<R> {
+    inner: R,
+    line: Vec<u8>,
+    order: Arc<NotificationOrder>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for StdoutTap<R> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &result {
+            for chunk in buf.filled()[before..].split_inclusive(|&b| b == b'\n') {
+                this.line.extend_from_slice(chunk);
+                if chunk.ends_with(b"\n") {
+                    this.order.observe(&this.line);
+                    this.line.clear();
+                }
+            }
+        }
+        result
+    }
 }
 
 impl AcpClientHandler {
@@ -964,6 +1086,8 @@ impl acp::Client for AcpClientHandler {
             self.session_id,
             EventKind::SessionUpdate(payload),
         );
+        self.order.handled.fetch_add(1, Ordering::SeqCst);
+        self.order.progress.notify_waiters();
         Ok(())
     }
 
@@ -1065,6 +1189,7 @@ mod tests {
                 event_tx,
                 pending: pending.clone(),
                 commands: Arc::new(Mutex::new(None)),
+                order: Arc::default(),
             },
             rx,
             pending,
@@ -1104,6 +1229,63 @@ mod tests {
         assert!(h.resolve_in_cwd(Path::new("new.txt")).is_ok());
         // Lexical `..` escape is refused.
         assert!(h.resolve_in_cwd(Path::new("../outside.txt")).is_err());
+    }
+
+    /// Lines are classified in arrival order even when a read splits
+    /// them: notifications count, responses snapshot the count.
+    #[tokio::test]
+    async fn stdout_tap_counts_notifications_before_each_response() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let order = Arc::new(NotificationOrder::default());
+        let (mut agent, stdout) = tokio::io::duplex(16);
+        let mut tap = StdoutTap {
+            inner: stdout,
+            line: Vec::new(),
+            order: order.clone(),
+        };
+        let writer = tokio::spawn(async move {
+            let replay = r#"{"jsonrpc":"2.0","method":"session/update","params":{"x":1}}"#;
+            for _ in 0..3 {
+                agent.write_all(replay.as_bytes()).await.unwrap();
+                agent.write_all(b"\n").await.unwrap();
+            }
+            agent
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":null}\n")
+                .await
+                .unwrap();
+            agent
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\"}\n")
+                .await
+                .unwrap();
+        });
+        let mut sink = Vec::new();
+        tap.read_to_end(&mut sink).await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(order.read.load(Ordering::SeqCst), 4);
+        assert_eq!(order.at_response.load(Ordering::SeqCst), 3);
+    }
+
+    /// `settle` returns once exactly the notifications that preceded the
+    /// response have been handled.
+    #[tokio::test]
+    async fn settle_waits_for_notifications_received_before_the_response() {
+        let order = Arc::new(NotificationOrder::default());
+        order.at_response.store(2, Ordering::SeqCst);
+        let handler = order.clone();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                tokio::task::yield_now().await;
+                handler.handled.fetch_add(1, Ordering::SeqCst);
+                handler.progress.notify_waiters();
+            }
+        });
+        let start = std::time::Instant::now();
+        order.settle().await;
+        assert_eq!(order.handled.load(Ordering::SeqCst), 2);
+        assert!(
+            start.elapsed() < REPLAY_SETTLE,
+            "settled by progress, not timeout"
+        );
     }
 
     /// A session cwd reached through a symlinked directory still reports
