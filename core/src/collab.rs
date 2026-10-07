@@ -12,13 +12,16 @@
 //! that the orchestrator can prepend to a sibling session's prompt so the
 //! agents can coordinate instead of stepping on each other's files.
 
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use chrono::Utc;
 
+use crate::id::SessionId;
 use crate::model::EventKind;
 use crate::Result;
 
@@ -203,6 +206,111 @@ fn summarize_pi_tool_update(update: &serde_json::Value) -> Option<String> {
     })
 }
 
+/// The file an event says was changed, as written by the agent: a
+/// `FileEdited`, an ACP `tool_call` of kind edit/delete/move with a
+/// location, or a pi file-editing tool record that did not fail.
+pub fn edited_path(kind: &EventKind) -> Option<PathBuf> {
+    match kind {
+        EventKind::FileEdited { path } => Some(path.clone()),
+        EventKind::SessionUpdate(update) => {
+            let update = update.get("update").unwrap_or(update);
+            if update.get("sessionUpdate").and_then(|u| u.as_str()) == Some("tool_call") {
+                let kind = update.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                if !matches!(kind, "edit" | "delete" | "move") {
+                    return None;
+                }
+                return update
+                    .get("locations")
+                    .and_then(|l| l.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|loc| loc.get("path"))
+                    .and_then(|p| p.as_str())
+                    .map(PathBuf::from);
+            }
+            use crate::pi_shape as ps;
+            let name = ps::tool_name(update)?;
+            (ps::tool_edits_file(name) && !ps::tool_end_failed(update))
+                .then(|| ps::tool_path(update).map(PathBuf::from))
+                .flatten()
+        }
+        _ => None,
+    }
+}
+
+/// How long an edit counts as "recent" for overlap notices.
+pub const OVERLAP_WINDOW: Duration = Duration::from_secs(15 * 60);
+
+/// Recent file edits per session within one shared worktree, to notice
+/// when two agents change the same file close together. This is a soft
+/// activity signal — not a lock, and not proof of a conflict (sequential
+/// hand-offs overlap too). In memory only: it covers this daemon's run.
+#[derive(Default)]
+pub struct OverlapTracker {
+    /// path → (session, agent name, last edit) for each editor.
+    edits: HashMap<PathBuf, Vec<(SessionId, String, Instant)>>,
+    /// (editor, path, other) → when the editor was last told about other.
+    notified: HashMap<(SessionId, PathBuf, SessionId), Instant>,
+}
+
+impl OverlapTracker {
+    /// Record that `session` (`agent`) edited `path` at `now`. Returns the
+    /// other sessions that also edited it within [`OVERLAP_WINDOW`] and
+    /// that `session` has not yet been told about since their last edit.
+    pub fn record(
+        &mut self,
+        session: SessionId,
+        agent: &str,
+        path: PathBuf,
+        now: Instant,
+    ) -> Vec<SessionId> {
+        let editors = self.edits.entry(path.clone()).or_default();
+        editors.retain(|(_, _, at)| now.duration_since(*at) < OVERLAP_WINDOW);
+        let mut fresh = vec![];
+        for (other, _, at) in editors.iter() {
+            if *other == session {
+                continue;
+            }
+            let key = (session, path.clone(), *other);
+            if self.notified.get(&key).is_none_or(|told| told < at) {
+                self.notified.insert(key, now);
+                fresh.push(*other);
+            }
+        }
+        editors.retain(|(id, _, _)| *id != session);
+        editors.push((session, agent.to_string(), now));
+        fresh
+    }
+
+    /// Files edited by two or more sessions within [`OVERLAP_WINDOW`]:
+    /// `path — agent, agent` lines, sorted by path.
+    pub fn summary(&self, now: Instant) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .edits
+            .iter()
+            .filter_map(|(path, editors)| {
+                let recent: Vec<&str> = editors
+                    .iter()
+                    .filter(|(_, _, at)| now.duration_since(*at) < OVERLAP_WINDOW)
+                    .map(|(_, agent, _)| agent.as_str())
+                    .collect();
+                (recent.len() >= 2).then(|| format!("- {} — {}", path.display(), recent.join(", ")))
+            })
+            .collect();
+        lines.sort();
+        lines
+    }
+
+    /// Drop a session's edits (it was removed).
+    pub fn forget(&mut self, session: SessionId) {
+        for editors in self.edits.values_mut() {
+            editors.retain(|(id, _, _)| *id != session);
+        }
+        self.edits.retain(|_, editors| !editors.is_empty());
+        self.notified
+            .retain(|(editor, _, other), _| *editor != session && *other != session);
+    }
+}
+
 /// Build the shared-context preamble injected into a sibling session's
 /// prompt, or `None` when there is nothing to share.
 ///
@@ -214,6 +322,7 @@ fn summarize_pi_tool_update(update: &serde_json::Value) -> Option<String> {
 pub fn shared_context_preamble(
     worktree_path: &Path,
     session_count: usize,
+    overlaps: &[String],
 ) -> Result<Option<String>> {
     if session_count < 2 {
         return Ok(None);
@@ -223,7 +332,7 @@ pub fn shared_context_preamble(
     let context = read_or_empty(&shared.join("context.md"))?;
     let activity = read_or_empty(&shared.join("activity.md"))?;
 
-    if context.trim().is_empty() && activity.trim().is_empty() {
+    if context.trim().is_empty() && activity.trim().is_empty() && overlaps.is_empty() {
         return Ok(None);
     }
 
@@ -241,6 +350,17 @@ pub fn shared_context_preamble(
     } else {
         tail
     };
+    let overlap_section = if overlaps.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n## Files several agents edited in the last {} minutes\n{}\n\
+             Re-read these files before changing them; another agent's edits \
+             may be newer than what you last saw.\n",
+            OVERLAP_WINDOW.as_secs() / 60,
+            overlaps.join("\n")
+        )
+    };
 
     Ok(Some(format!(
         "You are working in a shared workspace with other agents. \
@@ -253,6 +373,7 @@ pub fn shared_context_preamble(
          \n\
          ## .agentmux/activity.md (last {ACTIVITY_TAIL} entries)\n\
          {activity_section}\n\
+         {overlap_section}\
          \n\
          Coordinate through this blackboard: keep context.md updated with \
          the files you are working on, append your changes to activity.md, \

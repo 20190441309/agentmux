@@ -5,7 +5,8 @@
 use std::path::PathBuf;
 
 use agentmux_core::collab::{
-    append_activity, init_shared_dir, shared_context_preamble, summarize_event,
+    append_activity, edited_path, init_shared_dir, shared_context_preamble, summarize_event,
+    OverlapTracker, OVERLAP_WINDOW,
 };
 use agentmux_core::model::{EventKind, SessionState};
 use tempfile::TempDir;
@@ -194,24 +195,24 @@ fn preamble_is_none_for_a_lone_session() {
     append_activity(dir.path(), "alice", "edited src/a.rs").unwrap();
 
     assert_eq!(
-        shared_context_preamble(dir.path(), 1).unwrap(),
+        shared_context_preamble(dir.path(), 1, &[]).unwrap(),
         None,
         "a single session never needs the shared preamble"
     );
-    assert_eq!(shared_context_preamble(dir.path(), 0).unwrap(), None);
+    assert_eq!(shared_context_preamble(dir.path(), 0, &[]).unwrap(), None);
 }
 
 #[test]
 fn preamble_is_none_when_the_blackboard_has_no_content() {
     // No .agentmux dir at all → nothing to inject.
     let bare = tempfile::tempdir().unwrap();
-    assert_eq!(shared_context_preamble(bare.path(), 3).unwrap(), None);
+    assert_eq!(shared_context_preamble(bare.path(), 3, &[]).unwrap(), None);
 
     // .agentmux exists but both files are blank → still nothing to say.
     let dir = tempfile::tempdir().unwrap();
     init_shared_dir(dir.path()).unwrap();
     std::fs::write(dir.path().join(".agentmux/context.md"), "  \n").unwrap();
-    assert_eq!(shared_context_preamble(dir.path(), 2).unwrap(), None);
+    assert_eq!(shared_context_preamble(dir.path(), 2, &[]).unwrap(), None);
 }
 
 #[test]
@@ -226,7 +227,7 @@ fn preamble_includes_context_activity_and_instructions() {
     append_activity(dir.path(), "alice", "edited src/a.rs").unwrap();
     append_activity(dir.path(), "bob", "edited src/b.rs").unwrap();
 
-    let preamble = shared_context_preamble(dir.path(), 2)
+    let preamble = shared_context_preamble(dir.path(), 2, &[])
         .unwrap()
         .expect("content + 2 sessions should yield a preamble");
 
@@ -257,7 +258,9 @@ fn preamble_keeps_only_the_last_20_activity_lines() {
         append_activity(dir.path(), "a", &format!("line {i}")).unwrap();
     }
 
-    let preamble = shared_context_preamble(dir.path(), 2).unwrap().unwrap();
+    let preamble = shared_context_preamble(dir.path(), 2, &[])
+        .unwrap()
+        .unwrap();
     assert!(preamble.contains("a: line 24"));
     assert!(preamble.contains("a: line 5"), "20 lines means 5..=24");
     assert!(
@@ -303,4 +306,78 @@ fn shared_dir_is_excluded_from_git_status_once() {
 
     let exclude = std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
     assert_eq!(exclude.matches("/.agentmux/").count(), 1, "{exclude}");
+}
+
+/// Edits of one file by two sessions inside the window are reported to
+/// the later editor once per new edit by the other — never to themselves,
+/// never after the window.
+#[test]
+fn overlap_tracker_reports_each_new_overlap_once() {
+    use agentmux_core::SessionId;
+    use std::time::{Duration, Instant};
+    let (a, b) = (SessionId::new(), SessionId::new());
+    let path = std::path::PathBuf::from("src/lib.rs");
+    let t0 = Instant::now();
+    let mut tracker = OverlapTracker::default();
+    assert!(tracker.record(a, "Pi (a)", path.clone(), t0).is_empty());
+    assert!(tracker.record(a, "Pi (a)", path.clone(), t0).is_empty());
+    let t1 = t0 + Duration::from_secs(60);
+    assert_eq!(tracker.record(b, "Codex (b)", path.clone(), t1), vec![a]);
+    // B keeps editing: no repeat until A edits again.
+    let t2 = t1 + Duration::from_secs(1);
+    assert!(tracker.record(b, "Codex (b)", path.clone(), t2).is_empty());
+    let t3 = t2 + Duration::from_secs(1);
+    assert_eq!(tracker.record(a, "Pi (a)", path.clone(), t3), vec![b]);
+    let t4 = t3 + Duration::from_secs(1);
+    assert_eq!(tracker.record(b, "Codex (b)", path.clone(), t4), vec![a]);
+    assert_eq!(
+        tracker.summary(t4),
+        vec!["- src/lib.rs — Pi (a), Codex (b)".to_string()]
+    );
+    // Other files and expired edits do not overlap.
+    assert!(tracker
+        .record(b, "Codex (b)", "src/other.rs".into(), t4)
+        .is_empty());
+    let late = t4 + OVERLAP_WINDOW;
+    assert!(tracker.summary(late).is_empty());
+    assert!(tracker.record(a, "Pi (a)", path.clone(), late).is_empty());
+    tracker.forget(a);
+    assert!(tracker.record(b, "Codex (b)", path, late).is_empty());
+}
+
+#[test]
+fn edited_path_covers_file_edits_and_edit_tool_calls_only() {
+    assert_eq!(
+        edited_path(&EventKind::FileEdited {
+            path: "a.rs".into()
+        }),
+        Some("a.rs".into())
+    );
+    let tool = |kind: &str| {
+        EventKind::SessionUpdate(serde_json::json!({"update": {
+            "sessionUpdate": "tool_call", "kind": kind,
+            "locations": [{"path": "/w/src/b.rs"}]
+        }}))
+    };
+    assert_eq!(edited_path(&tool("edit")), Some("/w/src/b.rs".into()));
+    assert_eq!(edited_path(&tool("read")), None);
+    assert_eq!(edited_path(&EventKind::Orchestrator("edit".into())), None);
+}
+
+#[test]
+fn preamble_lists_overlapping_files() {
+    let dir = TempDir::new().unwrap();
+    let overlaps = vec!["- src/lib.rs — Pi (a), Codex (b)".to_string()];
+    let preamble = shared_context_preamble(dir.path(), 2, &overlaps)
+        .unwrap()
+        .expect("overlaps alone are worth sharing");
+    assert!(
+        preamble.contains("Files several agents edited"),
+        "{preamble}"
+    );
+    assert!(preamble.contains("- src/lib.rs — Pi (a), Codex (b)"));
+    assert_eq!(
+        shared_context_preamble(dir.path(), 1, &overlaps).unwrap(),
+        None
+    );
 }

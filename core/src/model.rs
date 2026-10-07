@@ -190,6 +190,13 @@ pub enum EventKind {
     /// A message produced by the orchestrator itself (lifecycle notes,
     /// internal errors, ...).
     Orchestrator(String),
+    /// This session edited `path`, which `others` (sessions in the same
+    /// workspace) also edited recently. A soft activity notice — not a
+    /// lock and not a proven conflict.
+    FileOverlap {
+        path: PathBuf,
+        others: Vec<SessionId>,
+    },
 }
 
 /// One entry in a session's ordered, persistent event log.

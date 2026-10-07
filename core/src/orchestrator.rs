@@ -202,6 +202,9 @@ struct EventSink {
     /// session. Entries persist for the orchestrator's lifetime so `seq`
     /// keeps increasing across `kill`/`resume`.
     seqs: Arc<Mutex<HashMap<SessionId, u64>>>,
+    /// Recent file edits per worktree, for overlap notices and the
+    /// shared-context preamble.
+    overlaps: Arc<Mutex<HashMap<PathBuf, collab::OverlapTracker>>>,
 }
 
 impl EventSink {
@@ -706,6 +709,7 @@ impl Orchestrator {
                 store: Arc::new(Mutex::new(store)),
                 bus,
                 seqs: Arc::new(Mutex::new(HashMap::new())),
+                overlaps: Arc::default(),
             },
             registry: Mutex::new(registry),
             sessions: Mutex::new(HashMap::new()),
@@ -1701,8 +1705,18 @@ impl Orchestrator {
             (workspace.worktree_path, count)
         };
 
+        let overlaps = self
+            .sink
+            .overlaps
+            .lock()
+            .unwrap()
+            .get(&worktree_path)
+            .map(|tracker| tracker.summary(std::time::Instant::now()))
+            .unwrap_or_default();
         let mut out = String::new();
-        if let Some(preamble) = collab::shared_context_preamble(&worktree_path, session_count)? {
+        if let Some(preamble) =
+            collab::shared_context_preamble(&worktree_path, session_count, &overlaps)?
+        {
             out.push_str(&preamble);
             out.push_str("\n\n");
         }
@@ -2034,6 +2048,26 @@ fn spawn_fanout(
                     if let Some(summary) = collab::summarize_event(&ev.kind) {
                         let _ = collab::append_activity(&worktree_path, &agent_name, &summary);
                     }
+                    if let Some(path) = collab::edited_path(&ev.kind) {
+                        // Compare workspace-relative paths whichever form
+                        // the agent reported.
+                        let path = path
+                            .strip_prefix(&worktree_path)
+                            .map(Path::to_path_buf)
+                            .unwrap_or(path);
+                        let id = session_id.to_string();
+                        let editor = format!("{agent_name} ({})", &id[..8.min(id.len())]);
+                        let others = sink
+                            .overlaps
+                            .lock()
+                            .unwrap()
+                            .entry(worktree_path.clone())
+                            .or_default()
+                            .record(session_id, &editor, path.clone(), std::time::Instant::now());
+                        if !others.is_empty() {
+                            sink.emit(session_id, EventKind::FileOverlap { path, others });
+                        }
+                    }
                     if exited {
                         let _ = sink.transition(
                             session_id,
@@ -2071,7 +2105,9 @@ fn describe_event(ev: &Event) -> Option<String> {
         return Some(summary);
     }
     match &ev.kind {
-        EventKind::ConversationStarted | EventKind::TitleChanged { .. } => None,
+        EventKind::ConversationStarted
+        | EventKind::TitleChanged { .. }
+        | EventKind::FileOverlap { .. } => None,
         EventKind::SessionUpdate(v) => {
             // Unwrap the `{"sessionId", "update"}` notification envelope.
             let update = v.get("update").unwrap_or(v);
@@ -2117,6 +2153,7 @@ mod tests {
             store: Arc::new(Mutex::new(Store::open(data_dir).unwrap())),
             bus,
             seqs: Arc::new(Mutex::new(HashMap::new())),
+            overlaps: Arc::default(),
         }
     }
 

@@ -952,6 +952,11 @@ pub(crate) fn event_summary(ev: &Event) -> String {
         EventKind::PermissionResolved { outcome, .. } => format!("permission {outcome}"),
         // `summarize_event` covers FileEdited above.
         EventKind::FileEdited { path } => format!("edited {}", path.display()),
+        EventKind::FileOverlap { path, others } => format!(
+            "{} also edited by {} other agent(s)",
+            path.display(),
+            others.len()
+        ),
     };
     truncate(text, 80)
 }

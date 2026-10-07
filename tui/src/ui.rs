@@ -958,6 +958,14 @@ fn full_prose(text: &str, style: Style, width: usize) -> Vec<Line<'static>> {
 }
 
 fn display_block(ev: &Event, app: &App, width: usize) -> EventBlock {
+    if let EventKind::FileOverlap { path, others } = &ev.kind {
+        let who = others
+            .iter()
+            .map(|id| app.agent_instance(*id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return EventBlock::Static(vec![overlap_line(ev, path, who)]);
+    }
     if let Some((id, end)) = app
         .wb
         .reasoning
@@ -1194,7 +1202,23 @@ fn event_block(ev: &Event) -> EventBlock {
                 Span::styled(format!("permission {outcome}"), THEME.dim),
             ])])
         }
+        // Names need the session list; `display_block` renders the full line.
+        EventKind::FileOverlap { path, others } => {
+            EventBlock::Static(vec![overlap_line(ev, path, others.len().to_string())])
+        }
     }
+}
+
+/// `⚠ src/lib.rs was also edited recently by Codex #2` — a soft notice,
+/// deliberately not called a conflict.
+fn overlap_line(ev: &Event, path: &std::path::Path, who: String) -> Line<'static> {
+    Line::from(vec![
+        ts_span(ev),
+        Span::styled("⚠ ", THEME.warning),
+        Span::styled(path.display().to_string(), THEME.text),
+        Span::styled(" was also edited recently by ", THEME.dim),
+        Span::styled(who, THEME.warning),
+    ])
 }
 
 /// `session/update` payloads → blocks: message chunks stay `Msg` for
@@ -2404,6 +2428,22 @@ mod tests {
     }
 
     // --- structured event rendering --------------------------------------
+
+    #[test]
+    fn file_overlap_renders_as_a_soft_notice_with_agent_names() {
+        let app = app_with_events(vec![EventKind::FileOverlap {
+            path: "src/lib.rs".into(),
+            others: vec![agentmux_core::SessionId::new()],
+        }]);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = buffer_text(terminal.backend());
+        assert!(
+            text.contains("⚠ src/lib.rs was also edited recently by Agent #1"),
+            "{text}"
+        );
+        assert!(!text.contains("conflict"));
+    }
 
     #[test]
     fn collapsed_tool_updates_keep_title_and_latest_status() {

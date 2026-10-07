@@ -22,6 +22,7 @@ pub enum Key {
     Permission(SessionId, String),
     Failure(Option<SessionId>),
     Finished(SessionId),
+    Overlap(SessionId),
 }
 
 #[derive(Clone)]
@@ -40,6 +41,8 @@ pub enum Panel {
 pub struct Attention {
     pub panel: Option<Panel>,
     finished: HashMap<SessionId, u64>,
+    /// Latest live file-overlap notice per session: (seq, path, others).
+    overlaps: HashMap<SessionId, (u64, std::path::PathBuf, Vec<SessionId>)>,
     state_seq: HashMap<SessionId, u64>,
     failure_seq: HashMap<SessionId, u64>,
     acknowledged: HashMap<SessionId, (u64, String)>,
@@ -71,10 +74,12 @@ fn identity(app: &App, id: SessionId) -> String {
 impl Attention {
     pub fn viewed(&mut self, id: SessionId) {
         self.finished.remove(&id);
+        self.overlaps.remove(&id);
     }
 
     pub fn reset(&mut self, id: SessionId, boundary: u64) {
         self.finished.remove(&id);
+        self.overlaps.remove(&id);
         self.errors.remove(&Some(id));
         self.acknowledged.remove(&id);
         self.failure_seq.remove(&id);
@@ -215,20 +220,32 @@ impl App {
                 });
             }
         }
+        for view in &self.sessions {
+            let id = view.session.id;
+            if let Some((_, path, others)) = self.wb.attention.overlaps.get(&id) {
+                let names: Vec<_> = others.iter().map(|o| self.agent_instance(*o)).collect();
+                items.push(Item {
+                    key: Key::Overlap(id),
+                    label: "Overlaps",
+                    session: Some(id),
+                    summary: fit_text(
+                        &format!(
+                            "{} also edited recently by {}",
+                            path.display(),
+                            names.join(", ")
+                        ),
+                        120,
+                    ),
+                });
+            }
+        }
         items
     }
 }
 
-pub fn observe(app: &mut App, event: &Event) {
-    let EventKind::StateChanged { from, to } = &event.kind else {
-        return;
-    };
-    let id = event.session_id;
-    if event.seq == 0 || event.seq <= app.wb.attention.state_seq.get(&id).copied().unwrap_or(0) {
-        return;
-    }
-    app.wb.attention.state_seq.insert(id, event.seq);
-    let reading_live = app.selected_session_id() == Some(id)
+/// The user is looking at `id`'s live conversation right now.
+fn reading_live(app: &App, id: SessionId) -> bool {
+    app.selected_session_id() == Some(id)
         && matches!(app.mode, InputMode::Editing | InputMode::Normal)
         && app.wb.inspection.is_none()
         && !app.show_diff
@@ -241,7 +258,37 @@ pub fn observe(app: &mut App, event: &Event) {
             .wb
             .sessions
             .get(&id)
-            .is_none_or(|ui| ui.anchor.is_none());
+            .is_none_or(|ui| ui.anchor.is_none())
+}
+
+pub fn observe(app: &mut App, event: &Event) {
+    let id = event.session_id;
+    // Live events only: history baselines `state_seq`, and duplicates
+    // never re-raise a notice.
+    if event.seq == 0 || event.seq <= app.wb.attention.state_seq.get(&id).copied().unwrap_or(0) {
+        return;
+    }
+    if let EventKind::FileOverlap { path, others } = &event.kind {
+        if !reading_live(app, id)
+            && app
+                .wb
+                .attention
+                .overlaps
+                .get(&id)
+                .is_none_or(|(seq, _, _)| *seq < event.seq)
+        {
+            app.wb
+                .attention
+                .overlaps
+                .insert(id, (event.seq, path.clone(), others.clone()));
+        }
+        return;
+    }
+    let EventKind::StateChanged { from, to } = &event.kind else {
+        return;
+    };
+    app.wb.attention.state_seq.insert(id, event.seq);
+    let reading_live = reading_live(app, id);
     match to {
         SessionState::Error(message) => {
             app.wb.attention.finished.remove(&id);
@@ -379,7 +426,8 @@ pub fn activate(app: &mut App, key: Key) -> AppAction {
                 });
             show_error(app, feedback);
         }
-        Key::Finished(id) => {
+        Key::Finished(id) | Key::Overlap(id) => {
+            app.wb.attention.overlaps.remove(&id);
             close(app);
             if let Some(index) = app.sessions.iter().position(|view| view.session.id == id) {
                 app.select_session(index);
@@ -734,6 +782,49 @@ mod tests {
         };
         app.handle_event(event.clone());
         event
+    }
+
+    /// A live overlap on a background session becomes one pending item
+    /// naming the other agent; duplicates, history and viewing do not
+    /// inflate or keep it.
+    #[test]
+    fn live_file_overlap_is_pending_once_and_clears_when_viewed() {
+        let mut app = app(2);
+        let (first, second) = (app.sessions[0].session.id, app.sessions[1].session.id);
+        let overlap = Event {
+            session_id: second,
+            seq: 5,
+            ts: Utc::now(),
+            kind: EventKind::FileOverlap {
+                path: "src/lib.rs".into(),
+                others: vec![first],
+            },
+        };
+        app.handle_event(overlap.clone());
+        app.handle_event(overlap.clone());
+        let items = app.attention_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "Overlaps");
+        assert_eq!(
+            items[0].summary,
+            "src/lib.rs also edited recently by Agent #1"
+        );
+        activate(&mut app, Key::Overlap(second));
+        assert_eq!(app.selected_session_id(), Some(second));
+        assert!(app.attention_items().is_empty());
+
+        // Replayed history never raises the notice again.
+        app.wb.attention.baseline(first, 9);
+        app.handle_event(Event {
+            session_id: first,
+            seq: 8,
+            ts: Utc::now(),
+            kind: EventKind::FileOverlap {
+                path: "src/lib.rs".into(),
+                others: vec![second],
+            },
+        });
+        assert!(app.attention_items().is_empty());
     }
 
     fn render(app: &mut App, width: u16, height: u16) -> Terminal<TestBackend> {

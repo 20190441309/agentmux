@@ -1668,3 +1668,64 @@ async fn prompt_on_native_session_is_rejected_without_killing_it() {
     assert!(!matches!(after, SessionState::Error(_)));
     orch.kill(sid).await.unwrap();
 }
+
+/// Two agents in one workspace edit the same file: the later editor gets a
+/// `FileOverlap` notice naming the earlier one, and the next prompt in the
+/// workspace lists the file under the overlap section of the preamble.
+#[tokio::test]
+async fn overlapping_edits_are_noticed_and_shared_with_agents() {
+    let env = setup();
+    let ws = env
+        .orch
+        .create_workspace(env.project_id, "overlap", "main")
+        .await
+        .unwrap();
+    let agent = AgentId::new("mock");
+    let sa = env.orch.create_session(ws, &agent, None).await.unwrap();
+    let sb = env.orch.create_session(ws, &agent, None).await.unwrap();
+
+    // Every mock turn reports a `tool_call` edit of src/lib.rs.
+    prompt(&env.orch, sa, "first pass").await.unwrap();
+    let mut rx = env.orch.subscribe();
+    prompt(&env.orch, sb, "second pass").await.unwrap();
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |e| {
+        e.session_id == sb && matches!(e.kind, EventKind::FileOverlap { .. })
+    })
+    .await;
+    let overlap = events
+        .iter()
+        .find(|e| e.session_id == sb && matches!(e.kind, EventKind::FileOverlap { .. }))
+        .unwrap();
+    assert!(
+        matches!(&overlap.kind, EventKind::FileOverlap { path, others }
+            if path == Path::new("src/lib.rs") && others == &vec![sa]),
+        "{:?}",
+        overlap.kind
+    );
+    assert!(
+        env.orch
+            .read_events(sb)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::FileOverlap { .. })),
+        "the notice is persisted with the session's history"
+    );
+    assert!(
+        !env.orch
+            .read_events(sa)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::FileOverlap { .. })),
+        "the first editor had nothing to overlap with yet"
+    );
+
+    let mut rx = env.orch.subscribe();
+    prompt(&env.orch, sa, "third pass").await.unwrap();
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |e| {
+        chunk_text(e, sa).is_some_and(|t| t.contains("third pass"))
+    })
+    .await;
+    let text = events.iter().find_map(|e| chunk_text(e, sa)).unwrap();
+    assert!(text.contains("Files several agents edited"), "{text}");
+    assert!(text.contains("- src/lib.rs — "), "{text}");
+}

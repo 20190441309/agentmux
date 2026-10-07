@@ -34,7 +34,9 @@ rework.
   coordinate through a `.agentmux/` blackboard (`context.md` you and agents
   can edit, `activity.md` the daemon maintains automatically), and a shared
   context preamble is injected into prompts while ≥2 sessions share a
-  workspace.
+  workspace. When two agents edit the same file within 15 minutes, the later
+  one's conversation shows a notice, it appears under **Pending → Overlaps**,
+  and the preamble lists the file so both agents re-read it before editing.
 - **Manual relay** — pick an event or file edit from session A, hit `@`,
   choose session B: it lands in B's next prompt as quoted context.
 - **Event persistence** — every normalized event is appended to
@@ -46,9 +48,11 @@ rework.
 - **Permissions are reviewed in the TUI.** Requests wait in an inbox;
   `/permissions` opens the next request without interrupting your typing.
   Allow once / always (when offered), reject, or leave it pending with `Esc`.
-- **No conflict arbitration in shared worktrees.** Shared workspaces suit
-  sequential handoff (A scaffolds, B fills in) and partitioned parallel work;
-  two agents editing the same file concurrently is a real git conflict.
+- **Overlap notices, not locks.** Shared workspaces suit sequential handoff
+  (A scaffolds, B fills in) and partitioned parallel work. agentmux notices when
+  two agents edit the same file close together and tells you and the agents,
+  but it does not block or merge edits; overlap tracking covers the current
+  daemon run only.
 - **Linux / macOS only** (Unix sockets), local machine only — no remote
   daemons.
 - **No auto-delegation** — you choose which agent gets which prompt; a
@@ -554,7 +558,7 @@ for t in tui/tests/*_pty.py; do python3 "$t" || echo "FAILED: $t"; done
 
 - Desktop app (Tauri v2) on the same daemon API — Phase 2
 - Agent auto-delegation / coordinator mode
-- File-lock / conflict arbitration for shared worktrees
+- File locks / edit arbitration for shared worktrees (overlap notices exist)
 - Remote daemon (SSH)
 - Headless adapters for `claude -p` / `codex exec`-style non-ACP CLIs
 - Project/agent registration CLI (RPC-only today)
