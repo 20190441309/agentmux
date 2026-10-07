@@ -134,10 +134,10 @@ def check(sock, project_id, width, height):
     try:
         terminal.wait(lambda: terminal.visible(" Help "))
         terminal.choose_conversation(f"lead-{width}")
-        header_row = 0 if width < 90 or height < 24 else 1
-        assert f"team{width}" in terminal.rows()[header_row], "header lost the current space"
+        # The title bar always leads with `space › conversation` on row 0.
+        assert f"team{width}" in terminal.rows()[0], "header lost the current space"
         if width == 80:
-            assert "Alt+Enter new line" in terminal.rows()[-1], "footer hint is clipped"
+            assert "alt+enter newline" in terminal.rows()[-1], "footer hint is clipped"
         terminal.paste(f"source_draft_{width}")
         if width == 80:
             for columns, lines in [(20, 8), (40, 16), (120, 30), (160, 40), (80, 24)]:
@@ -145,12 +145,12 @@ def check(sock, project_id, width, height):
                 terminal.wait(lambda: terminal.visible("team80"))
             terminal.wait(lambda: terminal.visible("source_draft_80"))
             assert "source_draft_80" not in prompts(sock, lead["id"]), "resize submitted the draft"
-        terminal.click("+ Add agent")
+        terminal.click("+ Agent")
         terminal.wait(lambda: terminal.visible(f"Space: team{width}"))
         terminal.click(" Cancel ")
         assert len(sessions()) == 1, "cancel created an agent"
         assert terminal.visible(f"source_draft_{width}"), "cancel lost draft"
-        terminal.click("+ Add agent")
+        terminal.click("+ Agent")
         terminal.click("Mock (mock)")
         terminal.wait(lambda: len(sessions()) == 2)
         second = next(session for session in sessions() if session["id"] != lead["id"])

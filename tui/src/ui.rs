@@ -807,7 +807,7 @@ fn render_blocks<'a>(
                         let mut lines =
                             full_prose(&thought.text, THEME.dim_italic, width.saturating_sub(4));
                         for line in &mut lines {
-                            line.spans.insert(0, Span::styled("  ┃ ", THEME.border));
+                            line.spans.insert(0, Span::styled("  │ ", THEME.border));
                         }
                         *cache = Some(crate::reasoning::ReplyRender {
                             width,

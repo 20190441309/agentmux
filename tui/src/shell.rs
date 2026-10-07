@@ -52,7 +52,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     );
     let compact = compact(area);
     let rows = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(header_rows(app, area.width).min(area.height.saturating_sub(4).max(1))),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
@@ -168,54 +168,108 @@ pub fn draw(frame: &mut Frame, app: &App) {
 /// One-row title bar: `◆ agentmux  space › conversation` on the left,
 /// actions on the right. Actions drop (into the menu) before the title
 /// is squeezed below a readable width.
+/// Title-bar contents shared by layout (row count) and drawing.
+struct Header<'a> {
+    title: &'a str,
+    workspace: &'a str,
+    brand: &'static str,
+    menu: String,
+    primary: (&'static str, Target),
+    margin: u16,
+}
+
+impl<'a> Header<'a> {
+    fn new(app: &'a App, width: u16) -> Header<'a> {
+        let margin = if width >= 60 { 2 } else { 1 };
+        let available = usize::from(width.saturating_sub(margin * 2));
+        // Narrow bars keep the location readable: the brand steps aside
+        // and the menu drops its glyph.
+        let menu = if available >= 50 { "≡ Menu" } else { "Menu" };
+        Header {
+            title: app
+                .selected_session_id()
+                .and_then(|id| app.wb.sessions.get(&id))
+                .and_then(|s| s.title.as_deref())
+                .unwrap_or("New conversation"),
+            workspace: app
+                .selected_session()
+                .map(|v| v.workspace_name.as_str())
+                .unwrap_or("workspace"),
+            brand: if available >= 60 {
+                "◆ agentmux  "
+            } else if available >= 50 {
+                "◆ "
+            } else {
+                ""
+            },
+            menu: if app.permission_count() > 0 {
+                format!("{menu} · {}", app.permission_count())
+            } else {
+                menu.into()
+            },
+            // Before anything exists, starting a space is the first step.
+            primary: if app.sessions.is_empty() {
+                ("+ Space", Target::Command("/new"))
+            } else {
+                ("+ Agent", Target::Command("/add-agent"))
+            },
+            margin,
+        }
+    }
+
+    /// Cells the location needs to stay readable (title capped at 28).
+    fn reserve(&self) -> usize {
+        self.brand.width() + self.workspace.width().min(16) + 3 + self.title.width().clamp(8, 28)
+    }
+
+    /// `Menu`, the primary action and `Agents` — the actions every width
+    /// keeps; Agents is the narrow-screen way to switch conversations.
+    fn essentials(&self) -> usize {
+        self.menu.width() + 2 + self.primary.0.width() + 3 + "Agents".width() + 3
+    }
+
+    /// One row when the readable location and the essential actions fit
+    /// side by side; otherwise the location gets a row of its own.
+    fn rows(&self, width: u16) -> u16 {
+        let available = usize::from(width.saturating_sub(self.margin * 2));
+        if self.reserve() + self.essentials() < available {
+            1
+        } else {
+            2
+        }
+    }
+}
+
+pub(crate) fn header_rows(app: &App, width: u16) -> u16 {
+    Header::new(app, width).rows(width)
+}
+
+/// Title bar: `◆ agentmux  space › conversation` and the actions, on one
+/// row when both stay readable, else location above actions. Optional
+/// actions fold into the menu before the location is squeezed.
 fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Block::default().style(THEME.panel), area);
-    let title = app
-        .selected_session_id()
-        .and_then(|id| app.wb.sessions.get(&id))
-        .and_then(|s| s.title.as_deref())
-        .unwrap_or("New conversation");
-    let workspace = app
-        .selected_session()
-        .map(|v| v.workspace_name.as_str())
-        .unwrap_or("workspace");
-    let margin = if area.width >= 60 { 2 } else { 1 };
+    let header = Header::new(app, area.width);
     let inner = Rect::new(
-        area.x + margin,
+        area.x + header.margin,
         area.y,
-        area.width.saturating_sub(margin * 2),
+        area.width.saturating_sub(header.margin * 2),
         1,
     );
     let available = usize::from(inner.width);
-    // Narrow bars keep the location readable: the brand steps aside and
-    // the menu drops its glyph.
-    let menu = if available >= 50 { "≡ Menu" } else { "Menu" };
-    let menu_label = if app.permission_count() > 0 {
-        format!("{menu} · {}", app.permission_count())
+    let split = area.height >= 2;
+    // On a shared row, extras still leave the location its reserve; on an
+    // action row of their own they only need to fit.
+    let reserve = if split { 0 } else { header.reserve() };
+    let stub = if split {
+        0
     } else {
-        menu.into()
-    };
-    let brand = if available >= 60 {
-        "◆ agentmux  "
-    } else if available >= 50 {
-        "◆ "
-    } else {
-        ""
-    };
-    // Keep enough of the title readable before spending cells on actions.
-    // `+ Agent` (or `+ Space` before anything exists) only needs a stub of
-    // title; the rest yield to a readable title and live in the menu.
-    let reserve = brand.width() + workspace.width().min(16) + 3 + title.width().clamp(8, 28);
-    let stub = brand.width() + 3 + 10;
-    let primary = if app.sessions.is_empty() {
-        ("+ Space", Target::Command("/new"))
-    } else {
-        ("+ Agent", Target::Command("/add-agent"))
+        header.brand.width() + 3 + 10
     };
     let mut choices: Vec<(&str, Target)> = vec![];
-    let mut used = menu_label.width() + 2;
+    let mut used = header.menu.width() + 2;
     for (label, target) in [
-        primary.clone(),
+        header.primary.clone(),
         ("Agents", Target::Command("/tasks")),
         ("+ Agent", Target::Command("/add-agent")),
         ("+ Space", Target::Command("/new")),
@@ -224,7 +278,8 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
             continue;
         }
         let needed = label.width() + 3;
-        let keep = if target == primary.1 { stub } else { reserve };
+        let essential = target == header.primary.1 || target == Target::Command("/tasks");
+        let keep = if essential { stub } else { reserve };
         if used + needed + keep <= available {
             choices.push((label, target));
             used += needed;
@@ -237,13 +292,20 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         _ => 2,
     };
     choices.sort_by_key(|(_, target)| order(target));
-    choices.push((menu_label.as_str(), Target::Menu));
+    choices.push((header.menu.as_str(), Target::Menu));
     let actions_width = (used as u16).min(inner.width);
-    let left = usize::from(inner.width.saturating_sub(actions_width + 1));
-    let brand = fit_text(brand, left);
-    let space = fit_text(workspace, left.saturating_sub(brand.width()).min(left / 2));
+    let left = if split {
+        available
+    } else {
+        usize::from(inner.width.saturating_sub(actions_width + 1))
+    };
+    let brand = fit_text(header.brand, left);
+    let space = fit_text(
+        header.workspace,
+        left.saturating_sub(brand.width()).min(left / 2),
+    );
     let title = fit_text(
-        title,
+        header.title,
         left.saturating_sub(brand.width() + space.width() + 3),
     );
     frame.render_widget(
@@ -261,7 +323,12 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     buttons(
         frame,
         app,
-        Rect::new(inner.right() - actions_width, inner.y, actions_width, 1),
+        Rect::new(
+            inner.right() - actions_width,
+            inner.y + u16::from(split),
+            actions_width,
+            1,
+        ),
         &choices,
     );
 }
@@ -675,6 +742,11 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             )
         });
     }
+    // A live status ("Needs permission") outranks Help, which stays
+    // reachable through F1 and the menu.
+    if status.is_some_and(|text| 4 + text.width() + controls_width(&choices) >= available) {
+        choices.retain(|(_, target)| *target != Target::Command("/help"));
+    }
     let right_width = controls_width(&choices).min(available.saturating_sub(3)) as u16;
     let left = Rect::new(
         area.x,
@@ -848,7 +920,9 @@ pub(crate) fn modal(frame: &mut Frame, width: u16, height: u16, title: &str) -> 
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(THEME.faint)
-        .padding(Padding::horizontal(1))
+        // Breathing room only where it is affordable; narrow modals keep
+        // every cell for content.
+        .padding(Padding::horizontal(u16::from(rect.width >= 60)))
         .style(THEME.panel)
         .title(Line::styled(title.to_string(), THEME.accent_bold));
     let inner = block.inner(rect);
@@ -1214,7 +1288,7 @@ mod tests {
             let app = selected_app();
             let terminal = render(&app, width, height);
             let conversation = conversation_area(&app);
-            assert_eq!(conversation.y, 1);
+            assert_eq!(conversation.y, header_rows(&app, width));
             assert!(conversation.height.saturating_sub(1) >= minimum);
             assert!(row_text(&terminal, 0).contains("repo-main › Test task"));
             assert!(row_text(&terminal, height - 4).contains("To: Mock #1"));
@@ -1226,6 +1300,20 @@ mod tests {
                 .iter()
                 .any(|h| h.target == Target::Key(crossterm::event::KeyCode::Enter)));
         }
+    }
+
+    #[test]
+    fn narrow_header_moves_actions_below_a_readable_location() {
+        let mut app = selected_app();
+        let id = app.selected_session_id().unwrap();
+        app.apply_title(id, "commands-width-40".into(), 2);
+        let terminal = render(&app, 40, 16);
+        assert_eq!(header_rows(&app, 40), 2);
+        assert!(row_text(&terminal, 0).contains("repo-main › commands-width-40"));
+        assert!(row_text(&terminal, 1).contains(" Agents "));
+        let terminal = render(&app, 120, 30);
+        assert_eq!(header_rows(&app, 120), 1);
+        assert!(row_text(&terminal, 0).contains("commands-width-40"));
     }
 
     #[test]
@@ -1277,13 +1365,18 @@ mod tests {
             let app = selected_app();
             let terminal = render(&app, width, height);
             let hits = app.wb.hits.borrow();
+            let row = header_rows(&app, width) - 1;
             assert!(hits
                 .iter()
-                .any(|hit| hit.target == Target::Menu && hit.area.y == 0));
+                .any(|hit| hit.target == Target::Menu && hit.area.y == row));
             if width >= 40 {
-                assert!(hits
-                    .iter()
-                    .any(|hit| hit.target == Target::Command("/add-agent") && hit.area.y == 0));
+                for target in [Target::Command("/add-agent"), Target::Command("/tasks")] {
+                    assert!(
+                        hits.iter()
+                            .any(|hit| hit.target == target && hit.area.y == row),
+                        "{width}x{height}: essential action hidden"
+                    );
+                }
             }
             assert!(!row_text(&terminal, 1).contains("panel"));
             if width >= 40 {
@@ -1386,6 +1479,18 @@ mod tests {
             .borrow()
             .iter()
             .any(|h| h.target == Target::Command("/tools")));
+    }
+
+    #[test]
+    fn narrow_footer_shows_the_full_run_status_before_help() {
+        let mut app = selected_app();
+        app.sessions[0].session.state = SessionState::WaitingPermission;
+        let terminal = render(&app, 40, 16);
+        assert!(row_text(&terminal, 15).contains("Needs permission"));
+        // Idle, Help keeps its place.
+        app.sessions[0].session.state = SessionState::Ready;
+        let terminal = render(&app, 40, 16);
+        assert!(row_text(&terminal, 15).contains("Help"));
     }
 
     #[test]

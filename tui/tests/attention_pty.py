@@ -49,7 +49,7 @@ def check(sock, project_id, width, height):
         start_prompt(sessions[1], "perm reviewer")
         start_prompt(sessions[2], "crash")
         start_prompt(sessions[3], "finishedprobe")
-        terminal.wait(lambda: terminal.visible("Pending · 4") and terminal.visible("Needs permission"))
+        terminal.wait(lambda: terminal.visible("4 pending") and terminal.visible("Needs permission"))
         assert terminal.visible(draft), "background work lost the writer draft"
         assert not terminal.visible(" Allow once "), "background permission opened the approval dialog"
 
@@ -61,15 +61,15 @@ def check(sock, project_id, width, height):
         terminal.click(" Next ")
         terminal.wait(lambda: terminal.visible("project registration failed"))
         terminal.click(" Cancel ")
-        terminal.wait(lambda: terminal.visible("Pending · 5") and terminal.visible("project registration failed"))
+        terminal.wait(lambda: terminal.visible("5 pending") and terminal.visible("project registration failed"))
         assert terminal.visible("Needs permission"), "error feedback replaced the running status"
         assert terminal.visible(draft), "failed registration changed the draft"
         terminal.click(" Error " if width == 40 else " Error details ")
         terminal.wait(lambda: terminal.visible("Error details") and terminal.visible("project registration failed"))
         terminal.click(" Close ")
-        terminal.wait(lambda: terminal.visible("Pending · 4"))
+        terminal.wait(lambda: terminal.visible("4 pending"))
 
-        terminal.click("Pending · 4")
+        terminal.click("4 pending")
         terminal.wait(lambda: terminal.visible("Permissions") and terminal.visible("Failed") and terminal.visible("Finished"))
         terminal.paste("ignored paste")
         terminal.click(f"Mock #2 / space{width} / Needs approval")
@@ -77,16 +77,16 @@ def check(sock, project_id, width, height):
         terminal.click(" Allow once ")
         terminal.wait(lambda: session_state(sessions[1]) == "Ready")
         assert session_state(sessions[0]) == "WaitingPermission", "approved the wrong agent's request"
-        terminal.wait(lambda: terminal.visible("Pending · 3"))
+        terminal.wait(lambda: terminal.visible("3 pending"))
 
-        terminal.click("Pending · 3")
+        terminal.click("3 pending")
         terminal.click(f"Mock #4 / space{width} / Finished work")
-        terminal.wait(lambda: terminal.visible("finishedprobe") and terminal.visible("Pending · 2"))
-        terminal.click("Pending · 2")
+        terminal.wait(lambda: terminal.visible("finishedprobe") and terminal.visible("2 pending"))
+        terminal.click("2 pending")
         terminal.click(f"Mock #3 / space{width} / Broken adapter")
         terminal.wait(lambda: terminal.visible("Error details") and terminal.visible(" Resume "))
         terminal.click(" Resume ")
-        terminal.wait(lambda: session_state(sessions[2]) == "Ready" and terminal.visible("Pending · 1"))
+        terminal.wait(lambda: session_state(sessions[2]) == "Ready" and terminal.visible("1 pending"))
         terminal.choose_conversation(f"Writer {width}")
         terminal.wait(lambda: terminal.visible(draft))
         assert "ignored paste" not in "\n".join(terminal.rows()), "inbox paste leaked into an editor"
