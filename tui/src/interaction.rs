@@ -80,6 +80,9 @@ pub fn buttons(frame: &mut Frame, app: &App, area: Rect, choices: &[(&str, Targe
             || matches!(target, Target::DiffScope(scope) if *scope == app.wb.files.diff_scope)
             || matches!(target, Target::AgentFilter(filter) if *filter == app.wb.picker_filter)
             || matches!(target, Target::PickerSpace if app.wb.picker_current_space);
+        // View toggles that are on read brighter, without a tab's accent.
+        let toggled = matches!(target, Target::Command("/thinking") if app.wb.thoughts)
+            || matches!(target, Target::Command("/tools") if app.wb.tools_expanded);
         frame.render_widget(
             Paragraph::new(text).style(if focused {
                 THEME.selection
@@ -87,6 +90,8 @@ pub fn buttons(frame: &mut Frame, app: &App, area: Rect, choices: &[(&str, Targe
                 THEME.warning_bold
             } else if matches!(*label, "Send" | "Resume & send" | "Queue" | "Allow once") {
                 THEME.primary
+            } else if toggled {
+                THEME.text
             } else if active {
                 THEME
                     .accent_bold
@@ -817,7 +822,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(text.contains("2 agents · 1 active here"), "{text}");
+        assert!(text.contains("2 agents · 1 running"), "{text}");
         assert!(text.contains("1 in other spaces"));
         assert_eq!(
             app.workspace_file_participants()["shared.rs"],

@@ -38,10 +38,16 @@ fn pane<'a>(title: impl Into<Line<'a>>) -> Block<'a> {
         .title(title)
 }
 
-/// Wash the whole frame in the backdrop shade — the cheap "dim" behind
-/// modal overlays (bg-only style merges over the drawn UI).
-fn draw_backdrop(frame: &mut Frame) {
-    frame.render_widget(Block::default().style(THEME.backdrop), frame.area());
+/// Recede everything already drawn so a modal reads as the only
+/// foreground: text fades to the faint tone, surfaces keep their shape.
+pub(crate) fn draw_backdrop(frame: &mut Frame) {
+    let fade = THEME.faint;
+    for cell in &mut frame.buffer_mut().content {
+        cell.modifier = fade.add_modifier;
+        if let Some(fg) = fade.fg {
+            cell.fg = fg;
+        }
+    }
 }
 
 /// The right pane: relay event picker, touched-files list, or the
@@ -118,6 +124,8 @@ pub(crate) fn draw_sessions(frame: &mut Frame, app: &App, area: Rect) {
                 unread(i),
                 app.session_title(view.session.id),
                 app.agent_instance(view.session.id),
+                usize::from(area.width).saturating_sub(1),
+                i == highlight,
             ));
         }
         // Workspaces with no sessions still render — `n` can land there.
@@ -171,6 +179,8 @@ pub(crate) fn draw_sessions(frame: &mut Frame, app: &App, area: Rect) {
                 unread(i),
                 app.session_title(app.sessions[i].session.id),
                 app.agent_instance(app.sessions[i].session.id),
+                usize::from(area.width).saturating_sub(1),
+                i == highlight,
             ));
         }
     }
@@ -204,7 +214,8 @@ pub(crate) fn draw_sessions(frame: &mut Frame, app: &App, area: Rect) {
     let list = List::new(items)
         .block(block)
         .highlight_style(THEME.selection)
-        .highlight_symbol("▎");
+        .highlight_symbol(Span::styled("▎", THEME.accent))
+        .highlight_spacing(ratatui::widgets::HighlightSpacing::Always);
     let mut state = ListState::default();
     state.select(selected_row);
     frame.render_stateful_widget(list, area, &mut state);
@@ -220,36 +231,55 @@ pub(crate) fn draw_sessions(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-/// `▸ workspace` — a quiet section label, not a competing accent.
+/// `▾ workspace` — a quiet section label, not a competing accent.
 fn workspace_header(name: &str, collapsed: bool) -> ListItem<'static> {
     ListItem::new(Line::from(vec![
-        Span::styled(if collapsed { " ▸ " } else { " ▾ " }, THEME.faint),
+        Span::styled(if collapsed { "▸ " } else { "▾ " }, THEME.faint),
         Span::styled(name.to_string(), THEME.section),
     ]))
 }
 
-/// `● agent·id state [•]` — badge color is the state, name is text,
-/// the state label stays secondary.
+/// Two rows per conversation:
+/// `  ● Pi #1           ready •` — state glyph, agent in its identity
+/// hue, state label right-aligned — then the conversation title.
 fn session_line(
     view: &SessionView,
     unread: bool,
     title: String,
     instance: String,
+    width: usize,
+    selected: bool,
 ) -> ListItem<'static> {
+    use unicode_width::UnicodeWidthStr;
     let (glyph, label) = App::badge(&view.session.state);
+    let label = match view.session.state {
+        agentmux_core::SessionState::Prompting => "working",
+        _ => label,
+    };
+    let tail = format!("{label}{}", if unread { " •" } else { "  " });
+    let name_width = width.saturating_sub(4 + tail.width() + 1);
+    let name = crate::shell::fit_text(&instance, name_width);
+    let pad = width.saturating_sub(4 + name.width() + tail.width());
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(glyph.to_string(), THEME.badge(&view.session.state)),
-        Span::styled(format!(" {instance}"), THEME.text),
-        Span::raw(" · "),
-        Span::styled(label, THEME.dim),
+        Span::raw(" "),
+        Span::styled(name, THEME.agent(&view.agent_name)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(label.to_string(), THEME.faint),
     ];
     if unread {
-        spans.push(Span::styled("  •", THEME.accent));
+        spans.push(Span::styled(" •", THEME.accent));
     }
     ListItem::new(vec![
-        Line::styled(format!("  {title}"), THEME.text),
         Line::from(spans),
+        Line::styled(
+            format!(
+                "    {}",
+                crate::shell::fit_text(&title, width.saturating_sub(4))
+            ),
+            if selected { THEME.text } else { THEME.dim },
+        ),
     ])
 }
 
@@ -532,20 +562,33 @@ pub(crate) fn draw_events(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
-fn thought_header(thought: &crate::reasoning::Thought, open: bool) -> Line<'static> {
+/// `◆ Pi` — the reply header, in the agent's identity hue.
+fn agent_header(agent: &str) -> Line<'static> {
+    let hue = THEME.agent(agent);
     Line::from(vec![
-        Span::styled(format!("  {} ", if open { "▾" } else { "▸" }), THEME.dim),
+        Span::styled("  ◆ ", hue),
+        Span::styled(
+            agent.to_string(),
+            hue.add_modifier(ratatui::style::Modifier::BOLD),
+        ),
+    ])
+}
+
+fn thought_header(thought: &crate::reasoning::Thought, open: bool) -> Line<'static> {
+    let live = thought.ended.is_none();
+    Line::from(vec![
+        Span::styled(format!("  {} ", if open { "▾" } else { "▸" }), THEME.faint),
         Span::styled(
             format!(
                 "{} · {}s",
-                if thought.ended.is_some() {
-                    "Thought"
-                } else {
-                    "Thinking"
-                },
+                if live { "Thinking" } else { "Thought" },
                 thought.duration()
             ),
-            THEME.warning,
+            if live {
+                THEME.warning
+            } else {
+                THEME.dim_italic
+            },
         ),
     ])
 }
@@ -722,7 +765,7 @@ fn render_blocks<'a>(
                 }
                 let lines = &cached.as_ref().unwrap().lines;
                 if lines.len() <= budget {
-                    out.push(Line::styled(format!("  {agent}"), THEME.accent_bold));
+                    out.push(agent_header(agent));
                 }
                 out.extend(
                     lines
@@ -764,7 +807,7 @@ fn render_blocks<'a>(
                         let mut lines =
                             full_prose(&thought.text, THEME.dim_italic, width.saturating_sub(4));
                         for line in &mut lines {
-                            line.spans.insert(0, Span::styled("  │ ", THEME.faint));
+                            line.spans.insert(0, Span::styled("  ┃ ", THEME.border));
                         }
                         *cache = Some(crate::reasoning::ReplyRender {
                             width,
@@ -802,14 +845,7 @@ fn render_blocks<'a>(
                 if let Some(status) = status {
                     entry.2 = Some(status.clone());
                 }
-                out[entry.0] = Line::from(vec![
-                    Span::styled("  ⚙ ", THEME.dim),
-                    Span::styled(entry.1.clone(), THEME.dim),
-                    Span::styled(
-                        format!("  {}", entry.2.as_deref().unwrap_or("pending")),
-                        THEME.tool_status(entry.2.as_deref()),
-                    ),
-                ]);
+                out[entry.0] = tool_row(&entry.1, entry.2.as_deref());
                 reasoning_headers.push((entry.0, Target::Tool(*session, id.clone())));
                 out.extend(details.iter().cloned());
             }
@@ -831,6 +867,31 @@ fn render_blocks<'a>(
     }
     flush_msg(&mut out, pending.take(), agent, width);
     out
+}
+
+/// `✓ Read tui/src/shell.rs` — status glyph, verb, then the target in a
+/// quieter tone. Only unusual outcomes spell out their status.
+fn tool_row(title: &str, status: Option<&str>) -> Line<'static> {
+    let (verb, rest) = title.split_once(' ').unwrap_or((title, ""));
+    let mut spans = vec![
+        Span::styled(
+            format!("  {} ", crate::theme::Theme::tool_glyph(status)),
+            THEME.tool_status(status),
+        ),
+        Span::styled(verb.to_string(), THEME.text),
+    ];
+    if !rest.is_empty() {
+        spans.push(Span::styled(format!(" {rest}"), THEME.dim));
+    }
+    match status {
+        Some("completed") => {}
+        Some(other) => spans.push(Span::styled(
+            format!("  {}", other.replace('_', " ")),
+            THEME.tool_status(status),
+        )),
+        None => spans.push(Span::styled("  pending", THEME.faint)),
+    }
+    Line::from(spans)
 }
 
 /// Emit a coalesced message with a quiet role label and spaced prose.
@@ -855,7 +916,7 @@ fn flush_msg(
         return;
     }
     let header = match role {
-        MsgRole::Agent => vec![Span::styled(format!("  {agent}"), THEME.accent_bold)],
+        MsgRole::Agent => agent_header(agent).spans,
         MsgRole::Thought => vec![Span::styled(
             format!("  {agent} · thinking"),
             THEME.dim_italic,
@@ -1292,7 +1353,13 @@ fn tool_call_lines(ev: &Event, update: &serde_json::Value) -> Vec<Line<'static>>
         .to_string();
     let status = update.get("status").and_then(|s| s.as_str());
 
-    let mut header = vec![ts_span(ev), Span::styled("⚙ ", THEME.accent)];
+    let mut header = vec![
+        ts_span(ev),
+        Span::styled(
+            format!("{} ", crate::theme::Theme::tool_glyph(status)),
+            THEME.tool_status(status),
+        ),
+    ];
     header.push(Span::styled(title, THEME.text));
     if let Some(status) = status {
         header.push(Span::styled(
@@ -1778,7 +1845,13 @@ pub(crate) fn draw_wizard(frame: &mut Frame, app: &App) {
     draw_backdrop(frame);
     frame.render_widget(Clear, rect);
     let operation = if wiz.adding { "Add agent" } else { "New space" };
-    let block = pane(format!(" {operation} · {title} ")).border_style(THEME.border_focus);
+    let block = pane(Line::from(vec![
+        Span::styled(format!(" {operation}"), THEME.accent_bold),
+        Span::styled(format!(" · {title} "), THEME.dim),
+    ]))
+    .border_style(THEME.faint)
+    .padding(Padding::horizontal(1))
+    .style(THEME.panel);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     let parts = Layout::vertical([
@@ -1904,14 +1977,16 @@ pub(crate) fn draw_permission(frame: &mut Frame, app: &App) {
     {
         lines.insert(
             0,
-            Line::styled(
-                format!(
-                    "{} / {}",
-                    view.agent_name,
-                    app.session_title(view.session.id)
+            Line::from(vec![
+                Span::styled(
+                    view.agent_name.clone(),
+                    THEME
+                        .agent(&view.agent_name)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
                 ),
-                THEME.accent,
-            ),
+                Span::styled(" · ", THEME.faint),
+                Span::styled(app.session_title(view.session.id), THEME.dim),
+            ]),
         );
     }
     if let Some(tool) = notice.request.get("toolCall") {
@@ -1928,7 +2003,7 @@ pub(crate) fn draw_permission(frame: &mut Frame, app: &App) {
     }
     let width = 76.min(frame.area().width);
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let rows = paragraph.line_count(width.saturating_sub(2));
+    let rows = paragraph.line_count(width.saturating_sub(4));
     let rect = centered(
         frame.area(),
         width,
@@ -1938,14 +2013,16 @@ pub(crate) fn draw_permission(frame: &mut Frame, app: &App) {
     );
     draw_backdrop(frame);
     crate::shell::clear_overlay(frame, rect);
-    let block = pane(Line::from(Span::styled(
-        format!(
-            " permission requested — {} ",
-            short_id(&notice.session_id.to_string())
+    let block = pane(Line::from(vec![
+        Span::styled(" ! Permission ", THEME.warning_bold),
+        Span::styled(
+            format!("{} ", short_id(&notice.session_id.to_string())),
+            THEME.faint,
         ),
-        THEME.title,
-    )))
-    .border_style(THEME.warning);
+    ]))
+    .border_style(THEME.warning)
+    .padding(Padding::horizontal(1))
+    .style(THEME.panel);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(3)]).split(inner);
@@ -2146,11 +2223,11 @@ mod tests {
         assert!(text.contains("●"), "ready badge glyph: {text}");
         assert!(text.contains("◐"), "prompting badge glyph: {text}");
         assert!(text.contains("ready"));
-        assert!(text.contains("prompting"));
+        assert!(text.contains("working"));
         assert!(text.contains("claude"));
         assert!(text.contains("hello world"), "event text: {text}");
         assert!(text.contains(" Send "), "input box: {text}");
-        assert!(text.contains("Enter send"), "status bar: {text}");
+        assert!(text.contains("enter send"), "status bar: {text}");
     }
 
     #[test]
@@ -2162,7 +2239,7 @@ mod tests {
         let text = buffer_text(terminal.backend());
         assert!(text.contains("no session selected"), "{text}");
         assert!(text.contains("new session"), "empty hint keys: {text}");
-        assert!(text.contains("+ New space"), "onboarding hint: {text}");
+        assert!(text.contains("+ Space"), "onboarding hint: {text}");
         assert!(text.contains("New conversation"));
         assert!(
             text.contains("no session selected"),
@@ -2342,8 +2419,8 @@ mod tests {
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(terminal.backend());
         assert_eq!(text.matches("Read config").count(), 1);
-        assert!(text.contains("completed"));
-        assert!(!text.contains("in_progress"));
+        assert!(text.contains("✓ Read config"), "{text}");
+        assert!(!text.contains("in progress"));
     }
 
     #[test]
@@ -2441,7 +2518,7 @@ mod tests {
         assert_eq!(
             lines
                 .iter()
-                .filter(|l| l.to_string().trim() == "agent")
+                .filter(|l| l.to_string().trim() == "◆ agent")
                 .count(),
             2
         );
@@ -2520,7 +2597,7 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("╭─ rust"));
+        assert!(text.lines().any(|l| l.trim() == "rust"), "{text}");
         assert_eq!(text.matches("let 中文 = 42;").count(), 120);
         assert!(text.contains("After code."));
         // A scrolled anchor must not leak later text from the same cached reply.
@@ -2539,7 +2616,7 @@ mod tests {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("╭─ rust"));
+        assert!(text.lines().any(|l| l.trim() == "rust"), "{text}");
         assert!(!text.contains("After code."));
     }
 
@@ -2592,15 +2669,17 @@ mod tests {
                 .buffer()
                 .content
                 .chunks(80)
-                .filter(|row| row.iter().map(|c| c.symbol()).collect::<String>().trim() == "claude")
+                .filter(
+                    |row| row.iter().map(|c| c.symbol()).collect::<String>().trim() == "◆ claude"
+                )
                 .count(),
             1,
             "one header for the merged chunk run: {text}"
         );
     }
 
-    /// A `tool_call` update becomes a card: `⚙` header with title, and
-    /// the status word carries the status color (completed → success).
+    /// A `tool_call` update becomes a row: a status glyph in the status
+    /// color (completed → success ✓), then the title.
     #[test]
     fn tool_call_renders_status_colored_card() {
         let app = app_with_events(vec![EventKind::SessionUpdate(serde_json::json!({
@@ -2615,14 +2694,15 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(terminal.backend());
-        assert!(text.contains("⚙"), "tool card glyph: {text}");
-        assert!(text.contains("mock edit of src/lib.rs"), "{text}");
-        assert!(text.contains("completed"), "{text}");
+        assert!(
+            text.contains("✓ mock edit of src/lib.rs"),
+            "tool row: {text}"
+        );
         assert!(text.contains("src/lib.rs"), "location line: {text}");
         assert_eq!(
-            fg_at(terminal.backend(), "completed"),
+            fg_at(terminal.backend(), "✓"),
             THEME.success.fg,
-            "completed status in the success hue"
+            "completed glyph in the success hue"
         );
     }
 
@@ -2795,7 +2875,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();
         let text = buffer_text(terminal.backend());
-        assert!(text.contains("permission requested"), "{text}");
+        assert!(text.contains("! Permission"), "{text}");
         assert!(text.contains("Write src/x.rs"), "{text}");
         assert!(text.contains("Allow once"), "{text}");
         assert!(text.contains("Always allow"), "{text}");
@@ -3246,6 +3326,27 @@ mod tests {
             .and_then(|s| s.parse().ok())
             .unwrap_or(38);
         app.wb.columns = width;
+        match std::env::var("AGENTMUX_PREVIEW_OVERLAY").as_deref() {
+            Ok("menu") => app.wb.menu = true,
+            Ok("help") => app.mode = InputMode::Help,
+            Ok("picker") => app.mode = InputMode::TaskPicker,
+            Ok("permission") => {
+                app.handle_event(Event {
+                    session_id: sid,
+                    seq: 20,
+                    ts: Utc::now(),
+                    kind: EventKind::PermissionRequest {
+                        request_id: "preview".into(),
+                        request: serde_json::json!({"toolCall": {
+                            "title": "Run cargo test -p agentmux-tui",
+                            "rawInput": {"command": "cargo test -p agentmux-tui"}
+                        }, "options": [{"kind": "allow_always", "optionId": "a", "name": "Always"}]}),
+                    },
+                });
+                app.mode = InputMode::Permission;
+            }
+            _ => {}
+        }
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| draw(f, &app)).unwrap();

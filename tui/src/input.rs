@@ -119,7 +119,7 @@ pub(crate) fn editing_key(app: &mut App, key: KeyEvent) -> AppAction {
                 return AppAction::None;
             }
             if app.selected_session_id().is_none() {
-                app.set_status("Click + New space to choose a project and agent first.");
+                app.set_status("Click + Space to choose a project and agent first.");
                 return AppAction::None;
             }
             app.wb.cursor = 0;

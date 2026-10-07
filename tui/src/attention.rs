@@ -1038,7 +1038,7 @@ mod tests {
         let output = text(&terminal);
         assert!(output.contains("operation failed"), "{output}");
         assert!(output.contains("Waiting"), "{output}");
-        assert!(output.contains("Pending · 1"), "{output}");
+        assert!(output.contains("1 pending"), "{output}");
         assert!(app
             .wb
             .attention

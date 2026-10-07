@@ -14,15 +14,19 @@ use crate::theme::THEME;
 #[derive(Clone)]
 struct Styles;
 impl StyleSheet for Styles {
-    fn heading(&self, _: u8) -> Style {
-        THEME.special.add_modifier(Modifier::BOLD)
+    fn heading(&self, level: u8) -> Style {
+        if level <= 2 {
+            THEME.accent_bold
+        } else {
+            THEME.text.add_modifier(Modifier::BOLD)
+        }
     }
     fn heading_marker(&self, _: u8) -> &str {
         ""
     }
     fn code(&self) -> Style {
         Style {
-            fg: THEME.success.fg,
+            fg: THEME.special.fg,
             ..Style::default()
         }
     }
@@ -33,10 +37,10 @@ impl StyleSheet for Styles {
         THEME.accent.add_modifier(Modifier::UNDERLINED)
     }
     fn blockquote(&self) -> Style {
-        THEME.warning
+        THEME.dim_italic
     }
     fn list_marker(&self) -> Style {
-        THEME.accent
+        THEME.faint
     }
     fn table_header(&self) -> Style {
         THEME.accent_bold
@@ -129,23 +133,26 @@ fn code_block(source: &str, lang: &str, width: usize) -> Vec<Line<'static>> {
             .flat_map(|l| wrap_line(l, width))
             .collect();
     }
+    // A raised slab: language label row, code inset by two cells, and a
+    // closing padding row. No box glyphs, so copied text stays clean.
     let inside = width - 4;
     let label: String = if lang.is_empty() { "code" } else { lang }
         .graphemes(true)
         .scan(0, |n, g| {
             *n += g.width();
-            (*n <= width - 4).then_some(g)
+            (*n <= inside).then_some(g)
         })
         .collect();
-    let heading = format!(
-        "╭─ {label}{}╮",
-        "─".repeat(width.saturating_sub(label.width() + 4))
-    );
-    let mut out = vec![Line::styled(heading, THEME.code.patch(THEME.border))];
+    let mut out = vec![Line::from(vec![
+        Span::styled("  ", THEME.code),
+        Span::styled(label.clone(), THEME.code.patch(THEME.faint)),
+        Span::styled(" ".repeat(width - 2 - label.width()), THEME.code),
+    ])
+    .style(THEME.code)];
     for line in lines {
         for row in wrap_line(line, inside) {
             let pad = inside.saturating_sub(row.width());
-            let mut spans = vec![Span::styled("│ ", THEME.border)];
+            let mut spans = vec![Span::styled("  ", THEME.code)];
             spans.extend(row.spans.into_iter().map(|s| {
                 Span::styled(
                     s.content,
@@ -155,15 +162,11 @@ fn code_block(source: &str, lang: &str, width: usize) -> Vec<Line<'static>> {
                         .bg(THEME.code.bg.unwrap_or(ratatui::style::Color::Reset)),
                 )
             }));
-            spans.push(Span::styled(" ".repeat(pad + 1), THEME.code));
-            spans.push(Span::styled("│", THEME.border));
+            spans.push(Span::styled(" ".repeat(pad + 2), THEME.code));
             out.push(Line::from(spans).style(THEME.code));
         }
     }
-    out.push(Line::styled(
-        format!("╰{}╯", "─".repeat(width - 2)),
-        THEME.code.patch(THEME.border),
-    ));
+    out.push(Line::styled(" ".repeat(width), THEME.code));
     out
 }
 
@@ -259,10 +262,7 @@ pub fn user_panel(text: &str, width: usize) -> Vec<Line<'static>> {
             .collect();
     }
     let inside = width - 4;
-    let mut content = vec![
-        Line::styled("You", THEME.text.add_modifier(Modifier::BOLD)),
-        Line::default(),
-    ];
+    let mut content = vec![Line::styled("You", THEME.dim.add_modifier(Modifier::BOLD))];
     content.extend(text.lines().map(|s| Line::styled(s.to_owned(), THEME.text)));
     content.push(Line::default());
     content
@@ -296,7 +296,7 @@ mod tests {
             48,
         );
         let shown = text(&lines);
-        assert!(shown.contains("╭─ rust"), "{shown}");
+        assert!(shown.lines().any(|l| l.trim() == "rust"), "{shown}");
         assert!(shown.contains("    println!"));
         assert!(shown.contains("**你好**"));
         assert!(shown.contains("After"));
@@ -319,16 +319,18 @@ mod tests {
             let source = "    你好世界🙂abc**literal**";
             let lines = prose(&format!("{fence}unknown\n{source}"), THEME.text, 18);
             let shown = text(&lines);
-            assert!(shown.contains("╭─ unknown"), "{shown}");
+            assert!(shown.lines().any(|l| l.trim() == "unknown"), "{shown}");
             assert!(lines.iter().all(|l| l.width() <= 18), "{shown}");
-            let recovered: String = lines
+            // Every code row is the full slab width on the code surface.
+            let rows: Vec<_> = lines
                 .iter()
-                .filter_map(|l| {
-                    let s = l.to_string();
-                    s.strip_prefix("  │ ")
-                        .and_then(|s| s.strip_suffix('│'))
-                        .map(|s| s.trim().to_owned())
-                })
+                .filter(|l| l.spans.iter().any(|s| s.style.bg == THEME.code.bg))
+                .collect();
+            assert!(rows.iter().all(|l| l.width() == 18), "{shown}");
+            let recovered: String = rows
+                .iter()
+                .skip(1)
+                .map(|l| l.to_string().trim().to_owned())
                 .collect();
             assert_eq!(recovered, source.trim());
         }

@@ -180,18 +180,6 @@ pub fn keyboard(app: &mut App, key: KeyEvent) -> Option<AppAction> {
     Some(AppAction::None)
 }
 
-pub fn summary(app: &App, id: SessionId) -> String {
-    let mode = execution(app, id);
-    let model = app
-        .wb
-        .info
-        .sessions
-        .get(&id)
-        .and_then(|info| info.model.as_deref())
-        .unwrap_or("model unknown");
-    format!("{mode} · {model}")
-}
-
 pub fn draw(frame: &mut Frame, app: &App) {
     let Some((session, scroll)) = app.wb.info.panel else {
         return;

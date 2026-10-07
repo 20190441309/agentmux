@@ -52,23 +52,26 @@ pub fn draw(frame: &mut Frame, app: &App) {
     );
     let compact = compact(area);
     let rows = Layout::vertical([
-        Constraint::Length(if compact { 2 } else { 3 }),
+        Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
     .split(area);
-    draw_header(frame, app, rows[0], compact);
+    draw_header(frame, app, rows[0]);
     let sidebar = area.width >= 110 && !app.wb.focus;
     let body = Layout::horizontal([
         Constraint::Min(1),
         Constraint::Length(if sidebar { 34 } else { 0 }),
     ])
     .split(rows[1]);
+    // Wide layouts get a row of air under the title bar; compact ones
+    // spend every row on reading.
+    let gap = u16::from(!compact).min(body[0].height.saturating_sub(1));
     let main = Rect::new(
         body[0].x + 1,
-        body[0].y,
+        body[0].y + gap,
         body[0].width.saturating_sub(2),
-        body[0].height,
+        body[0].height - gap,
     );
     let (editor_rows, _, _) = editor_lines(
         &app.input,
@@ -78,8 +81,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
     // Size by the whole draft, not its cursor: moving upward must not shrink chat.
     let input_height = editor_rows
         .len()
-        .saturating_add(if compact { 2 } else { 4 })
-        .clamp(if compact { 3 } else { 6 }, 10)
+        .saturating_add(2)
+        .clamp(if compact { 3 } else { 4 }, 10)
         .min(usize::from((main.height / 2).max(3)))
         .min(usize::from(main.height)) as u16;
     let inner = Layout::vertical([
@@ -97,7 +100,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     } else {
         ui::draw_body(frame, app, inner[1]);
     }
-    draw_input(frame, app, inner[2], compact);
+    draw_input(frame, app, inner[2]);
     if crate::focus::current(app) == crate::focus::Pane::Reading && inner[1].height > 0 {
         for y in inner[1].y..inner[1].bottom() {
             frame.buffer_mut()[(inner[1].x.saturating_sub(1), y)]
@@ -162,7 +165,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
     }
 }
 
-fn draw_header(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
+/// One-row title bar: `◆ agentmux  space › conversation` on the left,
+/// actions on the right. Actions drop (into the menu) before the title
+/// is squeezed below a readable width.
+fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
+    frame.render_widget(Block::default().style(THEME.panel), area);
     let title = app
         .selected_session_id()
         .and_then(|id| app.wb.sessions.get(&id))
@@ -172,119 +179,91 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
         .selected_session()
         .map(|v| v.workspace_name.as_str())
         .unwrap_or("workspace");
-    let menu_label = if app.permission_count() > 0 {
-        format!("Menu · {}", app.permission_count())
-    } else {
-        "Menu".into()
-    };
-    if compact {
-        let width = usize::from(area.width.saturating_sub(4));
-        let space = fit_text(workspace, (width / 2).max(1));
-        let title = fit_text(title, width.saturating_sub(space.width() + 3));
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(space, THEME.accent),
-                Span::styled(" / ", THEME.dim),
-                Span::styled(
-                    title,
-                    THEME.text.add_modifier(ratatui::style::Modifier::BOLD),
-                ),
-            ])),
-            Rect::new(area.x + 2, area.y, area.width.saturating_sub(4), 1),
-        );
-        let mut candidates = vec![];
-        if area.width >= 70 {
-            candidates.push(("+ New space", Target::Command("/new")));
-        }
-        if area.width >= 30 {
-            candidates.push((
-                if area.width >= 40 {
-                    "+ Add agent"
-                } else {
-                    "+ Agent"
-                },
-                Target::Command("/add-agent"),
-            ));
-        }
-        if area.width >= 20 {
-            candidates.push(("Agents", Target::Command("/tasks")));
-        }
-        let mut choices = vec![];
-        let mut used = 0;
-        // Menu is the fallback for hidden actions, so always reserve its cells.
-        for (label, target) in candidates {
-            let needed = label.width() + 3;
-            if used + needed + menu_label.width() + 2 <= usize::from(area.width.saturating_sub(2)) {
-                choices.push((label, target));
-                used += needed;
-            }
-        }
-        choices.push((menu_label.as_str(), Target::Menu));
-        buttons(
-            frame,
-            app,
-            Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), 1),
-            &choices,
-        );
-        return;
-    }
-    let creation_width = 27;
-    let navigation_width = 11 + menu_label.width() as u16;
-    let action_width = creation_width + 3 + navigation_width;
-    frame.render_widget(
-        Paragraph::new(fit_text(
-            title,
-            usize::from(area.width.saturating_sub(action_width + 4)),
-        ))
-        .style(THEME.text.add_modifier(ratatui::style::Modifier::BOLD)),
-        Rect::new(
-            area.x + 2,
-            area.y,
-            area.width.saturating_sub(action_width + 4),
-            1,
-        ),
-    );
-    let actions = Rect::new(
-        area.right().saturating_sub(action_width + 2),
+    let margin = if area.width >= 60 { 2 } else { 1 };
+    let inner = Rect::new(
+        area.x + margin,
         area.y,
-        creation_width,
+        area.width.saturating_sub(margin * 2),
         1,
     );
-    buttons(
-        frame,
-        app,
-        actions,
-        &[
-            ("+ New space", Target::Command("/new")),
-            ("+ Add agent", Target::Command("/add-agent")),
-        ],
-    );
-    buttons(
-        frame,
-        app,
-        Rect::new(actions.right() + 3, actions.y, navigation_width, 1),
-        &[
-            ("Agents", Target::Command("/tasks")),
-            (&menu_label, Target::Menu),
-        ],
-    );
-    let y = area.y + 1;
-    let meta_width = area.width.saturating_sub(4);
-    if meta_width > 0 {
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("agentmux", THEME.accent),
-                Span::styled(
-                    fit_text(
-                        &format!("  /  {workspace}"),
-                        usize::from(meta_width.saturating_sub(10)),
-                    ),
-                    THEME.dim,
-                ),
-            ])),
-            Rect::new(area.x + 2, y, meta_width.saturating_sub(2), 1),
-        );
+    let available = usize::from(inner.width);
+    // Narrow bars keep the location readable: the brand steps aside and
+    // the menu drops its glyph.
+    let menu = if available >= 50 { "≡ Menu" } else { "Menu" };
+    let menu_label = if app.permission_count() > 0 {
+        format!("{menu} · {}", app.permission_count())
+    } else {
+        menu.into()
+    };
+    let brand = if available >= 60 {
+        "◆ agentmux  "
+    } else if available >= 50 {
+        "◆ "
+    } else {
+        ""
+    };
+    // Keep enough of the title readable before spending cells on actions.
+    // `+ Agent` (or `+ Space` before anything exists) only needs a stub of
+    // title; the rest yield to a readable title and live in the menu.
+    let reserve = brand.width() + workspace.width().min(16) + 3 + title.width().clamp(8, 28);
+    let stub = brand.width() + 3 + 10;
+    let primary = if app.sessions.is_empty() {
+        ("+ Space", Target::Command("/new"))
+    } else {
+        ("+ Agent", Target::Command("/add-agent"))
+    };
+    let mut choices: Vec<(&str, Target)> = vec![];
+    let mut used = menu_label.width() + 2;
+    for (label, target) in [
+        primary.clone(),
+        ("Agents", Target::Command("/tasks")),
+        ("+ Agent", Target::Command("/add-agent")),
+        ("+ Space", Target::Command("/new")),
+    ] {
+        if choices.iter().any(|(_, t)| *t == target) {
+            continue;
+        }
+        let needed = label.width() + 3;
+        let keep = if target == primary.1 { stub } else { reserve };
+        if used + needed + keep <= available {
+            choices.push((label, target));
+            used += needed;
+        }
     }
+    // Display order is fixed regardless of which actions survived.
+    let order = |t: &Target| match t {
+        Target::Command("/new") => 0,
+        Target::Command("/add-agent") => 1,
+        _ => 2,
+    };
+    choices.sort_by_key(|(_, target)| order(target));
+    choices.push((menu_label.as_str(), Target::Menu));
+    let actions_width = (used as u16).min(inner.width);
+    let left = usize::from(inner.width.saturating_sub(actions_width + 1));
+    let brand = fit_text(brand, left);
+    let space = fit_text(workspace, left.saturating_sub(brand.width()).min(left / 2));
+    let title = fit_text(
+        title,
+        left.saturating_sub(brand.width() + space.width() + 3),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(brand, THEME.accent_bold),
+            Span::styled(space, THEME.dim),
+            Span::styled(" › ", THEME.faint),
+            Span::styled(
+                title,
+                THEME.text.add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+        ])),
+        Rect::new(inner.x, inner.y, left as u16, 1),
+    );
+    buttons(
+        frame,
+        app,
+        Rect::new(inner.right() - actions_width, inner.y, actions_width, 1),
+        &choices,
+    );
 }
 
 fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
@@ -292,7 +271,7 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
     if crate::focus::current(app) == crate::focus::Pane::Navigation {
         for y in area.y..area.bottom() {
             frame.buffer_mut()[(area.x, y)]
-                .set_symbol("│")
+                .set_symbol("▎")
                 .set_style(THEME.accent);
         }
     }
@@ -332,67 +311,100 @@ fn draw_sidebar(frame: &mut Frame, app: &App, area: Rect) {
                     )
             })
             .count();
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::styled(
-                    workspace
-                        .map(|workspace| workspace.name.as_str())
-                        .unwrap_or("No space"),
-                    THEME.text.add_modifier(ratatui::style::Modifier::BOLD),
-                ),
-                Line::styled(
-                    workspace
-                        .map(|w| {
-                            if w.branch == w.name {
-                                String::new()
-                            } else {
-                                fit_text(&w.branch, usize::from(parts[0].width))
-                            }
-                        })
-                        .unwrap_or_else(|| "No project selected".into()),
-                    THEME.dim,
-                ),
-                Line::styled(
-                    format!("{members} agents · {running} active here"),
-                    THEME.dim,
-                ),
-                Line::styled(
-                    if app.sessions.len() > members {
-                        format!("{} in other spaces", app.sessions.len() - members)
-                    } else {
-                        String::new()
-                    },
-                    THEME.faint,
-                ),
-            ]),
-            parts[0],
-        );
+        let width = usize::from(parts[0].width);
+        let mut meta = vec![Span::styled(
+            format!("{members} agent{}", if members == 1 { "" } else { "s" }),
+            THEME.dim,
+        )];
+        if running > 0 {
+            meta.push(Span::styled(" · ", THEME.faint));
+            meta.push(Span::styled(format!("{running} running"), THEME.warning));
+        }
+        let elsewhere = app.sessions.len() - members;
+        let mut lines = vec![Line::styled(
+            fit_text(
+                workspace
+                    .map(|workspace| workspace.name.as_str())
+                    .unwrap_or("No space"),
+                width,
+            ),
+            THEME.text.add_modifier(ratatui::style::Modifier::BOLD),
+        )];
+        match workspace {
+            Some(w) if w.branch != w.name => lines.push(Line::styled(
+                fit_text(&format!("⎇ {}", w.branch), width),
+                THEME.dim,
+            )),
+            Some(_) => {}
+            None => lines.push(Line::styled("No project selected", THEME.dim)),
+        }
+        lines.push(Line::from(meta));
+        if elsewhere > 0 {
+            lines.push(Line::styled(
+                fit_text(&format!("{elsewhere} in other spaces"), width),
+                THEME.faint,
+            ));
+        }
+        frame.render_widget(Paragraph::new(lines), parts[0]);
     }
     buttons(
         frame,
         app,
-        parts[1],
+        Rect::new(
+            parts[1].x.saturating_sub(1),
+            parts[1].y,
+            parts[1].width + 1,
+            1,
+        ),
         &[
             ("Agents", Target::Tab(SideTab::Team)),
             ("Files", Target::Tab(SideTab::Files)),
             ("Context", Target::Tab(SideTab::Context)),
         ],
     );
+    rule(
+        frame,
+        Rect::new(area.x + 1, parts[1].y + 1, area.width.saturating_sub(2), 1),
+    );
     match app.wb.tab {
         SideTab::Team => ui::draw_sessions(frame, app, parts[2]),
         SideTab::Files => ui::draw_files(frame, app, parts[2]),
         SideTab::Context => crate::context::draw(frame, app, parts[2]),
     }
-    let permissions = format!("Permissions · {}", app.permission_count());
+    rule(
+        frame,
+        Rect::new(area.x + 1, parts[3].y, area.width.saturating_sub(2), 1),
+    );
+    let permissions = format!("! Permissions · {}", app.permission_count());
     let mut controls = vec![
-        ("+ Add agent", Target::Command("/add-agent")),
+        ("+ Agent", Target::Command("/add-agent")),
         ("Quote", Target::Command("/relay")),
         ("Close panel", Target::Command("/hide-sidebar")),
     ];
     if app.permission_count() > 0 {
         controls.insert(0, (permissions.as_str(), Target::Command("/permissions")));
     }
-    buttons(frame, app, parts[3], &controls);
+    buttons(
+        frame,
+        app,
+        Rect::new(
+            parts[3].x.saturating_sub(1),
+            parts[3].y + 1,
+            parts[3].width + 1,
+            2,
+        ),
+        &controls,
+    );
+}
+
+/// A hairline horizontal rule.
+fn rule(frame: &mut Frame, area: Rect) {
+    if area.height > 0 {
+        frame.render_widget(
+            Paragraph::new("─".repeat(usize::from(area.width))).style(THEME.border),
+            area,
+        );
+    }
 }
 
 pub fn editor_lines(text: &str, cursor: usize, width: u16) -> (Vec<String>, usize, usize) {
@@ -401,35 +413,56 @@ pub fn editor_lines(text: &str, cursor: usize, width: u16) -> (Vec<String>, usiz
     (layout.lines, row, col)
 }
 
-fn draw_input(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
+/// Short execution/model note for the composer frame; unknowns are
+/// omitted here (Agent details spells them out).
+fn composer_meta(app: &App, id: agentmux_core::SessionId) -> String {
+    let mode = match crate::agent_info::execution(app, id) {
+        "Structured Pi RPC" => "Pi RPC",
+        "Structured ACP" => "ACP",
+        "Native PTY" => "Native",
+        _ => "",
+    };
+    let model = app
+        .wb
+        .info
+        .sessions
+        .get(&id)
+        .and_then(|info| info.model.as_deref());
+    match model {
+        Some(model) if !mode.is_empty() => format!("{mode} · {model}"),
+        Some(model) => model.to_owned(),
+        None => mode.to_owned(),
+    }
+}
+
+/// The composer: a rounded frame whose top edge names the recipient and
+/// whose bottom edge carries the send controls.
+fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     if area.height < 2 || area.width < 4 {
         return;
     }
     let id = app.selected_session_id();
+    let focused = crate::focus::current(app) == crate::focus::Pane::Input;
     let block = Block::default()
-        .borders(Borders::LEFT)
-        .border_type(BorderType::Thick)
-        .padding(Padding::new(1, 1, u16::from(!compact), 0))
-        .border_style(if crate::focus::current(app) == crate::focus::Pane::Input {
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::new(1, 2, 0, 0))
+        .border_style(if focused {
             THEME.border_focus
         } else {
-            THEME.border
+            THEME.faint
         })
         .style(THEME.input);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let rows = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(if compact { 1 } else { 2 }),
-    ])
-    .split(inner);
-    let content = Rect::new(
-        rows[0].x + 1,
-        rows[0].y,
-        rows[0].width.saturating_sub(2),
-        rows[0].height,
+    let top = Rect::new(area.x + 2, area.y, area.width.saturating_sub(4), 1);
+    let bottom = Rect::new(
+        area.x + 2,
+        area.bottom() - 1,
+        area.width.saturating_sub(4),
+        1,
     );
+    let content = inner;
     app.wb.editor_width.set(content.width.max(1));
     let (lines, crow, ccol) = editor_lines(&app.input, app.wb.cursor, content.width.max(1));
     let offset = crow.saturating_sub(content.height.saturating_sub(1) as usize);
@@ -442,7 +475,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
         },
     );
     if app.input.is_empty() {
-        frame.render_widget(Paragraph::new("Ask anything…").style(THEME.dim), content);
+        frame.render_widget(Paragraph::new("Ask anything…").style(THEME.faint), content);
     } else {
         frame.render_widget(
             Paragraph::new(
@@ -484,16 +517,19 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
         .selected_session()
         .is_some_and(|s| matches!(s.session.state, SessionState::Done | SessionState::Error(_)));
     if app.mode == InputMode::RelayPick {
-        buttons(frame, app, rows[2], &[("Cancel quote", Target::Close)]);
+        let width = 16.min(bottom.width);
+        buttons(
+            frame,
+            app,
+            Rect::new(bottom.right() - width, bottom.y, width, 1),
+            &[("Cancel quote", Target::Close)],
+        );
         return;
     }
     if let Some(view) = app.selected_session() {
         let instance = app.agent_instance(view.session.id);
-        let title = format!(
-            "{} · {}",
-            app.session_title(view.session.id),
-            crate::agent_info::summary(app, view.session.id)
-        );
+        let title = app.session_title(view.session.id);
+        let meta = composer_meta(app, view.session.id);
         let mut counts = String::new();
         if queued > 0 {
             counts.push_str(&format!(" · {queued} queued"));
@@ -501,27 +537,50 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
         if !app.pending_relays.is_empty() {
             counts.push_str(&format!(" · {} refs", app.pending_relays.len()));
         }
-        let width = usize::from(rows[1].width);
-        let recipient = if instance.width() + 5 > width {
+        let width = usize::from(top.width);
+        let recipient = if instance.width() + 6 > width {
             let (name, ordinal) = instance.rsplit_once(" #").unwrap_or((&instance, "1"));
             let suffix = format!(" #{ordinal}");
             format!(
-                " To: {}{suffix}",
-                fit_text(name, width.saturating_sub(5 + suffix.width()))
+                "{}{suffix}",
+                fit_text(name, width.saturating_sub(6 + suffix.width()))
             )
         } else {
-            format!(" To: {instance}")
+            instance.clone()
         };
-        let mut spans = vec![Span::styled(fit_text(&recipient, width), THEME.accent_bold)];
-        let remaining = width.saturating_sub(recipient.width());
-        if instance != title && remaining > counts.width() + 4 {
-            spans.push(Span::styled(
-                format!(" · {}", fit_text(&title, remaining - counts.width() - 3)),
-                THEME.dim,
-            ));
+        let mut spans = vec![
+            Span::styled(" To: ", THEME.dim),
+            Span::styled(
+                recipient.clone(),
+                THEME
+                    .agent(&view.agent_name)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+        ];
+        let mut remaining = width.saturating_sub(recipient.width() + 6);
+        let tail = counts.width() + 1;
+        if instance != title && remaining > tail + 6 {
+            let shown = fit_text(&title, remaining - tail - 3);
+            remaining -= shown.width() + 3;
+            spans.push(Span::styled(" · ", THEME.faint));
+            spans.push(Span::styled(shown, THEME.dim));
         }
         spans.push(Span::styled(fit_text(&counts, remaining), THEME.warning));
-        frame.render_widget(Paragraph::new(Line::from(spans)), rows[1]);
+        spans.push(Span::raw(" "));
+        let used: usize = spans.iter().map(Span::width).sum();
+        if !meta.is_empty() && used + meta.width() + 4 <= width {
+            let pad = width - used - meta.width() - 2;
+            spans.push(Span::styled(
+                "─".repeat(pad),
+                if focused {
+                    THEME.border_focus
+                } else {
+                    THEME.faint
+                },
+            ));
+            spans.push(Span::styled(format!(" {meta} "), THEME.faint));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), top);
     }
     let mut controls = vec![("New line", Target::Command("/newline"))];
     if busy {
@@ -536,15 +595,22 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
     } else {
         "Send"
     };
-    let send_width = (send_label.len() as u16 + 4).min(rows[2].width);
+    let send_width = (send_label.width() as u16 + 2).min(bottom.width);
+    let controls_width = controls
+        .iter()
+        .map(|(label, _)| label.width() as u16 + 3)
+        .sum::<u16>()
+        .min(bottom.width.saturating_sub(send_width + 1));
     buttons(
         frame,
         app,
         Rect::new(
-            rows[2].x,
-            rows[2].y,
-            rows[2].width.saturating_sub(send_width),
-            rows[2].height,
+            bottom
+                .right()
+                .saturating_sub(send_width + 1 + controls_width),
+            bottom.y,
+            controls_width,
+            1,
         ),
         &controls,
     );
@@ -552,8 +618,8 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
         frame,
         app,
         Rect::new(
-            rows[2].right().saturating_sub(send_width),
-            rows[2].y,
+            bottom.right().saturating_sub(send_width),
+            bottom.y,
             send_width,
             1,
         ),
@@ -561,45 +627,36 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect, compact: bool) {
     );
 }
 
+/// Idle footer hints: `(key, action)` pairs, dropped from the end as
+/// the row narrows.
+const HINTS: [(&str, &str); 4] = [
+    ("enter", "send"),
+    ("alt+enter", "newline"),
+    ("ctrl+p", "agents"),
+    ("f1", "help"),
+];
+
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
-    let default_status = "Enter send · Alt+Enter new line";
     let activity = app.run_status();
-    let text = activity
+    let status = activity.as_deref().or(app
+        .status
         .as_deref()
-        .or(app
-            .status
-            .as_deref()
-            .filter(|s| !s.starts_with("connected ·")))
-        .unwrap_or(default_status);
+        .filter(|s| !s.starts_with("connected ·")));
     let pending = app.attention_items().len();
-    let pending_label = format!("Pending · {pending}");
+    let pending_label = format!("● {pending} pending");
     let mut choices = vec![];
     if pending > 0 {
         choices.push((pending_label.as_str(), Target::Command("/attention")));
     }
     let help_visible = area.width >= 40;
+    choices.extend([
+        ("Thoughts", Target::Command("/thinking")),
+        ("Details", Target::Command("/tools")),
+        ("Latest", Target::Command("/latest")),
+    ]);
     if help_visible {
         choices.push(("Help", Target::Command("/help")));
     }
-    choices.extend([
-        (
-            if app.wb.thoughts {
-                "Fold thoughts"
-            } else {
-                "Show thoughts"
-            },
-            Target::Command("/thinking"),
-        ),
-        (
-            if app.wb.tools_expanded {
-                "Hide details"
-            } else {
-                "Details"
-            },
-            Target::Command("/tools"),
-        ),
-        ("Latest", Target::Command("/latest")),
-    ]);
     let available = usize::from(area.width);
     let controls_width = |choices: &[(&str, Target)]| {
         choices
@@ -608,37 +665,55 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             .sum::<usize>()
             .saturating_sub(1)
     };
-    if 3 + text.width() + controls_width(&choices) >= available {
-        choices.truncate(usize::from(pending > 0) + usize::from(help_visible));
+    let text_width = status.map_or(HINTS[0].0.width() + HINTS[0].1.width() + 1, |s| s.width());
+    if 4 + text_width + controls_width(&choices) >= available {
+        // Status wins over toggles; pending and help always stay reachable.
+        choices.retain(|(_, target)| {
+            matches!(
+                target,
+                Target::Command("/attention") | Target::Command("/help")
+            )
+        });
     }
     let right_width = controls_width(&choices).min(available.saturating_sub(3)) as u16;
-    let text_width = usize::from(area.width.saturating_sub(right_width + 3));
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                if app.wb.connected { " ● " } else { " ○ " },
-                if app.wb.connected {
-                    THEME.success
-                } else {
-                    THEME.error
-                },
-            ),
-            Span::styled(
-                fit_text(text, text_width),
-                if app.wb.connected {
-                    THEME.dim
-                } else {
-                    THEME.error
-                },
-            ),
-        ])),
-        Rect::new(
-            area.x,
-            area.y,
-            area.width.saturating_sub(right_width),
-            area.height,
-        ),
+    let left = Rect::new(
+        area.x,
+        area.y,
+        area.width.saturating_sub(right_width + 1),
+        area.height,
     );
+    let width = usize::from(left.width.saturating_sub(3));
+    let mut spans = vec![Span::styled(
+        if app.wb.connected { " ● " } else { " ○ " },
+        if app.wb.connected {
+            THEME.success
+        } else {
+            THEME.error
+        },
+    )];
+    match status {
+        Some(text) => spans.push(Span::styled(
+            fit_text(text, width),
+            if app.wb.connected {
+                THEME.dim
+            } else {
+                THEME.error
+            },
+        )),
+        None => {
+            let mut used = 0;
+            for (key, action) in HINTS {
+                let cost = key.width() + action.width() + 3;
+                if used + cost > width + 2 {
+                    break;
+                }
+                spans.push(Span::styled(key, THEME.key));
+                spans.push(Span::styled(format!(" {action}   "), THEME.faint));
+                used += cost;
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), left);
     if right_width > 0 {
         buttons(
             frame,
@@ -767,12 +842,15 @@ pub(crate) fn clear_overlay(frame: &mut Frame, rect: Rect) {
 
 pub(crate) fn modal(frame: &mut Frame, width: u16, height: u16, title: &str) -> Rect {
     let rect = ui::centered(frame.area(), width, height);
+    ui::draw_backdrop(frame);
     clear_overlay(frame, rect);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(THEME.border_focus)
+        .border_type(BorderType::Rounded)
+        .border_style(THEME.faint)
+        .padding(Padding::horizontal(1))
         .style(THEME.panel)
-        .title(title);
+        .title(Line::styled(title.to_string(), THEME.accent_bold));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     inner
@@ -854,12 +932,14 @@ fn draw_picker(frame: &mut Frame, app: &App) {
             selected = Some(items.len());
         }
         targets.push((2, Some(v.session.id)));
+        let (glyph, _) = App::badge(&v.session.state);
         items.push(ListItem::new(vec![
             Line::styled(app.session_title(v.session.id), THEME.text),
-            Line::styled(
-                format!("  {} / {}", v.agent_name, v.workspace_name),
-                THEME.dim,
-            ),
+            Line::from(vec![
+                Span::styled(format!("  {glyph} "), THEME.badge(&v.session.state)),
+                Span::styled(v.agent_name.clone(), THEME.agent(&v.agent_name)),
+                Span::styled(format!(" · {}", v.workspace_name), THEME.faint),
+            ]),
         ]));
     }
     if items.is_empty() {
@@ -893,13 +973,69 @@ fn draw_picker(frame: &mut Frame, app: &App) {
     }
 }
 
+/// Keymap shown by Help, grouped by task.
+const KEYMAP: [(&str, &[(&str, &str)]); 4] = [
+    (
+        "Compose",
+        &[
+            ("Enter", "Send, or activate the focused control"),
+            ("Alt+Enter", "New line"),
+            ("Ctrl+C", "Stop the structured turn; draft is kept"),
+            ("Esc", "Back"),
+        ],
+    ),
+    (
+        "Navigate",
+        &[
+            ("Ctrl+P", "Find an agent conversation"),
+            ("Ctrl+B", "Show / hide the sidebar"),
+            ("F2 F3 F4", "Focus input · chat or diff · navigation"),
+            ("F6", "Next pane (Shift+F6 previous)"),
+            ("Tab", "Next control (Shift+Tab previous)"),
+            ("PgUp PgDn", "Scroll the focused pane"),
+        ],
+    ),
+    (
+        "Read",
+        &[
+            ("Ctrl+T", "Show / fold thoughts"),
+            ("Ctrl+O", "Expand / collapse tool details"),
+            ("[ ]", "Previous / next diff hunk"),
+            ("Home End", "Diff start / end"),
+        ],
+    ),
+    (
+        "Native mode",
+        &[(
+            "Ctrl+] m",
+            "Return to the workbench; other keys go to the agent",
+        )],
+    ),
+];
+
 fn draw_help(frame: &mut Frame, app: &App) {
-    let inner = modal(frame, 76, 19, " Getting started ");
+    let inner = modal(frame, 76, 24, " Getting started ");
     let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
-    let text = "New space · Add agent · Agents · Pending\n\nF2  Input\nF3  Chat / diff\nF4  Navigation\nF6 / Shift+F6  Next / previous pane\nTab / Shift+Tab  Next / previous control\nEnter  Activate / send\nAlt+Enter  New line\nCtrl+C  Stop structured turn; draft retained\nPageUp / PageDown  Scroll focused pane\nHome / End  Diff start / end\n[ / ]  Previous / next diff hunk\nCtrl+P  Agent picker\nCtrl+B  Sidebar\nCtrl+O  Tool details\nCtrl+T  Thoughts\nEsc  Back\n\nNative mode keeps native keys.\nCtrl+] then m returns to the workbench.\nQueued messages stay in this TUI until sent.";
-    let paragraph = Paragraph::new(text)
-        .style(THEME.text)
-        .wrap(Wrap { trim: false });
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("+ Space", THEME.accent),
+            Span::styled(" starts a worktree for a task · ", THEME.dim),
+            Span::styled("+ Agent", THEME.accent),
+            Span::styled(" adds a teammate to it.", THEME.dim),
+        ]),
+        Line::styled("Queued messages stay in this TUI until sent.", THEME.faint),
+    ];
+    for (section, keys) in KEYMAP {
+        lines.push(Line::default());
+        lines.push(Line::styled(section, THEME.section));
+        for (key, action) in keys {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {key:<11}"), THEME.key),
+                Span::styled(*action, THEME.dim),
+            ]));
+        }
+    }
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let limit = paragraph
         .line_count(parts[0].width)
         .saturating_sub(usize::from(parts[0].height))
@@ -909,6 +1045,20 @@ fn draw_help(frame: &mut Frame, app: &App) {
         parts[0],
     );
     buttons(frame, app, parts[1], &[("Close", Target::Close)]);
+}
+
+/// Keyboard shortcut shown beside a menu action, when one exists.
+fn menu_shortcut(target: &Target) -> &'static str {
+    match target {
+        Target::Command("/tasks") => "Ctrl+P",
+        Target::Command("/sidebar") => "Ctrl+B",
+        Target::Command("/help") => "F1",
+        Target::Command("/tools") => "Ctrl+O",
+        Target::Command("/thinking") => "Ctrl+T",
+        Target::Command("/cancel") => "Ctrl+C",
+        Target::Close => "Esc",
+        _ => "",
+    }
 }
 
 pub(crate) fn menu_actions() -> Vec<(&'static str, Target)> {
@@ -946,7 +1096,7 @@ pub(crate) fn menu_actions() -> Vec<(&'static str, Target)> {
     ]
 }
 fn draw_menu(frame: &mut Frame, app: &App) {
-    let inner = modal(frame, 58, 21, " Actions · arrows / wheel to scroll ");
+    let inner = modal(frame, 58, 21, " Actions ");
     let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
     let actions = menu_actions();
     let mut state = ListState::default().with_selected(Some(app.wb.menu_cursor));
@@ -967,14 +1117,23 @@ fn draw_menu(frame: &mut Frame, app: &App) {
         .enumerate()
     {
         let area = Rect::new(parts[0].x, parts[0].y + row as u16, parts[0].width, 1);
+        let shortcut = menu_shortcut(&choice.1);
+        let label = fit_text(
+            choice.0,
+            usize::from(area.width).saturating_sub(shortcut.width() + 3),
+        );
+        let pad = usize::from(area.width).saturating_sub(label.width() + shortcut.width() + 2);
         frame.render_widget(
-            Paragraph::new(format!(" {} ", choice.0)).style(
-                if state.offset() + row == app.wb.menu_cursor {
-                    THEME.selection
-                } else {
-                    THEME.text
-                },
-            ),
+            Paragraph::new(Line::from(vec![
+                Span::raw(format!(" {label}{}", " ".repeat(pad))),
+                Span::styled(shortcut, THEME.faint),
+                Span::raw(" "),
+            ]))
+            .style(if state.offset() + row == app.wb.menu_cursor {
+                THEME.selection
+            } else {
+                THEME.text
+            }),
             area,
         );
         hit(app, area, choice.1.clone());
@@ -1055,10 +1214,10 @@ mod tests {
             let app = selected_app();
             let terminal = render(&app, width, height);
             let conversation = conversation_area(&app);
-            assert_eq!(conversation.y, 2);
+            assert_eq!(conversation.y, 1);
             assert!(conversation.height.saturating_sub(1) >= minimum);
-            assert!(row_text(&terminal, 0).contains("repo-main / Test task"));
-            assert!(row_text(&terminal, height - 3).contains("To: Mock #1"));
+            assert!(row_text(&terminal, 0).contains("repo-main › Test task"));
+            assert!(row_text(&terminal, height - 4).contains("To: Mock #1"));
             assert!(row_text(&terminal, height - 1).contains('●'));
             assert!(app
                 .wb
@@ -1073,10 +1232,10 @@ mod tests {
     fn short_wide_windows_also_use_compact_chrome() {
         let app = selected_app();
         render(&app, 120, 16);
-        assert_eq!(conversation_area(&app).y, 2);
+        assert_eq!(conversation_area(&app).y, 1);
         assert!(conversation_area(&app).height >= 8);
         render(&app, 120, 30);
-        assert_eq!(conversation_area(&app).y, 3);
+        assert_eq!(conversation_area(&app).y, 2);
     }
 
     #[test]
@@ -1120,7 +1279,12 @@ mod tests {
             let hits = app.wb.hits.borrow();
             assert!(hits
                 .iter()
-                .any(|hit| hit.target == Target::Menu && hit.area.y == 1));
+                .any(|hit| hit.target == Target::Menu && hit.area.y == 0));
+            if width >= 40 {
+                assert!(hits
+                    .iter()
+                    .any(|hit| hit.target == Target::Command("/add-agent") && hit.area.y == 0));
+            }
             assert!(!row_text(&terminal, 1).contains("panel"));
             if width >= 40 {
                 assert!(hits
@@ -1177,9 +1341,9 @@ mod tests {
                 });
             let terminal = render(&app, width, height);
             let offset = if compact(Rect::new(0, 0, width, height)) {
-                3
-            } else {
                 4
+            } else {
+                5
             };
             let text = row_text(&terminal, height - offset);
             assert!(text.contains("To: Mock #1"), "{text}");
@@ -1193,7 +1357,7 @@ mod tests {
         let mut app = selected_app();
         app.sessions[0].agent_name = "中文长名称👩‍💻".repeat(10);
         let terminal = render(&app, 40, 16);
-        let text = row_text(&terminal, 13);
+        let text = row_text(&terminal, 12);
         assert!(text.contains("To:"), "{text}");
         assert!(text.contains("#1"), "{text}");
         assert!(text.contains('…'), "{text}");
@@ -1204,7 +1368,7 @@ mod tests {
         let mut app = selected_app();
         let terminal = render(&app, 80, 24);
         let text = row_text(&terminal, 23);
-        assert!(text.contains("Enter send · Alt+Enter new line"), "{text}");
+        assert!(text.contains("enter send   alt+enter newline"), "{text}");
         assert!(text.contains("Latest"), "{text}");
         app.wb.connected = false;
         app.set_status(
@@ -1248,7 +1412,7 @@ mod tests {
         assert!(hits
             .iter()
             .all(|h| h.area.intersection(Rect::new(0, 0, 20, 8)) == h.area));
-        assert!(row_text(&terminal, 5).contains("To: Mock #1"));
+        assert!(row_text(&terminal, 4).contains("To: Mock #1"));
     }
 
     #[test]
