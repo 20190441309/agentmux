@@ -55,16 +55,19 @@ import json
 import os
 import re
 import sys
+import time
 
 sys.stdin.reconfigure(encoding="utf-8")
 sys.stdout.reconfigure(encoding="utf-8")
 
 SESSION_ID = "pi-session-1"
+SESSION_FILE = os.path.join(os.getcwd(), f".fake-pi-session-{os.getpid()}.jsonl")
 
 STATE = {
+    "model": {"provider": "fake", "id": "small", "name": "Small"},
     "sessionId": SESSION_ID,
     "sessionName": "fake-pi",
-    "sessionFile": "/tmp/fake-pi-session.jsonl",
+    "sessionFile": SESSION_FILE,
     "isStreaming": False,
     "isCompacting": False,
     "thinkingLevel": "medium",
@@ -77,6 +80,12 @@ STATE = {
 
 # True while a `slow` prompt run is waiting for `abort`.
 waiting_abort = False
+messages = []
+
+
+def persist_session():
+    with open(STATE["sessionFile"], "w", encoding="utf-8") as file:
+        json.dump({"sessionId": STATE["sessionId"], "messages": messages}, file, ensure_ascii=False)
 
 # Event lines emitted by a `burst` prompt — deliberately beyond the 256
 # records a 256-cap broadcast ring can retain.
@@ -136,10 +145,36 @@ def emit_tool_run(fail=False):
 
 def emit_run(message):
     """Emit a complete agent run for `message`, in the documented order."""
-    reply = "fake pi reply: " + message
+    reply = "fake pi reply: reasoningprobe tool" if triggered(message, "reasoningprobe") else "fake pi reply: " + message
     send({"type": "agent_start"})
     send({"type": "turn_start"})
     send({"type": "message_start", "message": {"role": "assistant", "content": []}})
+    if triggered(message, "burstprobe"):
+        thought = "BEGIN_THOUGHT" + "思考完整性校验-12345-" * 35 + "END_THOUGHT"
+        reply = "BEGIN_ANSWER" + "中文回复完整校验-abc123-" * 35 + "END_ANSWER"
+        for kind, text in [("thinking", thought), ("text", reply)]:
+            send({"type": "message_update", "assistantMessageEvent": {"type": kind + "_start", "contentIndex": 0}})
+            for i, char in enumerate(text):
+                send({"type": "message_update", "assistantMessageEvent": {"type": kind + "_delta", "contentIndex": 0, "delta": char}})
+                if i % 16 == 0:
+                    time.sleep(0.01)
+            send({"type": "message_update", "assistantMessageEvent": {"type": kind + "_end", "contentIndex": 0}})
+        send({"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": reply}]}})
+        send({"type": "agent_end", "messages": [], "willRetry": False})
+        send({"type": "agent_settled"})
+        return
+    if triggered(message, "scrollprobe"):
+        thought = "\n\n".join(f"THOUGHT_ROW_{i:04d} 检查中文换行与长对话滚动。" for i in range(900))
+        send({"type": "message_update", "assistantMessageEvent": {"type": "thinking_delta", "contentIndex": 0, "delta": thought}})
+        send({"type": "message_update", "assistantMessageEvent": {"type": "thinking_end", "contentIndex": 0}})
+        reply = "```rust\n" + "\n".join(f"let row_{i:04d} = {i};" for i in range(80)) + "\n```\n\nSCROLL_REPLY_END"
+    if triggered(message, "reasoningprobe"):
+        send({"type": "message_update", "assistantMessageEvent": {"type": "thinking_start", "contentIndex": 0}})
+        send({"type": "message_update", "assistantMessageEvent": {"type": "thinking_delta", "contentIndex": 0, "delta": "Inspect the request. "}})
+        time.sleep(1.2)
+        send({"type": "message_update", "assistantMessageEvent": {"type": "thinking_delta", "contentIndex": 0, "delta": "Check the relevant files."}})
+        time.sleep(1.2)
+        send({"type": "message_update", "assistantMessageEvent": {"type": "thinking_end", "contentIndex": 0}})
     if triggered(message, "toolfail"):
         emit_tool_run(fail=True)
     elif triggered(message, "tool"):
@@ -166,7 +201,7 @@ def emit_run(message):
 
 
 def main():
-    global waiting_abort
+    global waiting_abort, messages
     for raw in sys.stdin:
         try:
             req = json.loads(raw)
@@ -176,8 +211,60 @@ def main():
 
         if ctype == "get_state":
             respond(req, "get_state", data=dict(STATE))
+        elif ctype == "get_commands":
+            respond(req, ctype, data={"commands": [{"name": "fix-tests", "description": "Fix failing tests", "source": "prompt"}, {"name":"skill:review", "description":"Review code", "source":"skill"}]})
+        elif ctype == "get_available_models":
+            respond(req, ctype, data={"models": [{"provider":"fake", "id":"small", "name":"Small"}, {"provider":"fake", "id":"large", "name":"Large"}]})
+        elif ctype == "set_model":
+            STATE["model"] = {"provider": req["provider"], "id":req["modelId"]}
+            respond(req, ctype, data=STATE["model"])
+        elif ctype == "get_available_thinking_levels":
+            respond(req, ctype, data={"levels":["off", "low", "medium", "high"]})
+        elif ctype == "set_thinking_level":
+            if req["level"] not in ["off", "low", "medium", "high"]:
+                respond(req, ctype, success=False, error="invalid thinking level")
+                continue
+            STATE["thinkingLevel"] = req["level"]
+            respond(req, ctype)
+        elif ctype == "set_auto_compaction":
+            STATE["autoCompactionEnabled"] = req["enabled"]
+            respond(req, ctype)
+        elif ctype == "set_session_name":
+            STATE["sessionName"] = req["name"]
+            respond(req, ctype)
+        elif ctype == "compact":
+            respond(req, ctype, data={"summary":"Fake conversation compacted", "tokensBefore":1000})
+        elif ctype == "get_session_stats":
+            respond(req, ctype, data={"sessionId":SESSION_ID, "messageCount":STATE["messageCount"]})
         elif ctype == "new_session":
+            messages = []
+            STATE["messageCount"] = 0
+            if os.environ.get("FAKE_PI_NO_FILE"):
+                STATE["sessionFile"] = None
+            else:
+                persist_session()
             respond(req, "new_session", data={"cancelled": False})
+        elif ctype == "switch_session":
+            if os.environ.get("FAKE_PI_CANCEL_SWITCH"):
+                respond(req, ctype, data={"cancelled": True})
+                continue
+            if os.environ.get("FAKE_PI_FAIL_SWITCH"):
+                respond(req, ctype, success=False, error="fake switch failed")
+                continue
+            try:
+                with open(req["sessionPath"], encoding="utf-8") as file:
+                    saved = json.load(file)
+                messages = saved["messages"]
+                STATE["sessionId"] = saved["sessionId"]
+                STATE["sessionFile"] = req["sessionPath"]
+                STATE["messageCount"] = len(messages)
+                if os.environ.get("FAKE_PI_WRONG_ID"):
+                    STATE["sessionId"] = "wrong-native-session"
+                respond(req, ctype, data={"cancelled": False})
+            except (OSError, ValueError, KeyError) as error:
+                respond(req, ctype, success=False, error=str(error))
+        elif ctype == "get_messages":
+            respond(req, ctype, data={"messages": list(messages)})
         elif ctype == "abort":
             if waiting_abort:
                 waiting_abort = False
@@ -186,6 +273,12 @@ def main():
             respond(req, "abort")
         elif ctype == "prompt":
             msg = req.get("message", "")
+            if triggered(msg, "recallprobe"):
+                msg = "remembered context: " + " | ".join(messages)
+            messages.append(msg)
+            STATE["messageCount"] = len(messages)
+            if STATE["sessionFile"]:
+                persist_session()
             if triggered(msg, "crash"):
                 os._exit(1)
             if triggered(msg, "exit42"):

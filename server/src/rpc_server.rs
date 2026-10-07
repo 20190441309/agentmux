@@ -191,7 +191,16 @@ pub fn build_daemon(paths: &ServerPaths) -> Result<Arc<Daemon>> {
         AgentRegistry::probed(&config),
         paths.data_dir.clone(),
     );
-    Ok(Daemon::new(orch))
+    orch.set_native_socket(std::path::absolute(&paths.socket_path)?);
+    let mut daemon = Daemon::new(orch);
+    Arc::get_mut(&mut daemon)
+        .expect("new daemon has one owner")
+        .paths = Some(ServerPaths {
+        data_dir: std::path::absolute(&paths.data_dir)?,
+        socket_path: std::path::absolute(&paths.socket_path)?,
+        config_path: std::path::absolute(&paths.config_path)?,
+    });
+    Ok(daemon)
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +278,7 @@ fn tighten_socket_perms(_path: &Path) -> io::Result<()> {
 /// surface needs (uptime, shutdown signalling).
 pub struct Daemon {
     orchestrator: Arc<Orchestrator>,
+    paths: Option<ServerPaths>,
     started: Instant,
     shutdown: Notify,
 }
@@ -277,6 +287,7 @@ impl Daemon {
     pub fn new(orch: Orchestrator) -> Arc<Daemon> {
         Arc::new(Daemon {
             orchestrator: Arc::new(orch),
+            paths: None,
             started: Instant::now(),
             shutdown: Notify::new(),
         })
@@ -306,6 +317,8 @@ impl Daemon {
                     version: env!("CARGO_PKG_VERSION").to_string(),
                     uptime_secs: self.started.elapsed().as_secs(),
                     sessions: self.orchestrator.session_count(),
+                    data_dir: self.paths.as_ref().map(|p| p.data_dir.clone()),
+                    config_path: self.paths.as_ref().map(|p| p.config_path.clone()),
                 };
                 to_value(&result)
             }
@@ -672,15 +685,335 @@ pub async fn dispatch(orch: &Orchestrator, method: &str, params: Value) -> Resul
         }
         M_SESSION_CREATE => {
             let p: rpc::SessionCreateParams = parse_params(params)?;
-            let id = orch
+            let id = match orch
                 .create_session(p.workspace_id, &p.agent_id, p.prompt)
                 .await
-                .map_err(RpcError::from)?;
+            {
+                Ok(id) => id,
+                Err(error) => {
+                    match error.downcast_ref::<agentmux_core::orchestrator::SessionSetupFailure>() {
+                        Some(failure) => failure.session_id,
+                        None => return Err(RpcError::from(error)),
+                    }
+                }
+            };
             let session = orch
                 .get_session(id)
                 .map_err(RpcError::from)?
                 .ok_or_else(|| RpcError::internal("created session vanished"))?;
             to_value(&rpc::SessionCreateResult { session })
+        }
+        rpc::M_SESSION_PI => {
+            let p: rpc::SessionPiParams = parse_params(params)?;
+            orch.pi_command(p.session_id, p.command)
+                .await
+                .map_err(RpcError::from)
+        }
+        rpc::M_WORKSPACE_OPEN => {
+            let p: rpc::WorkspaceOpenParams = parse_params(params)?;
+            to_value(&rpc::WorkspaceCreateResult {
+                workspace: orch.open_workspace(p.project_id).map_err(RpcError::from)?,
+            })
+        }
+        rpc::M_NATIVE_LIST => {
+            let p: rpc::NativeListParams = parse_params(params)?;
+            to_value(
+                &orch
+                    .native_list(p.session_id)
+                    .await
+                    .map_err(RpcError::from)?,
+            )
+        }
+        rpc::M_NATIVE_OPEN => {
+            let p: rpc::NativeOpenParams = parse_params(params)?;
+            to_value(&rpc::SessionCreateResult {
+                session: orch.native_open(p).await.map_err(RpcError::from)?,
+            })
+        }
+        rpc::M_NATIVE_CHECK => {
+            let p: rpc::NativeControlParams = parse_params(params)?;
+            orch.native_check(p).await.map_err(RpcError::from)?;
+            to_value(&())
+        }
+        rpc::M_NATIVE_REPORT => {
+            let p: rpc::NativeControlParams = parse_params(params)?;
+            orch.native_report(p).await.map_err(RpcError::from)?;
+            to_value(&())
+        }
+        rpc::M_TERMINAL_ATTACH => {
+            let p: rpc::TerminalAttachParams = parse_params(params)?;
+            to_value(&orch.terminal_attach(p).await.map_err(RpcError::from)?)
+        }
+        rpc::M_TERMINAL_READ => {
+            let p: rpc::TerminalReadParams = parse_params(params)?;
+            to_value(&orch.terminal_read(p).await.map_err(RpcError::from)?)
+        }
+        rpc::M_TERMINAL_INPUT => {
+            let p: rpc::TerminalInputParams = parse_params(params)?;
+            orch.terminal_input(p).await.map_err(RpcError::from)?;
+            to_value(&())
+        }
+        rpc::M_TERMINAL_RESIZE => {
+            let p: rpc::TerminalResizeParams = parse_params(params)?;
+            orch.terminal_resize(p).await.map_err(RpcError::from)?;
+            to_value(&())
+        }
+        rpc::M_TERMINAL_DETACH => {
+            let p: rpc::TerminalDetachParams = parse_params(params)?;
+            orch.terminal_detach(p).map_err(RpcError::from)?;
+            to_value(&())
+        }
+        rpc::M_SESSION_TITLE => {
+            let p: rpc::SessionTitleParams = parse_params(params)?;
+            to_value(
+                &orch
+                    .set_session_title(p.session_id, p.title)
+                    .map_err(RpcError::from)?,
+            )
+        }
+        rpc::M_SESSION_HISTORY => {
+            let p: rpc::SessionHistoryParams = parse_params(params)?;
+            let session = orch
+                .get_session(p.session_id)
+                .map_err(RpcError::from)?
+                .ok_or_else(|| RpcError::internal("session not found"))?;
+            let all = orch.read_events(p.session_id).map_err(RpcError::from)?;
+            let conversation_start = all
+                .iter()
+                .filter(|e| e.resets_conversation_view())
+                .map(|e| e.seq)
+                .max()
+                .unwrap_or(0);
+            let named = all
+                .iter()
+                .rev()
+                .filter(|e| e.seq > conversation_start)
+                .find_map(|e| {
+                    if let EventKind::TitleChanged { title } = &e.kind {
+                        Some((title.clone(), e.seq))
+                    } else {
+                        None
+                    }
+                });
+            let prompt_title =
+                all.iter()
+                    .filter(|e| e.seq > conversation_start)
+                    .find_map(|e| {
+                        if let EventKind::SessionUpdate(v) = &e.kind {
+                            let u = v.get("update").unwrap_or(v);
+                            if u.get("sessionUpdate").and_then(|v| v.as_str())
+                                == Some("user_message_chunk")
+                            {
+                                return u.pointer("/content/text").and_then(|v| v.as_str()).map(
+                                    |s| {
+                                        (
+                                            s.lines()
+                                                .find(|l| !l.trim().is_empty())
+                                                .unwrap_or("")
+                                                .chars()
+                                                .take(60)
+                                                .collect(),
+                                            e.seq,
+                                        )
+                                    },
+                                );
+                            }
+                        }
+                        None
+                    });
+            let (title, title_seq) = named
+                .or(prompt_title)
+                .map(|(title, seq)| (Some(title), seq))
+                .unwrap_or((None, 0));
+            let mut pending = std::collections::BTreeMap::new();
+            if !matches!(
+                session.state,
+                agentmux_core::SessionState::Done | agentmux_core::SessionState::Error(_)
+            ) {
+                for e in &all {
+                    match &e.kind {
+                        EventKind::PermissionRequest { request_id, .. } => {
+                            pending.insert(request_id.clone(), e.clone());
+                        }
+                        EventKind::PermissionResolved { request_id, .. } => {
+                            pending.remove(request_id);
+                        }
+                        EventKind::StateChanged {
+                            to:
+                                agentmux_core::SessionState::Done
+                                | agentmux_core::SessionState::Error(_),
+                            ..
+                        } => {
+                            // A new adapter session cannot answer requests from
+                            // a terminated process, even when IDs are reused.
+                            pending.clear();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // Bound the serialized page, not just the number of events. Each
+            // normal event and all pending requests together stay well below
+            // the client's 8 MiB frame limit, including JSON escaping.
+            const PAGE_BYTES: usize = 1024 * 1024;
+            let mut available_commands = all
+                .iter()
+                .rev()
+                .find(|event| {
+                    event.seq >= conversation_start && event.available_commands().is_some()
+                })
+                .cloned();
+            let mut available_commands_ref = None;
+            if let Some(event) = &available_commands {
+                if serde_json::to_vec(event)
+                    .map_err(|e| RpcError::internal(e.to_string()))?
+                    .len()
+                    > PAGE_BYTES
+                {
+                    available_commands_ref = Some(event.seq);
+                    available_commands = None;
+                }
+            }
+            let eligible: Vec<_> = all
+                .into_iter()
+                .filter(|e| p.before_seq.is_none_or(|seq| e.seq < seq))
+                .collect();
+            let mut bytes = 0;
+            let mut events = Vec::new();
+            let mut event_refs = Vec::new();
+            for event in eligible.iter().rev().take(200) {
+                let size = serde_json::to_vec(event)
+                    .map_err(|e| RpcError::internal(e.to_string()))?
+                    .len();
+                if bytes + size > PAGE_BYTES {
+                    if events.is_empty() {
+                        event_refs.push(event.seq);
+                    }
+                    break;
+                }
+                bytes += size;
+                events.push(event.clone());
+            }
+            let has_more = eligible.len() > events.len() + event_refs.len();
+            events.reverse();
+            let mut pending_permissions = Vec::new();
+            let mut pending_permission_refs = Vec::new();
+            bytes = 0;
+            for event in pending.into_values() {
+                let size = serde_json::to_vec(&event)
+                    .map_err(|e| RpcError::internal(e.to_string()))?
+                    .len();
+                if bytes + size > PAGE_BYTES {
+                    pending_permission_refs.push(event.seq);
+                } else {
+                    bytes += size;
+                    pending_permissions.push(event);
+                }
+            }
+            let result = to_value(&rpc::SessionHistoryResult {
+                title_seq,
+                conversation_start,
+                events,
+                has_more,
+                title,
+                pending_permissions,
+                event_refs,
+                pending_permission_refs,
+                available_commands,
+                available_commands_ref,
+            })?;
+            if serde_json::to_vec(&result)
+                .map_err(|e| RpcError::internal(e.to_string()))?
+                .len()
+                > 4 * PAGE_BYTES
+            {
+                return Err(RpcError::internal(
+                    "too many pending permissions to return in one history page",
+                ));
+            }
+            Ok(result)
+        }
+        rpc::M_SESSION_EVENT_READ => {
+            let p: rpc::SessionEventReadParams = parse_params(params)?;
+            let event = orch
+                .read_events(p.session_id)
+                .map_err(RpcError::from)?
+                .into_iter()
+                .find(|e| e.seq == p.seq)
+                .ok_or_else(|| RpcError::internal("event not found"))?;
+            let json =
+                serde_json::to_string(&event).map_err(|e| RpcError::internal(e.to_string()))?;
+            if p.offset >= json.len() || !json.is_char_boundary(p.offset) {
+                return Err(RpcError::internal("invalid event chunk offset"));
+            }
+            let mut end = p.offset.saturating_add(256 * 1024).min(json.len());
+            while !json.is_char_boundary(end) {
+                end -= 1;
+            }
+            to_value(&rpc::SessionEventReadResult {
+                data: json[p.offset..end].to_string(),
+                next_offset: (end < json.len()).then_some(end),
+            })
+        }
+        rpc::M_WORKSPACE_DIFF => {
+            let p: rpc::WorkspaceDiffParams = parse_params(params)?;
+            let ws = orch
+                .get_workspace(p.workspace_id)
+                .map_err(RpcError::from)?
+                .ok_or_else(|| RpcError::internal("workspace not found"))?;
+            let result = tokio::task::spawn_blocking(move || {
+                agentmux_core::workspace_files::diff(&ws.worktree_path, &p)
+            })
+            .await
+            .map_err(|e| RpcError::internal(e.to_string()))?
+            .map_err(RpcError::from)?;
+            to_value(&result)
+        }
+        rpc::M_WORKSPACE_CHANGES => {
+            let p: rpc::WorkspaceChangesParams = parse_params(params)?;
+            let ws = orch
+                .get_workspace(p.workspace_id)
+                .map_err(RpcError::from)?
+                .ok_or_else(|| RpcError::internal("workspace not found"))?;
+            let result = tokio::task::spawn_blocking(move || {
+                agentmux_core::workspace_files::changes(&ws.worktree_path)
+            })
+            .await
+            .map_err(|error| RpcError::internal(error.to_string()))?
+            .map_err(RpcError::from)?;
+            to_value(&result)
+        }
+        rpc::M_WORKSPACE_CONTEXT => {
+            let p: rpc::WorkspaceChangesParams = parse_params(params)?;
+            let workspace = orch
+                .get_workspace(p.workspace_id)
+                .map_err(RpcError::from)?
+                .ok_or_else(|| RpcError::internal("workspace not found"))?;
+            let result = tokio::task::spawn_blocking(move || {
+                agentmux_core::workspace_context::load(&workspace.worktree_path)
+            })
+            .await
+            .map_err(|error| RpcError::internal(error.to_string()))?
+            .map_err(RpcError::from)?;
+            to_value(&result)
+        }
+        rpc::M_WORKSPACE_CONTEXT_SAVE => {
+            let p: rpc::WorkspaceContextSaveParams = parse_params(params)?;
+            let workspace = orch
+                .get_workspace(p.workspace_id)
+                .map_err(RpcError::from)?
+                .ok_or_else(|| RpcError::internal("workspace not found"))?;
+            let result = tokio::task::spawn_blocking(move || {
+                agentmux_core::workspace_context::save(
+                    &workspace.worktree_path,
+                    p.expected.as_deref(),
+                    &p.text,
+                )
+            })
+            .await
+            .map_err(|error| RpcError::internal(error.to_string()))?
+            .map_err(RpcError::from)?;
+            to_value(&result)
         }
         M_SESSION_PROMPT => {
             let p: rpc::SessionPromptParams = parse_params(params)?;

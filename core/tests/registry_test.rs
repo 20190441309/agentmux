@@ -40,7 +40,19 @@ fn missing_config_file_falls_back_to_builtin_agents() {
         .iter()
         .map(|p| p.id.0.as_str())
         .collect();
-    assert_eq!(ids, ["claude-code", "codex", "opencode", "pi"]);
+    assert_eq!(
+        ids,
+        [
+            "claude-code-native",
+            "codex-native",
+            "opencode-native",
+            "pi-native",
+            "claude-code",
+            "codex",
+            "opencode",
+            "pi"
+        ]
+    );
     assert!(
         registry.profiles().iter().all(|p| !p.available),
         "profiles must start unavailable until probe() runs"
@@ -121,6 +133,10 @@ PI_DEBUG = "1"
     assert_eq!(
         ids,
         [
+            "claude-code-native",
+            "codex-native",
+            "opencode-native",
+            "pi-native",
             "claude-code",
             "codex",
             "opencode",

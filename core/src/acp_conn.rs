@@ -81,6 +81,7 @@ struct PendingPermission {
 /// [`AcpConn`] handle (which resolves them). Locked for map ops only —
 /// never held across `.await`.
 type PendingPermissions = Arc<Mutex<HashMap<String, PendingPermission>>>;
+type CommandCatalog = Arc<Mutex<Option<serde_json::Value>>>;
 
 /// Map a generic [`PermissionDecision`] onto the options the agent
 /// offered. `Err` means the asked-for kind wasn't offered — the request
@@ -182,6 +183,11 @@ enum Cmd {
         cwd: PathBuf,
         reply: oneshot::Sender<Result<String>>,
     },
+    LoadSession {
+        session_id: String,
+        cwd: PathBuf,
+        reply: oneshot::Sender<Result<()>>,
+    },
     Prompt {
         session_id: String,
         text: String,
@@ -222,6 +228,8 @@ pub struct AcpConn {
     /// worker-side handler; resolved by [`AcpConn::respond_permission`]
     /// and drained `cancelled` on `cancel`/`close`/drop.
     pending: PendingPermissions,
+    /// Capability snapshots must survive transcript replay overflowing events.
+    commands: CommandCatalog,
     /// Worker thread driving the `!Send` ACP machinery.
     thread: Option<JoinHandle<()>>,
     /// Connection timeouts from config (`ConnTimeouts`, resolved through
@@ -253,6 +261,7 @@ impl AcpConn {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let pending: PendingPermissions = Arc::new(Mutex::new(HashMap::new()));
+        let commands: CommandCatalog = Arc::new(Mutex::new(None));
 
         let spec = SpawnSpec {
             command: command.to_path_buf(),
@@ -263,6 +272,7 @@ impl AcpConn {
         };
         let thread_event_tx = event_tx.clone();
         let thread_pending = pending.clone();
+        let thread_commands = commands.clone();
 
         let thread = std::thread::Builder::new()
             .name(format!("acp-conn-{session_id}"))
@@ -272,6 +282,7 @@ impl AcpConn {
                     session_id,
                     thread_event_tx,
                     thread_pending,
+                    thread_commands,
                     cmd_rx,
                     ready_tx,
                 );
@@ -291,6 +302,7 @@ impl AcpConn {
             session_id,
             cmd_tx: Mutex::new(Some(cmd_tx)),
             pending,
+            commands,
             thread: Some(thread),
             timeouts: options.timeouts,
             stderr,
@@ -300,6 +312,11 @@ impl AcpConn {
     /// The internal [`SessionId`] stamped on events from this connection.
     pub fn session_id(&self) -> SessionId {
         self.session_id
+    }
+
+    /// Latest command notification, independent of the bounded event stream.
+    pub fn command_catalog(&self) -> Option<serde_json::Value> {
+        self.commands.lock().unwrap().clone()
     }
 
     /// Perform the ACP `initialize` handshake, advertising fs read/write and
@@ -328,6 +345,18 @@ impl AcpConn {
             reply: tx,
         })?;
         self.await_reply(rx, Duration::ZERO, "session/new").await
+    }
+
+    /// Load an existing native conversation; callers must check loadSession.
+    pub async fn load_session(&self, session_id: &str, cwd: &Path) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Cmd::LoadSession {
+            session_id: session_id.to_owned(),
+            cwd: cwd.to_path_buf(),
+            reply: tx,
+        })?;
+        self.await_reply(rx, self.timeouts.prompt, "session/load")
+            .await
     }
 
     /// Send a user prompt; resolves when the agent finishes its turn.
@@ -537,6 +566,7 @@ fn actor_main(
     session_id: SessionId,
     event_tx: broadcast::Sender<Event>,
     pending: PendingPermissions,
+    commands: CommandCatalog,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     ready_tx: std::sync::mpsc::Sender<Result<StderrCapture>>,
 ) {
@@ -593,6 +623,7 @@ fn actor_main(
             cwd: session_cwd.clone(),
             event_tx: event_tx.clone(),
             pending,
+            commands,
         };
 
         // The returned io future and the `spawn` callback are `!Send`; both
@@ -724,6 +755,19 @@ async fn handle_cmd(
             }
             let _ = reply.send(result);
         }
+        Cmd::LoadSession {
+            session_id,
+            cwd,
+            reply,
+        } => {
+            *session_cwd.lock().unwrap() = cwd.clone();
+            let result = conn
+                .load_session(acp::LoadSessionRequest::new(session_id, cwd))
+                .await
+                .map(|_| ())
+                .map_err(|e| anyhow!("acp session/load failed: {e}"));
+            let _ = reply.send(result);
+        }
         Cmd::Prompt {
             session_id,
             text,
@@ -764,6 +808,7 @@ struct AcpClientHandler {
     /// them, and the handler removes its own entry when its await ends
     /// (so a timed-out request can never be answered into a void).
     pending: PendingPermissions,
+    commands: CommandCatalog,
 }
 
 impl AcpClientHandler {
@@ -911,6 +956,9 @@ impl acp::Client for AcpClientHandler {
 
     async fn session_notification(&self, args: acp::SessionNotification) -> acp::Result<()> {
         let payload = serde_json::to_value(&args).unwrap_or(serde_json::Value::Null);
+        if matches!(args.update, acp::SessionUpdate::AvailableCommandsUpdate(_)) {
+            *self.commands.lock().unwrap() = Some(payload.clone());
+        }
         emit(
             &self.event_tx,
             self.session_id,
@@ -1014,6 +1062,7 @@ mod tests {
                 cwd: Arc::new(Mutex::new(cwd.to_path_buf())),
                 event_tx,
                 pending: pending.clone(),
+                commands: Arc::new(Mutex::new(None)),
             },
             rx,
             pending,

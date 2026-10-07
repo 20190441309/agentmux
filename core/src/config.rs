@@ -33,7 +33,7 @@ use anyhow::{bail, Context};
 use serde::Deserialize;
 
 use crate::id::AgentId;
-use crate::model::{AdapterKind, AgentProfile};
+use crate::model::{AdapterKind, AgentProfile, NativeSessionBackend};
 use crate::Result;
 
 /// Default [`ConnTimeouts::init`] — bound on the agent `initialize`
@@ -132,6 +132,7 @@ impl Config {
             toml::from_str(&text).with_context(|| format!("failed to parse {}", path.display()))?;
 
         let mut config = Config::default();
+        let mut overrides = std::collections::HashSet::new();
         if let Some(secs) = raw.init_timeout_secs {
             config.timeouts.init = Duration::from_secs(secs);
         }
@@ -140,10 +141,33 @@ impl Config {
         }
         for raw_agent in raw.agents {
             let profile = raw_agent.into_profile()?;
+            overrides.insert(profile.id.clone());
             match config.agents.iter_mut().find(|p| p.id == profile.id) {
                 // A user entry with a built-in (or earlier user) id overrides it.
                 Some(slot) => *slot = profile,
                 None => config.agents.push(profile),
+            }
+        }
+        for (native, structured) in [
+            ("pi-native", "pi"),
+            ("codex-native", "codex"),
+            ("claude-code-native", "claude-code"),
+            ("opencode-native", "opencode"),
+        ] {
+            if !overrides.contains(&AgentId::new(native)) {
+                let env = config
+                    .agents
+                    .iter()
+                    .find(|a| a.id == AgentId::new(structured))
+                    .map(|a| a.env.clone())
+                    .unwrap_or_default();
+                if let Some(agent) = config
+                    .agents
+                    .iter_mut()
+                    .find(|a| a.id == AgentId::new(native))
+                {
+                    agent.env = env;
+                }
             }
         }
         Ok(config)
@@ -153,6 +177,24 @@ impl Config {
 /// The built-in agent table, in registry order. All `available: false` —
 /// probing happens later, in the registry.
 fn builtin_agents() -> Vec<AgentProfile> {
+    let native = |id: &str,
+                  name: &str,
+                  command: &str,
+                  backend: Option<NativeSessionBackend>,
+                  resume: &[&str],
+                  history: &[&str]| AgentProfile {
+        id: AgentId::new(id),
+        name: format!("{name} (native)"),
+        adapter: AdapterKind::Native {
+            command: command.into(),
+            args: vec![],
+            session_backend: backend,
+            resume_args: resume.iter().map(|s| (*s).into()).collect(),
+            history_args: history.iter().map(|s| (*s).into()).collect(),
+        },
+        env: BTreeMap::new(),
+        available: false,
+    };
     let acp = |id: &str, name: &str, command: &str, args: &[&str]| AgentProfile {
         id: AgentId::new(id),
         name: name.into(),
@@ -164,6 +206,38 @@ fn builtin_agents() -> Vec<AgentProfile> {
         available: false,
     };
     vec![
+        native(
+            "claude-code-native",
+            "Claude Code",
+            "claude",
+            None,
+            &["--resume", "{session_id}"],
+            &["--resume"],
+        ),
+        native(
+            "codex-native",
+            "Codex",
+            "codex",
+            None,
+            &["resume", "{session_id}"],
+            &["resume"],
+        ),
+        native(
+            "opencode-native",
+            "OpenCode",
+            "opencode",
+            None,
+            &["--session", "{session_id}"],
+            &[],
+        ),
+        native(
+            "pi-native",
+            "Pi",
+            "pi",
+            Some(NativeSessionBackend::Pi),
+            &["--session", "{session_file}"],
+            &["--resume"],
+        ),
         acp("claude-code", "Claude Code", "claude-code-acp", &[]),
         acp("codex", "Codex", "codex-acp", &[]),
         acp("opencode", "OpenCode", "opencode", &["acp"]),
@@ -212,6 +286,11 @@ struct RawAgent {
     command: PathBuf,
     #[serde(default)]
     args: Vec<String>,
+    session_backend: Option<NativeSessionBackend>,
+    #[serde(default)]
+    resume_args: Vec<String>,
+    #[serde(default)]
+    history_args: Vec<String>,
     #[serde(default)]
     env: BTreeMap<String, String>,
 }
@@ -244,7 +323,16 @@ impl RawAgent {
                 command,
                 args: self.args,
             },
-            _ => bail!("unknown [[agents]] kind {kind_tag:?} (expected \"acp\" or \"pi-rpc\")"),
+            "native" | "pty" => AdapterKind::Native {
+                command,
+                args: self.args,
+                session_backend: self.session_backend,
+                resume_args: self.resume_args,
+                history_args: self.history_args,
+            },
+            _ => bail!(
+                "unknown [[agents]] kind {kind_tag:?} (expected \"native\", \"acp\" or \"pi-rpc\")"
+            ),
         };
 
         Ok(AgentProfile {

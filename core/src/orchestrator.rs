@@ -31,15 +31,15 @@
 //!
 //! # Resume semantics
 //!
-//! Neither conn wrapper exposes `session/load`, so `resume` takes the
-//! degraded path: the old connection is closed and a **fresh** adapter
-//! session replaces `acp_session_id`. History is not lost — it persists
-//! in `<data_dir>/sessions/<id>.jsonl`, `seq` keeps increasing across the
-//! resume, and callers can re-inject context via `prompt`'s `refs`.
+//! `resume` reconnects to the existing native conversation: ACP uses
+//! `session/load` when advertised; Pi uses its persisted session file.
+//! Unsupported or failed restoration never silently creates a replacement.
+//! A setup that never obtained a native identity may retry initial creation.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, ensure, Context};
 use chrono::Utc;
@@ -63,6 +63,21 @@ use crate::{AcpConn, PiConn, Result};
 /// tolerate drops; the JSONL log is the authoritative record.
 const BUS_CAPACITY: usize = 1024;
 
+/// Setup failed after a session was persisted; clients can resume this record.
+#[derive(Debug)]
+pub struct SessionSetupFailure {
+    pub session_id: SessionId,
+    pub reason: String,
+}
+
+impl std::fmt::Display for SessionSetupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (session {})", self.reason, self.session_id)
+    }
+}
+
+impl std::error::Error for SessionSetupFailure {}
+
 /// A live connection to a spawned agent process — either ACP or pi RPC.
 ///
 /// The two adapters share one method surface; the enum delegates so the
@@ -74,6 +89,7 @@ const BUS_CAPACITY: usize = 1024;
 pub enum SpawnedConn {
     Acp(AcpConn),
     Pi(PiConn),
+    Native(crate::terminal::NativeTerminal),
 }
 
 impl SpawnedConn {
@@ -91,6 +107,9 @@ impl SpawnedConn {
             AdapterKind::PiRpc { command, args } => {
                 PiConn::spawn(command, args, &profile.env, cwd, options).map(SpawnedConn::Pi)
             }
+            AdapterKind::Native { args, .. } => {
+                crate::terminal::NativeTerminal::spawn(profile, cwd, args).map(SpawnedConn::Native)
+            }
         }
     }
 
@@ -101,6 +120,7 @@ impl SpawnedConn {
         match self {
             SpawnedConn::Acp(c) => c.session_id(),
             SpawnedConn::Pi(c) => c.session_id(),
+            SpawnedConn::Native(c) => c.session_id(),
         }
     }
 
@@ -108,6 +128,7 @@ impl SpawnedConn {
         match self {
             SpawnedConn::Acp(c) => c.initialize().await,
             SpawnedConn::Pi(c) => c.initialize().await,
+            SpawnedConn::Native(_) => Ok(serde_json::json!({"native":true})),
         }
     }
 
@@ -115,6 +136,7 @@ impl SpawnedConn {
         match self {
             SpawnedConn::Acp(c) => c.new_session(cwd).await,
             SpawnedConn::Pi(c) => c.new_session(cwd).await,
+            SpawnedConn::Native(_) => bail!("native agents create conversations in their own UI"),
         }
     }
 
@@ -122,6 +144,7 @@ impl SpawnedConn {
         match self {
             SpawnedConn::Acp(c) => c.prompt(acp_session_id, text).await,
             SpawnedConn::Pi(c) => c.prompt(acp_session_id, text).await,
+            SpawnedConn::Native(_) => bail!("open the native terminal to send input to this agent"),
         }
     }
 
@@ -129,6 +152,7 @@ impl SpawnedConn {
         match self {
             SpawnedConn::Acp(c) => c.cancel(acp_session_id).await,
             SpawnedConn::Pi(c) => c.cancel(acp_session_id).await,
+            SpawnedConn::Native(c) => c.interrupt(),
         }
     }
 
@@ -139,6 +163,7 @@ impl SpawnedConn {
         match self {
             SpawnedConn::Acp(c) => c.respond_permission(request_id, decision),
             SpawnedConn::Pi(c) => c.respond_permission(request_id, decision),
+            SpawnedConn::Native(_) => bail!("native approvals belong to the agent's own terminal"),
         }
     }
 
@@ -146,6 +171,7 @@ impl SpawnedConn {
         match self {
             SpawnedConn::Acp(c) => c.events(),
             SpawnedConn::Pi(c) => c.events(),
+            SpawnedConn::Native(c) => c.events(),
         }
     }
 
@@ -156,6 +182,7 @@ impl SpawnedConn {
         match self {
             SpawnedConn::Acp(c) => c.close(),
             SpawnedConn::Pi(c) => c.close(),
+            SpawnedConn::Native(c) => c.close(),
         }
     }
 }
@@ -362,6 +389,8 @@ struct SessionSlot {
     worktree_path: PathBuf,
     /// Agent display name, used for `activity.md` entries.
     agent_name: String,
+    native_nonce: Mutex<Option<String>>,
+    native_reservation: Mutex<Option<(PathBuf, std::time::Instant)>>,
 }
 
 impl SessionSlot {
@@ -372,6 +401,8 @@ impl SessionSlot {
             fanout: Mutex::new(None),
             worktree_path,
             agent_name,
+            native_nonce: Mutex::new(None),
+            native_reservation: Mutex::new(None),
         }
     }
 }
@@ -392,9 +423,273 @@ pub struct Orchestrator {
     /// Connection timeouts handed to every spawned conn — captured from
     /// the registry's [`crate::config::Config`] at construction.
     timeouts: ConnTimeouts,
+    native_ownership: AsyncMutex<()>,
+    native_socket: Mutex<Option<PathBuf>>,
 }
 
 impl Orchestrator {
+    pub fn set_native_socket(&self, path: PathBuf) {
+        *self.native_socket.lock().unwrap() = Some(path);
+    }
+
+    fn native_conn(&self, id: SessionId) -> Result<Arc<SpawnedConn>> {
+        let slot = self.slot(id)?;
+        let conn = slot
+            .conn
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.conn.clone())
+            .context("native terminal is not running; restore it or open native history")?;
+        ensure!(
+            matches!(conn.as_ref(), SpawnedConn::Native(_)),
+            "this conversation uses a structured adapter"
+        );
+        Ok(conn)
+    }
+    pub async fn terminal_attach(
+        &self,
+        p: crate::rpc::TerminalAttachParams,
+    ) -> Result<crate::terminal::TerminalAttached> {
+        let conn = self.native_conn(p.session_id)?;
+        tokio::task::spawn_blocking(move || match conn.as_ref() {
+            SpawnedConn::Native(t) => t.attach(p.rows, p.cols),
+            _ => unreachable!(),
+        })
+        .await?
+    }
+    pub async fn terminal_read(
+        &self,
+        p: crate::rpc::TerminalReadParams,
+    ) -> Result<crate::terminal::TerminalFrame> {
+        let conn = self.native_conn(p.session_id)?;
+        match conn.as_ref() {
+            SpawnedConn::Native(t) => t.read(&p.token, p.after).await,
+            _ => unreachable!(),
+        }
+    }
+    pub async fn terminal_input(&self, p: crate::rpc::TerminalInputParams) -> Result<()> {
+        let conn = self.native_conn(p.session_id)?;
+        tokio::task::spawn_blocking(move || match conn.as_ref() {
+            SpawnedConn::Native(t) => t.input(&p.token, &p.data),
+            _ => unreachable!(),
+        })
+        .await?
+    }
+    pub async fn terminal_resize(&self, p: crate::rpc::TerminalResizeParams) -> Result<()> {
+        let conn = self.native_conn(p.session_id)?;
+        tokio::task::spawn_blocking(move || match conn.as_ref() {
+            SpawnedConn::Native(t) => t.resize(&p.token, p.rows, p.cols),
+            _ => unreachable!(),
+        })
+        .await?
+    }
+    pub fn terminal_detach(&self, p: crate::rpc::TerminalDetachParams) -> Result<()> {
+        let conn = self.native_conn(p.session_id)?;
+        match conn.as_ref() {
+            SpawnedConn::Native(t) => t.detach(&p.token),
+            _ => unreachable!(),
+        }
+    }
+    fn check_native_owner(&self, file: &Path, ignore: Option<SessionId>) -> Result<()> {
+        let file = file.canonicalize()?;
+        for session in self.sink.store.lock().unwrap().list_all_sessions()? {
+            if Some(session.id) != ignore
+                && !matches!(session.state, SessionState::Done | SessionState::Error(_))
+            {
+                ensure!(!session.native_session_file.as_ref().is_some_and(|p| p.canonicalize().ok().as_ref() == Some(&file)),
+                    "native conversation is already running in agent {}; stop it before taking control", session.id);
+            }
+        }
+        for (id, slot) in self.sessions.lock().unwrap().iter() {
+            if Some(*id) != ignore {
+                ensure!(
+                    !slot
+                        .native_reservation
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|(p, until)| *until > std::time::Instant::now() && *p == file),
+                    "native conversation is being opened by another agent"
+                );
+            }
+        }
+        Ok(())
+    }
+    fn authorize_native_hook(&self, id: SessionId, token: &str) -> Result<Arc<SessionSlot>> {
+        let slot = self.slot(id)?;
+        ensure!(
+            slot.native_nonce.lock().unwrap().as_deref() == Some(token),
+            "stale or unauthorized native lifecycle callback"
+        );
+        let session = self.get_session(id)?.context("native session is missing")?;
+        ensure!(
+            session.native_terminal
+                && !matches!(session.state, SessionState::Done | SessionState::Error(_)),
+            "native process is no longer active"
+        );
+        Ok(slot)
+    }
+    pub async fn native_check(&self, p: crate::rpc::NativeControlParams) -> Result<()> {
+        let _ownership = self.native_ownership.lock().await;
+        let slot = self.authorize_native_hook(p.session_id, &p.token)?;
+        self.check_native_owner(&p.session_file, Some(p.session_id))?;
+        *slot.native_reservation.lock().unwrap() = Some((
+            p.session_file.canonicalize()?,
+            std::time::Instant::now() + Duration::from_secs(10),
+        ));
+        Ok(())
+    }
+    pub async fn native_report(&self, p: crate::rpc::NativeControlParams) -> Result<()> {
+        let _ownership = self.native_ownership.lock().await;
+        let slot = self.authorize_native_hook(p.session_id, &p.token)?;
+        self.check_native_owner(&p.session_file, Some(p.session_id))?;
+        let (id, file) = crate::pi_sessions::identity(&p.session_file)?;
+        self.sink
+            .store
+            .lock()
+            .unwrap()
+            .set_native_session(p.session_id, &id, Some(&file))?;
+        *slot.native_reservation.lock().unwrap() = None;
+        Ok(())
+    }
+    pub async fn native_list(&self, id: SessionId) -> Result<crate::rpc::NativeListResult> {
+        let session = self.get_session(id)?.context("session is missing")?;
+        let profile = self
+            .registry
+            .lock()
+            .unwrap()
+            .get(&session.agent_id)
+            .cloned()
+            .context("agent is not configured")?;
+        ensure!(
+            matches!(
+                profile.adapter,
+                AdapterKind::PiRpc { .. }
+                    | AdapterKind::Native {
+                        session_backend: Some(crate::NativeSessionBackend::Pi),
+                        ..
+                    }
+            ),
+            "this adapter's history is available in its native interface"
+        );
+        let cwd = self
+            .get_workspace(session.workspace_id)?
+            .context("workspace is missing")?
+            .worktree_path;
+        let listing = profile.clone();
+        let conversations =
+            tokio::task::spawn_blocking(move || crate::pi_sessions::list(&listing, &cwd)).await??;
+        let registry = self.registry.lock().unwrap();
+        let native_available = registry.profiles().iter().any(|a| {
+            a.available
+                && a.env == profile.env
+                && matches!(
+                    a.adapter,
+                    AdapterKind::Native {
+                        session_backend: Some(crate::NativeSessionBackend::Pi),
+                        ..
+                    }
+                )
+        });
+        let structured_available = registry.profiles().iter().any(|a| {
+            a.available && a.env == profile.env && matches!(a.adapter, AdapterKind::PiRpc { .. })
+        });
+        Ok(crate::rpc::NativeListResult {
+            conversations,
+            native_available,
+            structured_available,
+        })
+    }
+    pub async fn native_open(&self, p: crate::rpc::NativeOpenParams) -> Result<Session> {
+        let _ownership = self.native_ownership.lock().await;
+        let mut source = self
+            .get_session(p.session_id)?
+            .context("source conversation is missing")?;
+        let profile = self
+            .registry
+            .lock()
+            .unwrap()
+            .get(&source.agent_id)
+            .cloned()
+            .context("source agent is not configured")?;
+        ensure!(matches!(profile.adapter, AdapterKind::PiRpc { .. } | AdapterKind::Native { .. }), "this adapter has no portable native conversation identity; create a native agent instead");
+        if p.history {
+            ensure!(
+                source.native_terminal,
+                "select a native agent to open its history"
+            );
+            let id = self
+                .create_session_inner(source.workspace_id, &source.agent_id, None, None, true)
+                .await?;
+            return self
+                .get_session(id)?
+                .context("native history launcher disappeared");
+        }
+        let file = p
+            .session_file
+            .or_else(|| source.native_session_file.clone())
+            .context("no native file is selected; open native history first")?;
+        let workspace = self
+            .get_workspace(source.workspace_id)?
+            .context("workspace is missing")?;
+        let cwd = workspace.worktree_path.clone();
+        let inspect_file = file.clone();
+        let imported =
+            tokio::task::spawn_blocking(move || crate::pi_sessions::inspect(&inspect_file, &cwd))
+                .await??;
+        let target_native = p.native;
+        let target = if target_native != source.native_terminal {
+            self.registry.lock().unwrap().profiles().iter().find(|a| a.available && a.env == profile.env && if target_native {
+                matches!(a.adapter, AdapterKind::Native { session_backend: Some(crate::NativeSessionBackend::Pi), .. })
+            } else { matches!(a.adapter, AdapterKind::PiRpc { .. }) }).map(|a| a.id.clone()).context("configure compatible Pi profiles with matching environments before switching modes")?
+        } else {
+            profile.id.clone()
+        };
+        if source
+            .native_session_file
+            .as_ref()
+            .and_then(|f| f.canonicalize().ok())
+            .as_ref()
+            == Some(&imported.session_file)
+        {
+            if target_native == source.native_terminal {
+                if matches!(source.state, SessionState::Done | SessionState::Error(_)) {
+                    // Ownership is already held here; resume performs the same
+                    // checks internally without reacquiring it.
+                    drop(_ownership);
+                    self.resume(source.id).await?;
+                }
+                return self
+                    .get_session(source.id)?
+                    .context("conversation disappeared");
+            }
+            let slot = self.slot(source.id)?;
+            let _turn = slot
+                .prompt_lock
+                .try_lock()
+                .map_err(|_| anyhow!("wait for this agent's current turn before native handoff"))?;
+            ensure!(
+                !matches!(
+                    source.state,
+                    SessionState::Prompting
+                        | SessionState::WaitingPermission
+                        | SessionState::Connecting
+                ),
+                "agent is busy; native handoff was not performed"
+            );
+            self.kill(source.id).await?;
+            source.state = SessionState::Done;
+        }
+        self.check_native_owner(&imported.session_file, None)?;
+        let title = imported.title.clone();
+        let id = self
+            .create_session_inner(source.workspace_id, &target, None, Some(imported), false)
+            .await?;
+        let _ = self.set_session_title(id, title.chars().take(60).collect());
+        self.get_session(id)?
+            .context("opened conversation disappeared")
+    }
     /// Create an orchestrator. `data_dir` is where `store` lives and where
     /// session JSONL logs land (`<data_dir>/sessions/`).
     ///
@@ -416,6 +711,8 @@ impl Orchestrator {
             sessions: Mutex::new(HashMap::new()),
             data_dir,
             timeouts,
+            native_ownership: AsyncMutex::new(()),
+            native_socket: Mutex::new(None),
         };
         orch.sweep_restarted_sessions();
         orch
@@ -508,6 +805,38 @@ impl Orchestrator {
         self.sink.store.lock().unwrap().read_events(session_id)
     }
 
+    pub fn set_session_title(&self, session_id: SessionId, title: String) -> Result<Event> {
+        let title = title.trim();
+        ensure!(!title.is_empty(), "title must not be empty");
+        ensure!(
+            title.chars().count() <= 60,
+            "title must be at most 60 characters"
+        );
+        ensure!(
+            !title
+                .chars()
+                .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')),
+            "title must be a single line without control characters"
+        );
+        let store = self.sink.store.lock().unwrap();
+        ensure!(
+            store.get_session(session_id)?.is_some(),
+            "session not found"
+        );
+        let event = Event {
+            session_id,
+            seq: self.sink.next_seq(session_id),
+            ts: Utc::now(),
+            kind: EventKind::TitleChanged {
+                title: title.into(),
+            },
+        };
+        // A successful rename promises persistence, unlike best-effort telemetry.
+        store.append_event(&event)?;
+        let _ = self.sink.bus.send(event.clone());
+        Ok(event)
+    }
+
     /// Number of sessions with a live slot — the `sessions` field of
     /// `server/status`.
     pub fn session_count(&self) -> usize {
@@ -564,6 +893,30 @@ impl Orchestrator {
     pub fn list_workspaces(&self, project_id: ProjectId) -> Result<Vec<Workspace>> {
         self.sink.store.lock().unwrap().list_workspaces(project_id)
     }
+    pub fn open_workspace(&self, project_id: ProjectId) -> Result<Workspace> {
+        let store = self.sink.store.lock().unwrap();
+        if let Some(workspace) = store
+            .list_workspaces(project_id)?
+            .into_iter()
+            .find(|w| !w.managed_worktree)
+        {
+            return Ok(workspace);
+        }
+        let project = store
+            .get_project(project_id)?
+            .context("project is not registered")?;
+        let workspace = Workspace {
+            id: WorkspaceId::new(),
+            project_id,
+            name: project.name,
+            worktree_path: project.root_path.canonicalize()?,
+            branch: "project directory".into(),
+            managed_worktree: false,
+            created_at: Utc::now(),
+        };
+        store.insert_workspace(&workspace)?;
+        Ok(workspace)
+    }
 
     /// Remove a workspace (`workspace/remove`): removes the git worktree,
     /// then — under a single store lock — re-verifies no live sessions and
@@ -601,7 +954,7 @@ impl Orchestrator {
         };
         // Tolerate a missing worktree path — a previous attempt may have
         // partially cleaned up, and the record should still be removable.
-        if workspace.worktree_path.exists() {
+        if workspace.managed_worktree && workspace.worktree_path.exists() {
             WorktreeManager::remove(&repo_root, &workspace.worktree_path)?;
         }
 
@@ -709,6 +1062,7 @@ impl Orchestrator {
             name: name.to_string(),
             worktree_path,
             branch,
+            managed_worktree: true,
             created_at: Utc::now(),
         };
 
@@ -735,7 +1089,19 @@ impl Orchestrator {
         agent_id: &AgentId,
         prompt: Option<String>,
     ) -> Result<SessionId> {
-        let profile = self
+        self.create_session_inner(workspace_id, agent_id, prompt, None, false)
+            .await
+    }
+
+    async fn create_session_inner(
+        &self,
+        workspace_id: WorkspaceId,
+        agent_id: &AgentId,
+        prompt: Option<String>,
+        imported: Option<crate::pi_sessions::NativeConversation>,
+        native_history: bool,
+    ) -> Result<SessionId> {
+        let mut profile = self
             .registry
             .lock()
             .unwrap()
@@ -747,12 +1113,46 @@ impl Orchestrator {
             .get_workspace(workspace_id)?
             .ok_or_else(|| anyhow!("unknown workspace {workspace_id}"))?;
 
+        let native_terminal = matches!(profile.adapter, AdapterKind::Native { .. });
+        ensure!(
+            !native_terminal || prompt.is_none(),
+            "native agents receive input in their own terminal, not as structured prompts"
+        );
+        let imported = if let Some(imported) = imported {
+            Some(imported)
+        } else if !native_history
+            && matches!(
+                profile.adapter,
+                AdapterKind::Native {
+                    session_backend: Some(crate::NativeSessionBackend::Pi),
+                    ..
+                }
+            )
+        {
+            let p = profile.clone();
+            let cwd = workspace.worktree_path.clone();
+            Some(tokio::task::spawn_blocking(move || crate::pi_sessions::create(&p, &cwd)).await??)
+        } else {
+            None
+        };
+        if native_history {
+            let AdapterKind::Native {
+                args, history_args, ..
+            } = &mut profile.adapter
+            else {
+                bail!("select a native agent to open native history");
+            };
+            args.extend(history_args.clone());
+        }
+
         let session = Session {
             id: SessionId::new(),
             workspace_id,
             agent_id: agent_id.clone(),
             state: SessionState::Created,
-            acp_session_id: None,
+            acp_session_id: imported.as_ref().map(|s| s.session_id.clone()),
+            native_session_file: imported.as_ref().map(|s| s.session_file.clone()),
+            native_terminal,
             references: vec![],
             created_at: Utc::now(),
         };
@@ -789,7 +1189,13 @@ impl Orchestrator {
             }
         }
         match self
-            .connect(&profile, &workspace.worktree_path, session_id, &slot)
+            .connect(
+                &profile,
+                &workspace.worktree_path,
+                session_id,
+                &slot,
+                imported.as_ref().map(|_| &session),
+            )
             .await
         {
             Ok(()) => {
@@ -824,7 +1230,11 @@ impl Orchestrator {
                     SessionState::Error(format!("setup failed: {e:#}")),
                     false,
                 );
-                Err(e)
+                Err(SessionSetupFailure {
+                    session_id,
+                    reason: format!("{e:#}"),
+                }
+                .into())
             }
         }
     }
@@ -838,10 +1248,97 @@ impl Orchestrator {
         worktree: &Path,
         session_id: SessionId,
         slot: &SessionSlot,
+        previous: Option<&Session>,
     ) -> Result<()> {
         // `SpawnedConn::spawn` blocks briefly on the child-spawn
         // handshake; keep that off the async executor.
-        let profile = profile.clone();
+        let mut profile = profile.clone();
+        let record = self
+            .get_session(session_id)?
+            .context("session vanished during setup")?;
+        if let AdapterKind::Native {
+            args, resume_args, ..
+        } = &mut profile.adapter
+        {
+            ensure!(
+                record.native_terminal,
+                "cannot silently convert a structured conversation to native mode"
+            );
+            if record.acp_session_id.is_some() || record.native_session_file.is_some() {
+                ensure!(
+                    !resume_args.is_empty(),
+                    "native CLI has no configured resume arguments"
+                );
+                for arg in resume_args {
+                    let mut expanded = arg.clone();
+                    if expanded.contains("{session_file}") {
+                        expanded = expanded.replace(
+                            "{session_file}",
+                            record
+                                .native_session_file
+                                .as_deref()
+                                .and_then(Path::to_str)
+                                .context("native session file is missing")?,
+                        );
+                    }
+                    if expanded.contains("{session_id}") {
+                        expanded = expanded.replace(
+                            "{session_id}",
+                            record
+                                .acp_session_id
+                                .as_deref()
+                                .context("native session identity is missing")?,
+                        );
+                    }
+                    args.push(expanded);
+                }
+            } else if previous.is_some_and(
+                |s| !matches!(&s.state, SessionState::Error(e) if e.starts_with("setup failed:")),
+            ) {
+                bail!("this native CLI has no saved restore identity; open native history or create a native agent explicitly");
+            }
+        } else {
+            ensure!(
+                !record.native_terminal,
+                "cannot silently convert a native conversation to structured mode"
+            );
+        }
+        if matches!(
+            profile.adapter,
+            AdapterKind::Native {
+                session_backend: Some(crate::NativeSessionBackend::Pi),
+                ..
+            }
+        ) {
+            if let Some(socket) = self.native_socket.lock().unwrap().clone() {
+                let dir = self.data_dir.join("native").join(session_id.to_string());
+                std::fs::create_dir_all(&dir)?;
+                let bridge = dir.join("agentmux-native.mjs");
+                std::fs::write(&bridge, include_str!("pi_native_bridge.mjs"))?;
+                let nonce = uuid::Uuid::new_v4().to_string();
+                *slot.native_nonce.lock().unwrap() = Some(nonce.clone());
+                profile.env.insert(
+                    "AGENTMUX_NATIVE_SOCKET".into(),
+                    socket
+                        .to_str()
+                        .context("native socket path is not UTF-8")?
+                        .into(),
+                );
+                profile
+                    .env
+                    .insert("AGENTMUX_NATIVE_SESSION".into(), session_id.to_string());
+                profile.env.insert("AGENTMUX_NATIVE_TOKEN".into(), nonce);
+                if let AdapterKind::Native { args, .. } = &mut profile.adapter {
+                    args.extend([
+                        "-e".into(),
+                        bridge
+                            .to_str()
+                            .context("native bridge path is not UTF-8")?
+                            .into(),
+                    ]);
+                }
+            }
+        }
         let cwd = worktree.to_path_buf();
         let stderr_log = {
             let store = self.sink.store.lock().unwrap();
@@ -859,25 +1356,118 @@ impl Orchestrator {
 
         // Grab the replay receiver *before* the handshake so events the
         // worker emits early (e.g. a fast `AgentExited`) are not lost.
-        let rx = conn.events();
+        let mut rx = conn.events();
 
-        if let Err(e) = conn.initialize().await {
-            conn.close();
-            return Err(e).context("agent initialize failed");
-        }
-        let acp_session_id = match conn.new_session(worktree).await {
-            Ok(id) => id,
+        let restoring =
+            previous.is_some_and(|s| s.acp_session_id.is_some() || s.native_session_file.is_some());
+        let setup = async {
+            let init = conn.initialize().await.context("agent initialize failed")?;
+            if matches!(conn.as_ref(), SpawnedConn::Native(_)) {
+                return Ok((record.acp_session_id.clone().unwrap_or_default(), record.native_session_file.clone()));
+            }
+            if restoring {
+                let previous = previous.unwrap();
+                let id = previous.acp_session_id.as_deref().context("native session identity is missing; original conversation was not replaced")?;
+                match conn.as_ref() {
+                    SpawnedConn::Acp(acp) => {
+                        ensure!(init.pointer("/agentCapabilities/loadSession").and_then(serde_json::Value::as_bool) == Some(true),
+                            "this ACP adapter does not support native session restoration; original conversation was not replaced. Create a new conversation explicitly with /mux new");
+                        acp.load_session(id, worktree).await?;
+                        Ok((id.to_owned(), None))
+                    }
+                    SpawnedConn::Pi(pi) => {
+                        let file = previous.native_session_file.as_deref().context(
+                            "this older Pi session has no saved native session file; original conversation was not replaced")?;
+                        ensure!(tokio::fs::metadata(file).await.with_context(|| format!("cannot restore Pi session file {}", file.display()))?.is_file(),
+                            "Pi session path is not a file: {}", file.display());
+                        let state = pi.load_session(file).await?;
+                        let restored_id = crate::pi_rpc::extract_session_id(&state).context("Pi restored no session identity")?;
+                        ensure!(restored_id == id, "Pi restored a different native session; original conversation was not replaced");
+                        Ok((restored_id, Some(file.to_path_buf())))
+                    }
+                    SpawnedConn::Native(_) => unreachable!(),
+                }
+            } else {
+                match conn.as_ref() {
+                    SpawnedConn::Pi(pi) => {
+                        let state = pi.new_session_state(worktree).await.context("agent session/new failed")?;
+                        let id = crate::pi_rpc::extract_session_id(&state).context("Pi returned no session identity")?;
+                        let file = state.get("sessionFile").and_then(serde_json::Value::as_str)
+                            .filter(|s| !s.is_empty()).map(PathBuf::from)
+                            .map(|p| if p.is_absolute() { p } else { worktree.join(p) });
+                        Ok((id, file))
+                    }
+                    SpawnedConn::Acp(acp) => Ok((acp.new_session(worktree).await.context("agent session/new failed")?, None)),
+                    SpawnedConn::Native(_) => unreachable!(),
+                }
+            }
+        }.await;
+        let (acp_session_id, native_file) = match setup {
+            Ok(identity) => identity,
             Err(e) => {
                 conn.close();
-                return Err(e).context("agent session/new failed");
+                return Err(e);
             }
         };
-        {
-            self.sink
-                .store
-                .lock()
-                .unwrap()
-                .set_acp_session_id(session_id, Some(&acp_session_id))?;
+
+        // ACP load replays old messages. The persisted workbench history already
+        // contains them; do not append a second copy on every reconnection.
+        if restoring && !matches!(conn.as_ref(), SpawnedConn::Native(_)) {
+            let mut commands_seen = None;
+            let mut replay_lagged = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(Event {
+                        kind: EventKind::AgentExited { .. },
+                        ..
+                    }) => {
+                        conn.close();
+                        bail!("agent exited during native session restoration");
+                    }
+                    Ok(mut event) => {
+                        // Drop replayed transcript chunks, not the new adapter's
+                        // command catalog needed by current and reconnecting UIs.
+                        if event.available_commands().is_some() {
+                            if let EventKind::SessionUpdate(value) = &event.kind {
+                                commands_seen = Some(value.clone());
+                            }
+                            event.session_id = session_id;
+                            self.sink.ingest(&mut event);
+                        }
+                    }
+                    Err(broadcast::error::TryRecvError::Lagged(_)) => replay_lagged = true,
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    Err(broadcast::error::TryRecvError::Closed) => {
+                        conn.close();
+                        bail!("agent disconnected during native session restoration");
+                    }
+                }
+            }
+            if replay_lagged {
+                if let SpawnedConn::Acp(acp) = conn.as_ref() {
+                    if let Some(value) = acp
+                        .command_catalog()
+                        .filter(|value| commands_seen.as_ref() != Some(value))
+                    {
+                        self.sink.ingest(&mut Event {
+                            session_id,
+                            seq: 0,
+                            ts: Utc::now(),
+                            kind: EventKind::SessionUpdate(value),
+                        });
+                    }
+                }
+            }
+        }
+        if !matches!(conn.as_ref(), SpawnedConn::Native(_)) {
+            if let Err(e) = self.sink.store.lock().unwrap().set_native_session(
+                session_id,
+                &acp_session_id,
+                native_file.as_deref(),
+            ) {
+                conn.close();
+                return Err(e);
+            }
         }
         let handle = spawn_fanout(
             self.sink.clone(),
@@ -938,7 +1528,18 @@ impl Orchestrator {
             .as_ref()
             .cloned()
             .ok_or_else(|| anyhow!("session {session_id} has no live connection"))?;
-        let text = self.compose_prompt(&session, &text, &refs)?;
+        let user_text = text.clone();
+        let text = if text.starts_with('/') {
+            // Agents recognize commands at byte zero. A collaboration preamble
+            // would turn a native command into an ordinary model prompt.
+            ensure!(
+                refs.is_empty(),
+                "Agent slash commands cannot carry quoted session references"
+            );
+            text
+        } else {
+            self.compose_prompt(&session, &text, &refs)?
+        };
 
         // `unless_terminal`: a `kill` landing between the liveness check
         // and here already owns the terminal state — a `Prompting`
@@ -949,6 +1550,20 @@ impl Orchestrator {
         {
             bail!("session {session_id} was terminated");
         }
+        // Persist the operator's prompt, without injected shared context, for
+        // transcript replay and a stable task title after reopening the TUI.
+        self.sink.ingest(&mut Event {
+            session_id,
+            seq: 0,
+            ts: chrono::Utc::now(),
+            kind: EventKind::SessionUpdate(serde_json::json!({
+                "sessionId": live.acp_session_id,
+                "update": {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": user_text}
+                }
+            })),
+        });
         let result = live.conn.prompt(&live.acp_session_id, text).await;
         match &result {
             Ok(()) => {
@@ -969,6 +1584,73 @@ impl Orchestrator {
             }
         }
         result
+    }
+
+    /// Execute a bounded, explicit Pi control surface on the existing adapter.
+    pub async fn pi_command(
+        &self,
+        session_id: SessionId,
+        command: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let name = command.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let readonly = matches!(
+            name,
+            "get_commands"
+                | "get_state"
+                | "get_available_models"
+                | "get_available_thinking_levels"
+                | "get_session_stats"
+                | "get_messages"
+        );
+        ensure!(
+            readonly
+                || matches!(
+                    name,
+                    "set_model"
+                        | "set_thinking_level"
+                        | "set_auto_compaction"
+                        | "set_auto_retry"
+                        | "set_steering_mode"
+                        | "set_follow_up_mode"
+                        | "compact"
+                        | "set_session_name"
+                ),
+            "unsupported Pi control command: {name}"
+        );
+        let session = self
+            .get_session(session_id)?
+            .ok_or_else(|| anyhow!("no such session {session_id}"))?;
+        ensure!(
+            !matches!(
+                session.state,
+                SessionState::Done
+                    | SessionState::Error(_)
+                    | SessionState::Connecting
+                    | SessionState::Created
+            ),
+            "agent is not ready; resume the task first"
+        );
+        let slot = self.slot(session_id)?;
+        let _permit = if readonly {
+            None
+        } else {
+            Some(
+                slot.prompt_lock
+                    .try_lock()
+                    .map_err(|_| anyhow!("session busy; wait for the current turn"))?,
+            )
+        };
+        let live = slot
+            .conn
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("session has no live connection"))?;
+        match live.conn.as_ref() {
+            SpawnedConn::Pi(conn) => conn.request(command).await,
+            _ => bail!("selected agent does not use Pi RPC"),
+        }
     }
 
     /// Build the outgoing prompt text: preamble + refs + user text.
@@ -1069,6 +1751,8 @@ impl Orchestrator {
     /// by `kill`, `resume` and the post-`connect` kill-race cleanup.
     /// Idempotent; a slot may hold neither.
     fn teardown_slot(slot: &SessionSlot) {
+        *slot.native_nonce.lock().unwrap() = None;
+        *slot.native_reservation.lock().unwrap() = None;
         if let Some(handle) = slot.fanout.lock().unwrap().take() {
             handle.abort();
         }
@@ -1103,18 +1787,11 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Resume a `Done`/`Error` session: tear down any stale conn, spawn a
-    /// fresh adapter process and start a new adapter session in the same
-    /// worktree.
-    ///
-    /// **Degraded path** (documented in the module docs): neither conn
-    /// wrapper exposes `session/load`, so the old `acp_session_id` cannot
-    /// be reattached — a *fresh* adapter session replaces it. The
-    /// session's history is not lost: it persists in the JSONL log,
-    /// `seq` continues increasing, and clients can re-inject context via
-    /// `prompt`'s `refs`.
+    /// Reconnect a `Done`/`Error` session to its original native conversation.
+    /// Restore failure preserves its identity and history; it never falls back
+    /// to new_session unless initial setup never acquired a native identity.
     pub async fn resume(&self, session_id: SessionId) -> Result<()> {
-        let (session, workspace) = {
+        let (mut session, workspace) = {
             let store = self.sink.store.lock().unwrap();
             let session = store
                 .get_session(session_id)?
@@ -1141,6 +1818,42 @@ impl Orchestrator {
             session.agent_id
         );
 
+        let _ownership = if matches!(
+            profile.adapter,
+            AdapterKind::PiRpc { .. }
+                | AdapterKind::Native {
+                    session_backend: Some(crate::NativeSessionBackend::Pi),
+                    ..
+                }
+        ) {
+            Some(self.native_ownership.lock().await)
+        } else {
+            None
+        };
+        let preflight = async {
+        if matches!(profile.adapter, AdapterKind::PiRpc { .. }) && session.native_session_file.is_none() {
+            if let Some(native_id) = session.acp_session_id.clone() {
+                let p = profile.clone(); let cwd = workspace.worktree_path.clone();
+                let candidates = tokio::task::spawn_blocking(move || crate::pi_sessions::list(&p, &cwd)).await??;
+                let matching: Vec<_> = candidates.into_iter().filter(|s| s.session_id == native_id).collect();
+                ensure!(matching.len() == 1, "cannot uniquely locate the original Pi session file; open native history to choose it explicitly");
+                let file = matching[0].session_file.clone();
+                self.sink.store.lock().unwrap().set_native_session(session_id, &native_id, Some(&file))?;
+                session.native_session_file = Some(file);
+            }
+        }
+        if let Some(file) = &session.native_session_file { self.check_native_owner(file, Some(session_id))?; }
+        Ok::<(), anyhow::Error>(())
+        }.await;
+        if let Err(error) = preflight {
+            // Only a still-terminal record may be changed; never disturb a winning resume.
+            let _ = self.sink.transition_out_of_terminal(
+                session_id,
+                SessionState::Error(format!("resume preflight failed: {error:#}")),
+            );
+            return Err(error);
+        }
+
         let slot = self.slot(session_id).unwrap_or_else(|_| {
             // Defensive: a session row always gets a slot at creation, but
             // after a daemon restart only the store remains — recreate the
@@ -1156,6 +1869,13 @@ impl Orchestrator {
                 .or_insert_with(|| slot.clone())
                 .clone()
         });
+
+        // A killed turn may still be unwinding. It must not mutate state after
+        // a new controller has taken ownership of this native conversation.
+        let _permit = slot
+            .prompt_lock
+            .try_lock()
+            .map_err(|_| anyhow!("previous agent turn is still unwinding; retry resume shortly"))?;
 
         // Claim the resume *before* touching the slot: a concurrent losing
         // `resume` must not run `teardown_slot` — it could land between the
@@ -1184,19 +1904,16 @@ impl Orchestrator {
         Self::teardown_slot(&slot);
 
         match self
-            .connect(&profile, &workspace.worktree_path, session_id, &slot)
+            .connect(
+                &profile,
+                &workspace.worktree_path,
+                session_id,
+                &slot,
+                Some(&session),
+            )
             .await
         {
             Ok(()) => {
-                self.sink.emit(
-                    session_id,
-                    EventKind::Orchestrator(
-                        "session resumed with a fresh adapter session \
-                         (session/load unsupported); prior history persists \
-                         in the event log"
-                            .into(),
-                    ),
-                );
                 // `unless_terminal`: a `kill` racing the `connect` await
                 // owns the terminal state — tear the fresh conn down
                 // rather than resurrect. A missing row (`workspace/remove`)
@@ -1312,6 +2029,7 @@ fn describe_event(ev: &Event) -> Option<String> {
         return Some(summary);
     }
     match &ev.kind {
+        EventKind::ConversationStarted | EventKind::TitleChanged { .. } => None,
         EventKind::SessionUpdate(v) => {
             // Unwrap the `{"sessionId", "update"}` notification envelope.
             let update = v.get("update").unwrap_or(v);

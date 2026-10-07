@@ -72,6 +72,30 @@ struct MockAgent {
 }
 
 impl MockAgent {
+    async fn send_commands(&self, session_id: &acp::SessionId) -> Result<(), acp::Error> {
+        let Ok(names) = std::env::var("MOCK_COMMANDS") else {
+            return Ok(());
+        };
+        let commands = names
+            .split(',')
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                acp::AvailableCommand::new(name, format!("Mock {name}")).input(
+                    acp::AvailableCommandInput::Unstructured(acp::UnstructuredCommandInput::new(
+                        "[arguments]",
+                    )),
+                )
+            })
+            .collect();
+        self.send_update(
+            session_id,
+            acp::SessionUpdate::AvailableCommandsUpdate(acp::AvailableCommandsUpdate::new(
+                commands,
+            )),
+        )
+        .await
+    }
+
     /// Queue one `session/update` and wait until the connection task has
     /// flushed it. Errors when the connection is gone map to
     /// `internal_error`, failing the in-flight prompt.
@@ -160,11 +184,15 @@ impl acp::Agent for MockAgent {
         &self,
         _args: acp::InitializeRequest,
     ) -> Result<acp::InitializeResponse, acp::Error> {
-        Ok(
-            acp::InitializeResponse::new(acp::ProtocolVersion::V1).agent_info(
-                acp::Implementation::new("agentmux-mock-agent", env!("CARGO_PKG_VERSION")),
-            ),
-        )
+        Ok(acp::InitializeResponse::new(acp::ProtocolVersion::V1)
+            .agent_capabilities(
+                acp::AgentCapabilities::new()
+                    .load_session(std::env::var_os("MOCK_NO_LOAD").is_none()),
+            )
+            .agent_info(acp::Implementation::new(
+                "agentmux-mock-agent",
+                env!("CARGO_PKG_VERSION"),
+            )))
     }
 
     async fn authenticate(
@@ -178,7 +206,38 @@ impl acp::Agent for MockAgent {
         &self,
         _args: acp::NewSessionRequest,
     ) -> Result<acp::NewSessionResponse, acp::Error> {
+        if std::env::var_os("MOCK_FORBID_NEW").is_some() {
+            return Err(acp::Error::invalid_params());
+        }
+        self.send_commands(&acp::SessionId::new(SESSION_ID)).await?;
         Ok(acp::NewSessionResponse::new(SESSION_ID))
+    }
+
+    async fn load_session(
+        &self,
+        args: acp::LoadSessionRequest,
+    ) -> Result<acp::LoadSessionResponse, acp::Error> {
+        if std::env::var_os("MOCK_NO_LOAD").is_some()
+            || std::env::var_os("MOCK_LOAD_FAIL").is_some()
+            || args.session_id.to_string() != SESSION_ID
+        {
+            return Err(acp::Error::invalid_params());
+        }
+        self.send_commands(&args.session_id).await?;
+        let replay_count = std::env::var("MOCK_LOAD_REPLAY_COUNT")
+            .ok()
+            .and_then(|count| count.parse::<usize>().ok())
+            .unwrap_or(1);
+        for _ in 0..replay_count {
+            self.send_update(
+                &args.session_id,
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    acp::ContentBlock::from("mock replay sentinel"),
+                )),
+            )
+            .await?;
+        }
+        Ok(acp::LoadSessionResponse::new())
     }
 
     async fn prompt(&self, args: acp::PromptRequest) -> Result<acp::PromptResponse, acp::Error> {

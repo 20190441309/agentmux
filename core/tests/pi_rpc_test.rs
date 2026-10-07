@@ -945,3 +945,31 @@ async fn init_failure_error_carries_stderr_tail() {
         "init failure should carry the stderr tail, got: {msg}"
     );
 }
+
+#[tokio::test]
+async fn pi_control_requests_query_and_change_existing_adapter() {
+    let (mut conn, _dir) = spawn_fake();
+    conn.initialize().await.unwrap();
+    let commands = conn
+        .request(serde_json::json!({"type":"get_commands"}))
+        .await
+        .unwrap();
+    assert_eq!(commands["commands"][0]["name"], "fix-tests");
+    conn.request(serde_json::json!({"type":"set_model", "provider":"fake", "modelId":"large"}))
+        .await
+        .unwrap();
+    conn.request(serde_json::json!({"type":"set_thinking_level", "level":"high"}))
+        .await
+        .unwrap();
+    let state = conn
+        .request(serde_json::json!({"type":"get_state"}))
+        .await
+        .unwrap();
+    assert_eq!(state["model"]["id"], "large");
+    assert_eq!(state["thinkingLevel"], "high");
+    assert!(conn
+        .request(serde_json::json!({"type":"set_thinking_level", "level":"invalid"}))
+        .await
+        .is_err());
+    conn.shutdown().await.unwrap();
+}

@@ -87,7 +87,10 @@ impl AgentRegistry {
     /// `command` — the single-profile version of [`probe`](Self::probe).
     pub fn probe_profile(profile: &AgentProfile) -> AgentProfile {
         AgentProfile {
-            available: command_exists(adapter_command(&profile.adapter)),
+            available: command_exists_with_path(
+                adapter_command(&profile.adapter),
+                profile.env.get("PATH"),
+            ),
             ..profile.clone()
         }
     }
@@ -105,7 +108,9 @@ impl AgentRegistry {
 /// The executable an adapter would spawn.
 fn adapter_command(adapter: &AdapterKind) -> &Path {
     match adapter {
-        AdapterKind::Acp { command, .. } | AdapterKind::PiRpc { command, .. } => command,
+        AdapterKind::Acp { command, .. }
+        | AdapterKind::PiRpc { command, .. }
+        | AdapterKind::Native { command, .. } => command,
     }
 }
 
@@ -113,14 +118,20 @@ fn adapter_command(adapter: &AdapterKind) -> &Path {
 ///
 /// A `cmd` with a directory component (`/abs/path` or `dir/file`) is checked
 /// directly; a bare file name is searched along `PATH`, `which`-style.
+#[cfg(test)]
 fn command_exists(cmd: &Path) -> bool {
+    command_exists_with_path(cmd, None)
+}
+fn command_exists_with_path(cmd: &Path, configured_path: Option<&String>) -> bool {
     // `Path::new("sh").parent()` is `Some("")` — a bare name has an empty
     // parent, anything else counts as having a directory component.
     let has_dir = cmd.parent().is_some_and(|p| !p.as_os_str().is_empty());
     if cmd.is_absolute() || has_dir {
         return is_executable(cmd);
     }
-    env::var_os("PATH")
+    configured_path
+        .map(std::ffi::OsString::from)
+        .or_else(|| env::var_os("PATH"))
         .is_some_and(|path| env::split_paths(&path).any(|dir| is_executable(&dir.join(cmd))))
 }
 

@@ -55,11 +55,44 @@ impl Store {
         std::fs::create_dir_all(data_dir.join(EVENTS_DIR))
             .context("failed to create data dir / sessions dir")?;
 
-        let conn = Connection::open(data_dir.join(DB_FILE)).context("failed to open db.sqlite")?;
+        let mut conn =
+            Connection::open(data_dir.join(DB_FILE)).context("failed to open db.sqlite")?;
         conn.pragma_update(None, "foreign_keys", true)
             .context("failed to enable foreign keys")?;
         conn.execute_batch(SCHEMA)
             .context("failed to apply schema")?;
+
+        let migration = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let has_native_file: bool = migration.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'native_session_file')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_native_file {
+            migration.execute(
+                "ALTER TABLE sessions ADD COLUMN native_session_file TEXT",
+                [],
+            )?;
+        }
+        let has_native_terminal: bool = migration.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'native_terminal')", [], |row| row.get(0),
+        )?;
+        if !has_native_terminal {
+            migration.execute(
+                "ALTER TABLE sessions ADD COLUMN native_terminal INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        let has_worktree_flag: bool = migration.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('workspaces') WHERE name = 'managed_worktree')", [], |row| row.get(0))?;
+        if !has_worktree_flag {
+            migration.execute(
+                "ALTER TABLE workspaces ADD COLUMN managed_worktree INTEGER NOT NULL DEFAULT 1",
+                [],
+            )?;
+        }
+        migration
+            .commit()
+            .context("failed to migrate native session metadata")?;
 
         Ok(Store {
             conn,
@@ -142,8 +175,8 @@ impl Store {
         self.conn
             .execute(
                 "INSERT INTO workspaces
-                 (id, project_id, name, worktree_path, branch, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (id, project_id, name, worktree_path, branch, created_at, managed_worktree)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     workspace.id.to_string(),
                     workspace.project_id.to_string(),
@@ -151,6 +184,7 @@ impl Store {
                     path_str(&workspace.worktree_path)?,
                     workspace.branch,
                     workspace.created_at.to_rfc3339(),
+                    workspace.managed_worktree,
                 ],
             )
             .with_context(|| format!("failed to insert workspace {}", workspace.id))?;
@@ -161,7 +195,7 @@ impl Store {
     pub fn get_workspace(&self, id: WorkspaceId) -> Result<Option<Workspace>> {
         self.conn
             .query_row(
-                "SELECT id, project_id, name, worktree_path, branch, created_at
+                "SELECT id, project_id, name, worktree_path, branch, created_at, managed_worktree
                  FROM workspaces WHERE id = ?1",
                 params![id.to_string()],
                 workspace_from_row,
@@ -173,7 +207,7 @@ impl Store {
     /// All workspaces belonging to `project_id`, in insertion order.
     pub fn list_workspaces(&self, project_id: ProjectId) -> Result<Vec<Workspace>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, worktree_path, branch, created_at
+            "SELECT id, project_id, name, worktree_path, branch, created_at, managed_worktree
              FROM workspaces WHERE project_id = ?1 ORDER BY rowid",
         )?;
         let rows = stmt
@@ -276,8 +310,8 @@ impl Store {
         self.conn
             .execute(
                 "INSERT INTO sessions
-                 (id, workspace_id, agent_id, state, acp_session_id, refs, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (id, workspace_id, agent_id, state, acp_session_id, refs, created_at, native_session_file, native_terminal)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     session.id.to_string(),
                     session.workspace_id.to_string(),
@@ -286,6 +320,8 @@ impl Store {
                     session.acp_session_id,
                     serde_json::to_string(&session.references)?,
                     session.created_at.to_rfc3339(),
+                    session.native_session_file.as_deref().map(path_str).transpose()?,
+                    session.native_terminal,
                 ],
             )
             .with_context(|| format!("failed to insert session {}", session.id))?;
@@ -296,7 +332,7 @@ impl Store {
     pub fn get_session(&self, id: SessionId) -> Result<Option<Session>> {
         self.conn
             .query_row(
-                "SELECT id, workspace_id, agent_id, state, acp_session_id, refs, created_at
+                "SELECT id, workspace_id, agent_id, state, acp_session_id, refs, created_at, native_session_file, native_terminal
                  FROM sessions WHERE id = ?1",
                 params![id.to_string()],
                 session_from_row,
@@ -339,10 +375,29 @@ impl Store {
         Ok(())
     }
 
+    /// Commit the native identity and file together after successful setup.
+    pub fn set_native_session(
+        &self,
+        session_id: SessionId,
+        native_id: &str,
+        native_file: Option<&Path>,
+    ) -> Result<()> {
+        let n = self.conn.execute(
+            "UPDATE sessions SET acp_session_id = ?2, native_session_file = ?3 WHERE id = ?1",
+            params![
+                session_id.to_string(),
+                native_id,
+                native_file.map(path_str).transpose()?
+            ],
+        )?;
+        anyhow::ensure!(n == 1, "no session {session_id} to update");
+        Ok(())
+    }
+
     /// All sessions in `workspace_id`, in insertion order.
     pub fn list_sessions(&self, workspace_id: WorkspaceId) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, workspace_id, agent_id, state, acp_session_id, refs, created_at
+            "SELECT id, workspace_id, agent_id, state, acp_session_id, refs, created_at, native_session_file, native_terminal
              FROM sessions WHERE workspace_id = ?1 ORDER BY rowid",
         )?;
         let rows = stmt
@@ -356,7 +411,7 @@ impl Store {
     /// workspace's slice of it.
     pub fn list_all_sessions(&self) -> Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, workspace_id, agent_id, state, acp_session_id, refs, created_at
+            "SELECT id, workspace_id, agent_id, state, acp_session_id, refs, created_at, native_session_file, native_terminal
              FROM sessions ORDER BY rowid",
         )?;
         let rows = stmt
@@ -496,6 +551,7 @@ CREATE TABLE IF NOT EXISTS workspaces (
     name         TEXT NOT NULL,
     worktree_path TEXT NOT NULL,
     branch       TEXT NOT NULL,
+    managed_worktree INTEGER NOT NULL DEFAULT 1,
     created_at   TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS agents (
@@ -511,6 +567,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent_id       TEXT NOT NULL,
     state          TEXT NOT NULL,  -- serde_json of SessionState
     acp_session_id TEXT,
+    native_session_file TEXT,
+    native_terminal INTEGER NOT NULL DEFAULT 0,
     refs           TEXT NOT NULL,  -- serde_json of Vec<SessionRef>
     created_at     TEXT NOT NULL
 );
@@ -587,6 +645,7 @@ fn workspace_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspace> {
         name: row.get(2)?,
         worktree_path: PathBuf::from(row.get::<_, String>(3)?),
         branch: row.get(4)?,
+        managed_worktree: row.get(6)?,
         created_at: parse_ts(&row.get::<_, String>(5)?)?,
     })
 }
@@ -608,6 +667,8 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Session> {
         agent_id: AgentId(row.get::<_, String>(2)?),
         state: from_json::<SessionState>(&row.get::<_, String>(3)?)?,
         acp_session_id: row.get(4)?,
+        native_session_file: row.get::<_, Option<String>>(7)?.map(PathBuf::from),
+        native_terminal: row.get(8)?,
         references: from_json::<Vec<SessionRef>>(&row.get::<_, String>(5)?)?,
         created_at: parse_ts(&row.get::<_, String>(6)?)?,
     })

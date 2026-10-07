@@ -204,11 +204,55 @@ impl DaemonClient {
         Self::connect_to(Self::default_socket_path()).await
     }
 
+    /// Restart the default daemon, then return a connection to it.
+    /// Running agent connections end; persisted tasks can be resumed.
+    pub async fn restart() -> Result<DaemonClient> {
+        Self::restart_to(Self::default_socket_path()).await
+    }
+
+    /// Gracefully stop a daemon and wait for its socket to be removed before
+    /// starting its replacement. If absent, simply start it. Newer daemons
+    /// report their effective paths; older ones fall back to env/defaults.
+    pub async fn restart_to(socket_path: impl AsRef<Path>) -> Result<DaemonClient> {
+        let socket_path = socket_path.as_ref().to_path_buf();
+        let mut paths = ServerPaths::resolve(Some(socket_path.clone()), None, None);
+        match Self::connect_existing(&socket_path).await {
+            Ok(mut old) => {
+                old.set_request_timeout(Some(DAEMON_START_TIMEOUT));
+                let status = old.server_status().await?;
+                if let Some(data_dir) = status.data_dir {
+                    paths.data_dir = data_dir;
+                }
+                if let Some(config_path) = status.config_path {
+                    paths.config_path = config_path;
+                }
+                old.shutdown().await?;
+                let deadline = Instant::now() + DAEMON_START_TIMEOUT;
+                // Waiting just for the ack can reconnect to the old listener.
+                while socket_path.try_exists()? {
+                    if Instant::now() >= deadline {
+                        return Err(ClientError::Timeout(DAEMON_START_TIMEOUT));
+                    }
+                    tokio::time::sleep(DAEMON_POLL_INTERVAL).await;
+                }
+            }
+            Err(ClientError::Transport(e))
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) => {}
+            Err(e) => return Err(e),
+        }
+        tokio::task::spawn_blocking(move || Self::ensure_daemon_with_paths(&paths))
+            .await
+            .map_err(|e| ClientError::transport(format!("restart daemon task failed: {e}")))??;
+        Self::connect_existing(socket_path).await
+    }
+
     /// Connect to `socket_path`, auto-spawning the daemon if needed.
     ///
-    /// When spawned, the daemon resolves its own data dir / config the
-    /// usual way (env vars / defaults) — only the socket is passed
-    /// explicitly.
+    /// When spawned, the data dir / config are resolved from the current
+    /// environment and defaults, then passed explicitly with the socket.
     pub async fn connect_to(socket_path: impl AsRef<Path>) -> Result<DaemonClient> {
         let socket_path = socket_path.as_ref().to_path_buf();
         {
@@ -293,6 +337,15 @@ impl DaemonClient {
     /// polled until [`DAEMON_START_TIMEOUT`]; connectable at the deadline
     /// is success regardless of which process owns it.
     fn ensure_daemon_at(socket_path: &Path) -> Result<()> {
+        Self::ensure_daemon_with_paths(&ServerPaths::resolve(
+            Some(socket_path.to_path_buf()),
+            None,
+            None,
+        ))
+    }
+
+    fn ensure_daemon_with_paths(paths: &ServerPaths) -> Result<()> {
+        let socket_path = &paths.socket_path;
         let deadline = Instant::now() + DAEMON_START_TIMEOUT;
         if socket_accepts(socket_path) {
             return Ok(());
@@ -302,6 +355,10 @@ impl DaemonClient {
             .arg("--daemon")
             .arg("--socket")
             .arg(socket_path)
+            .arg("--data-dir")
+            .arg(&paths.data_dir)
+            .arg("--config")
+            .arg(&paths.config_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -482,6 +539,102 @@ impl DaemonClient {
             .workspace)
     }
 
+    pub async fn open_workspace(&mut self, project_id: ProjectId) -> Result<Workspace> {
+        Ok(self
+            .call_result::<rpc::WorkspaceCreateResult>(
+                rpc::M_WORKSPACE_OPEN,
+                rpc::WorkspaceOpenParams { project_id },
+            )
+            .await?
+            .workspace)
+    }
+    pub async fn native_list(&mut self, session_id: SessionId) -> Result<rpc::NativeListResult> {
+        self.call_result(rpc::M_NATIVE_LIST, rpc::NativeListParams { session_id })
+            .await
+    }
+    pub async fn native_open(&mut self, params: rpc::NativeOpenParams) -> Result<Session> {
+        Ok(self
+            .call_result::<rpc::SessionCreateResult>(rpc::M_NATIVE_OPEN, params)
+            .await?
+            .session)
+    }
+    pub async fn terminal_attach(
+        &mut self,
+        session_id: SessionId,
+        rows: u16,
+        cols: u16,
+    ) -> Result<agentmux_core::terminal::TerminalAttached> {
+        self.call_result(
+            rpc::M_TERMINAL_ATTACH,
+            rpc::TerminalAttachParams {
+                session_id,
+                rows,
+                cols,
+            },
+        )
+        .await
+    }
+    pub async fn terminal_read(
+        &mut self,
+        session_id: SessionId,
+        token: &str,
+        after: u64,
+    ) -> Result<agentmux_core::terminal::TerminalFrame> {
+        self.call_result(
+            rpc::M_TERMINAL_READ,
+            rpc::TerminalReadParams {
+                session_id,
+                token: token.into(),
+                after,
+            },
+        )
+        .await
+    }
+    pub async fn terminal_input(
+        &mut self,
+        session_id: SessionId,
+        token: &str,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        self.call_result(
+            rpc::M_TERMINAL_INPUT,
+            rpc::TerminalInputParams {
+                session_id,
+                token: token.into(),
+                data,
+            },
+        )
+        .await
+    }
+    pub async fn terminal_resize(
+        &mut self,
+        session_id: SessionId,
+        token: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<()> {
+        self.call_result(
+            rpc::M_TERMINAL_RESIZE,
+            rpc::TerminalResizeParams {
+                session_id,
+                token: token.into(),
+                rows,
+                cols,
+            },
+        )
+        .await
+    }
+    pub async fn terminal_detach(&mut self, session_id: SessionId, token: &str) -> Result<()> {
+        self.call_result(
+            rpc::M_TERMINAL_DETACH,
+            rpc::TerminalDetachParams {
+                session_id,
+                token: token.into(),
+            },
+        )
+        .await
+    }
+
     /// `workspace/list` → a project's workspaces.
     pub async fn list_workspaces(&mut self, project_id: ProjectId) -> Result<Vec<Workspace>> {
         Ok(self
@@ -507,6 +660,8 @@ impl DaemonClient {
 
     /// `session/create` → the created [`Session`]. `prompt`, when given,
     /// is sent as the first turn once the session is `Ready`.
+    /// Adapter setup failures return the persisted session in `Error`, so
+    /// callers can resume it instead of silently creating a duplicate.
     pub async fn create_session(
         &mut self,
         workspace_id: WorkspaceId,
@@ -522,6 +677,142 @@ impl DaemonClient {
             .call_result::<rpc::SessionCreateResult>(M_SESSION_CREATE, params)
             .await?
             .session)
+    }
+
+    pub async fn history(
+        &mut self,
+        session_id: SessionId,
+        before_seq: Option<u64>,
+    ) -> Result<rpc::SessionHistoryResult> {
+        let mut page: rpc::SessionHistoryResult = self
+            .call_result(
+                rpc::M_SESSION_HISTORY,
+                rpc::SessionHistoryParams {
+                    session_id,
+                    before_seq,
+                },
+            )
+            .await?;
+        for seq in std::mem::take(&mut page.event_refs) {
+            page.events
+                .push(self.read_history_event(session_id, seq).await?);
+        }
+        for seq in std::mem::take(&mut page.pending_permission_refs) {
+            let event = if let Some(event) = page.events.iter().find(|e| e.seq == seq) {
+                event.clone()
+            } else {
+                self.read_history_event(session_id, seq).await?
+            };
+            page.pending_permissions.push(event);
+        }
+        if let Some(seq) = page.available_commands_ref.take() {
+            page.available_commands = Some(
+                if let Some(event) = page.events.iter().find(|e| e.seq == seq) {
+                    event.clone()
+                } else {
+                    self.read_history_event(session_id, seq).await?
+                },
+            );
+        }
+        page.events.sort_by_key(|e| e.seq);
+        page.pending_permissions.sort_by_key(|e| e.seq);
+        Ok(page)
+    }
+
+    pub async fn set_session_title(
+        &mut self,
+        session_id: SessionId,
+        title: String,
+    ) -> Result<Event> {
+        self.call_result(
+            rpc::M_SESSION_TITLE,
+            rpc::SessionTitleParams { session_id, title },
+        )
+        .await
+    }
+
+    pub async fn read_history_event(&mut self, session_id: SessionId, seq: u64) -> Result<Event> {
+        let mut json = String::new();
+        loop {
+            let offset = json.len();
+            let chunk: rpc::SessionEventReadResult = self
+                .call_result(
+                    rpc::M_SESSION_EVENT_READ,
+                    rpc::SessionEventReadParams {
+                        session_id,
+                        seq,
+                        offset,
+                    },
+                )
+                .await?;
+            if chunk.data.is_empty() {
+                return Err(ClientError::transport("empty history chunk"));
+            }
+            json.push_str(&chunk.data);
+            match chunk.next_offset {
+                Some(next) if next == json.len() && next > offset => {}
+                Some(_) => return Err(ClientError::transport("invalid history chunk offset")),
+                None => break,
+            }
+        }
+        let event: Event = serde_json::from_str(&json).map_err(ClientError::transport)?;
+        if event.session_id != session_id || event.seq != seq {
+            return Err(ClientError::transport(
+                "history chunk event identity mismatch",
+            ));
+        }
+        Ok(event)
+    }
+
+    pub async fn file_diff(&mut self, workspace_id: WorkspaceId, path: String) -> Result<String> {
+        Ok(self
+            .file_diff_info(rpc::WorkspaceDiffParams {
+                workspace_id,
+                path,
+                path_bytes: None,
+                old_path: None,
+                old_path_bytes: None,
+                scope: rpc::DiffScope::Head,
+            })
+            .await?
+            .text)
+    }
+
+    pub async fn file_diff_info(
+        &mut self,
+        params: rpc::WorkspaceDiffParams,
+    ) -> Result<rpc::WorkspaceDiffResult> {
+        self.call_result(rpc::M_WORKSPACE_DIFF, params).await
+    }
+
+    pub async fn workspace_changes(
+        &mut self,
+        workspace_id: WorkspaceId,
+    ) -> Result<rpc::WorkspaceChangesResult> {
+        self.call_result(
+            rpc::M_WORKSPACE_CHANGES,
+            rpc::WorkspaceChangesParams { workspace_id },
+        )
+        .await
+    }
+
+    pub async fn workspace_context(
+        &mut self,
+        workspace_id: WorkspaceId,
+    ) -> Result<rpc::WorkspaceContextResult> {
+        self.call_result(
+            rpc::M_WORKSPACE_CONTEXT,
+            rpc::WorkspaceChangesParams { workspace_id },
+        )
+        .await
+    }
+
+    pub async fn save_workspace_context(
+        &mut self,
+        params: rpc::WorkspaceContextSaveParams,
+    ) -> Result<rpc::WorkspaceContextResult> {
+        self.call_result(rpc::M_WORKSPACE_CONTEXT_SAVE, params)
+            .await
     }
 
     /// `session/prompt` → resolves when the turn completes; the turn's
@@ -590,6 +881,22 @@ impl DaemonClient {
             )
             .await?
             .sessions)
+    }
+
+    /// Pi command discovery and controls on an existing adapter connection.
+    pub async fn pi_command(
+        &mut self,
+        session_id: SessionId,
+        command: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        self.call_result(
+            rpc::M_SESSION_PI,
+            rpc::SessionPiParams {
+                session_id,
+                command,
+            },
+        )
+        .await
     }
 
     /// `session/resume` → resume a `Done`/`Error` session.

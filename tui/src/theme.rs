@@ -1,41 +1,43 @@
-//! The UI's single palette — muted, low-saturation accents on the
-//! terminal's default background (克制现代 / restrained modern: color is
-//! semantic, whitespace does the grouping, nothing neon).
+//! OpenCode-inspired neutral surfaces with a warm primary accent.
+//! Color is semantic; whitespace separates conversation and controls.
 //!
-//! All styles are `const`-built, so the palette is a plain [`THEME`]
-//! constant — no lazy init, and `ui.rs` holds no scattered `Color::*`
-//! literals. Terminals without truecolor degrade each accent to its
-//! nearest ANSI shade, which stays low-key by construction.
+//! AGENTMUX_THEME selects dark (default), light or terminal surfaces.
+//! Renderers never contain raw palette colors.
 
 use agentmux_core::SessionState;
 use ratatui::style::{Color, Modifier, Style};
 
 // --- hues ---------------------------------------------------------------
 
-/// Dusty blue — agent identity, info, focus.
-const ACCENT: Color = Color::Rgb(0x7e, 0xa2, 0xc8);
+/// Warm peach — agent identity, primary actions and input focus.
+const ACCENT: Color = Color::Rgb(0xfa, 0xb2, 0x83);
 /// Sage — done states, `+` diff lines, success.
-const SUCCESS: Color = Color::Rgb(0x8f, 0xb3, 0x8f);
+const SUCCESS: Color = Color::Rgb(0x7f, 0xd8, 0x8f);
 /// Sand — in-flight work, waiting, warnings.
-const WARNING: Color = Color::Rgb(0xc9, 0xb1, 0x7d);
+const WARNING: Color = Color::Rgb(0xe5, 0xc0, 0x7b);
 /// Terracotta — errors, `-` diff lines.
 const ERROR: Color = Color::Rgb(0xc9, 0x82, 0x7d);
 /// Mauve — permission notices, relay picks.
-const SPECIAL: Color = Color::Rgb(0xa8, 0x8f, 0xb8);
+const SPECIAL: Color = Color::Rgb(0x9d, 0x7c, 0xd8);
 /// Light gray — primary readable text.
-const TEXT: Color = Color::Rgb(0xc8, 0xc8, 0xc4);
+const TEXT: Color = Color::Rgb(0xee, 0xee, 0xee);
 /// Medium gray — secondary text (labels, hints).
-const DIM: Color = Color::Rgb(0x77, 0x77, 0x73);
+const DIM: Color = Color::Rgb(0x99, 0x99, 0x99);
 /// Dark gray — tertiary chrome (timestamps, borders, separators).
-const FAINT: Color = Color::Rgb(0x50, 0x50, 0x4d);
+const FAINT: Color = Color::Rgb(0x70, 0x70, 0x70);
 /// Near-black — the overlay backdrop wash.
-const SHADE: Color = Color::Rgb(0x12, 0x12, 0x16);
+const SHADE: Color = Color::Rgb(0x0a, 0x0a, 0x0a);
 
 /// Named styles for every role the UI renders. Look up a field rather
 /// than styling ad-hoc — the palette stays coherent by construction.
 pub struct Theme {
     /// Primary readable text.
     pub text: Style,
+    pub panel: Style,
+    pub input: Style,
+    pub control: Style,
+    pub primary: Style,
+    pub code: Style,
     /// Secondary text: state labels, paths, hints.
     pub dim: Style,
     /// Tertiary chrome: timestamps, ids, separators.
@@ -78,6 +80,14 @@ impl Theme {
     const fn new() -> Theme {
         Theme {
             text: Style::new().fg(TEXT),
+            panel: Style::new().fg(TEXT).bg(Color::Rgb(0x14, 0x14, 0x14)),
+            input: Style::new().fg(TEXT).bg(Color::Rgb(0x1e, 0x1e, 0x1e)),
+            control: Style::new().fg(DIM),
+            primary: Style::new()
+                .fg(SHADE)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+            code: Style::new().fg(TEXT).bg(Color::Rgb(0x1e, 0x1e, 0x1e)),
             dim: Style::new().fg(DIM),
             faint: Style::new().fg(FAINT),
             accent: Style::new().fg(ACCENT),
@@ -94,7 +104,7 @@ impl Theme {
             title: Style::new().fg(DIM),
             border: Style::new().fg(FAINT),
             border_focus: Style::new().fg(ACCENT),
-            selection: Style::new().add_modifier(Modifier::REVERSED),
+            selection: Style::new().fg(TEXT).bg(Color::Rgb(0x28, 0x28, 0x28)),
             backdrop: Style::new().bg(SHADE),
         }
     }
@@ -123,23 +133,82 @@ impl Theme {
             _ => self.dim,
         }
     }
-
-    /// Foreground color for the status-bar mode chip.
-    pub fn mode(&self, mode: crate::app::InputMode) -> Style {
-        use crate::app::InputMode::*;
-        match mode {
-            Normal => self.accent,
-            Editing => self.warning,
-            RelayPick => self.special,
-            NewSession => self.accent,
-            Permission => self.warning,
-        }
-    }
 }
 
-/// The one palette instance — a `const`, so it's allocation-free and
-/// usable inside `const` contexts.
-pub const THEME: Theme = Theme::new();
+/// The selected palette, initialized once before the first frame.
+pub static THEME: std::sync::LazyLock<Theme> = std::sync::LazyLock::new(|| {
+    let mut theme = Theme::new();
+    let mode = std::env::var("AGENTMUX_THEME").unwrap_or_else(|_| "dark".into());
+    if mode == "light" {
+        let text = Color::Rgb(0x24, 0x2a, 0x31);
+        let dim = Color::Rgb(0x62, 0x6b, 0x72);
+        let blue = Color::Rgb(0x34, 0x67, 0x91);
+        theme.text = Style::new().fg(text);
+        theme.dim = Style::new().fg(dim);
+        theme.faint = Style::new().fg(dim);
+        theme.accent = Style::new().fg(blue);
+        theme.success = Style::new().fg(Color::Rgb(0x3d, 0x71, 0x50));
+        theme.warning = Style::new().fg(Color::Rgb(0x87, 0x65, 0x1f));
+        theme.error = Style::new().fg(Color::Rgb(0xa5, 0x48, 0x40));
+        theme.special = Style::new().fg(Color::Rgb(0x79, 0x54, 0x8e));
+        theme.panel = theme.text.bg(Color::Rgb(0xf0, 0xef, 0xeb));
+        theme.input = theme.text.bg(Color::Rgb(0xee, 0xed, 0xe8));
+        theme.control = theme.dim;
+        theme.primary = Style::new()
+            .fg(Color::White)
+            .bg(blue)
+            .add_modifier(Modifier::BOLD);
+        theme.code = theme.input;
+        theme.selection = theme.text.bg(Color::Rgb(0xe0, 0xe7, 0xeb));
+        theme.border = theme.dim;
+        theme.border_focus = theme.accent;
+        theme.title = theme.dim;
+        theme.section = theme.dim.add_modifier(Modifier::BOLD);
+        theme.accent_bold = theme.accent.add_modifier(Modifier::BOLD);
+        theme.warning_bold = theme.warning.add_modifier(Modifier::BOLD);
+        theme.special_bold = theme.special.add_modifier(Modifier::BOLD);
+        theme.dim_italic = theme.dim.add_modifier(Modifier::ITALIC);
+        theme.faint_italic = theme.dim_italic;
+        theme.backdrop = Style::new().bg(Color::Rgb(0xfa, 0xf9, 0xf6));
+    } else if mode == "terminal" {
+        theme.text = Style::new();
+        theme.panel = Style::new();
+        theme.input = Style::new();
+        theme.selection = Style::new().add_modifier(Modifier::REVERSED);
+        theme.backdrop = Style::new();
+        theme.control = Style::new();
+        theme.primary = theme.selection.add_modifier(Modifier::BOLD);
+        theme.code = Style::new().add_modifier(Modifier::BOLD);
+        theme.dim = Style::new().add_modifier(Modifier::DIM);
+        theme.title = theme.dim;
+        theme.faint = theme.dim;
+    }
+    theme
+});
+
+/// Syntax palette adapted from OpenCode (see design/OPENCODE-NOTICE.md).
+pub static CODE_THEME: std::sync::LazyLock<tui_markdown::CodeTheme> = std::sync::LazyLock::new(
+    || {
+        let color = |style: Style| match style.fg {
+            Some(Color::Rgb(r, g, b)) => format!("#{r:02x}{g:02x}{b:02x}"),
+            _ => "#eeeeee".into(),
+        };
+        let scopes = [
+            ("", THEME.text),
+            ("comment", THEME.dim),
+            ("keyword, storage", THEME.special),
+            ("string", THEME.success),
+            ("constant.numeric, constant.language", THEME.warning),
+            ("entity.name.function, support.function", THEME.accent),
+            ("entity.name.type, support.type", THEME.warning),
+            ("variable", THEME.error),
+        ];
+        let settings: String = scopes.into_iter().map(|(scope, style)| format!(
+        "<dict><key>scope</key><string>{scope}</string><key>settings</key><dict><key>foreground</key><string>{}</string></dict></dict>", color(style))).collect();
+        tui_markdown::CodeTheme::from_textmate(&format!("<?xml version=\"1.0\"?><plist version=\"1.0\"><dict><key>name</key><string>OpenCode</string><key>settings</key><array>{settings}</array></dict></plist>"))
+        .expect("bundled OpenCode syntax palette")
+    },
+);
 
 #[cfg(test)]
 mod tests {
@@ -149,17 +218,18 @@ mod tests {
     /// foreground (palettes that collapse to monochrome fail here).
     #[test]
     fn semantic_roles_have_distinct_colors() {
-        assert_ne!(THEME.accent.fg, THEME.error.fg);
-        assert_ne!(THEME.success.fg, THEME.warning.fg);
-        assert_ne!(THEME.dim.fg, THEME.faint.fg);
+        let theme = Theme::new();
+        assert_ne!(theme.accent.fg, theme.error.fg);
+        assert_ne!(theme.success.fg, theme.warning.fg);
+        assert_ne!(theme.dim.fg, theme.faint.fg);
         assert_eq!(
-            THEME.badge(&SessionState::Done).fg,
-            THEME.success.fg,
+            theme.badge(&SessionState::Done).fg,
+            theme.success.fg,
             "done maps to the success hue"
         );
         assert_eq!(
-            THEME.badge(&SessionState::Error("x".into())).fg,
-            THEME.error.fg
+            theme.badge(&SessionState::Error("x".into())).fg,
+            theme.error.fg
         );
     }
 }

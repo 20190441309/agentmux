@@ -436,7 +436,7 @@ pub fn translate_line(line: &str) -> Vec<Event> {
 
 /// Extract the pi session identifier from a `get_state` `data` object:
 /// `sessionId`, falling back to `sessionName` then `sessionFile`.
-fn extract_session_id(state: &Value) -> Option<String> {
+pub(crate) fn extract_session_id(state: &Value) -> Option<String> {
     for key in ["sessionId", "sessionName", "sessionFile"] {
         if let Some(s) = state.get(key).and_then(|v| v.as_str()) {
             if !s.is_empty() {
@@ -501,10 +501,11 @@ impl SettledWatch {
 
 /// Commands sent from a [`PiConn`] handle to its worker thread.
 enum Cmd {
+    Request(Value, oneshot::Sender<Result<Value>>),
     Initialize(oneshot::Sender<Result<Value>>),
     NewSession {
         cwd: PathBuf,
-        reply: oneshot::Sender<Result<String>>,
+        reply: oneshot::Sender<Result<Value>>,
     },
     Prompt {
         session_id: String,
@@ -624,12 +625,49 @@ impl PiConn {
         self.await_reply(rx, self.timeouts.init, "initialize").await
     }
 
+    /// Execute a Pi control command. The orchestrator restricts the public
+    /// command surface and serializes mutations with prompt turns.
+    pub async fn request(&self, command: Value) -> Result<Value> {
+        let (tx, rx) = oneshot::channel();
+        self.send(Cmd::Request(command, tx))?;
+        self.await_reply(rx, self.timeouts.prompt, "control command")
+            .await
+    }
+
+    /// Restore Pi's native conversation without creating a replacement.
+    pub async fn load_session(&self, session_file: &Path) -> Result<Value> {
+        let file = session_file
+            .to_str()
+            .ok_or_else(|| anyhow!("Pi session path is not UTF-8"))?;
+        let data = self
+            .request(serde_json::json!({"type":"switch_session", "sessionPath":file}))
+            .await?;
+        anyhow::ensure!(
+            data.get("cancelled").and_then(Value::as_bool) != Some(true),
+            "pi switch_session was cancelled by an extension"
+        );
+        let state = self
+            .request(serde_json::json!({"type":"get_state"}))
+            .await?;
+        anyhow::ensure!(
+            extract_session_id(&state).is_some(),
+            "pi get_state returned no session id after restore"
+        );
+        Ok(state)
+    }
+
     /// Start a fresh pi session: sends `new_session`, then `get_state`,
     /// resolving to the pi session id (`data.sessionId`). `cwd` is
     /// accepted for signature parity with `AcpConn` but unused — pi's
     /// working directory is fixed at spawn.
     /// Unbounded, matching `AcpConn::new_session`.
     pub async fn new_session(&self, cwd: &Path) -> Result<String> {
+        let state = self.new_session_state(cwd).await?;
+        extract_session_id(&state).ok_or_else(|| anyhow!("pi get_state returned no session id"))
+    }
+
+    /// Keep the file and identity from the same native state response.
+    pub(crate) async fn new_session_state(&self, cwd: &Path) -> Result<Value> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::NewSession {
             cwd: cwd.to_path_buf(),
@@ -1205,6 +1243,9 @@ async fn wait_for_settled(watch: &SettledWatch, since: u64) -> Result<()> {
 
 async fn handle_cmd(core: RpcCore, cmd: Cmd) {
     match cmd {
+        Cmd::Request(command, reply) => {
+            let _ = reply.send(core.request(command).await);
+        }
         Cmd::Initialize(reply) => {
             // pi has no initialize phase: `get_state` doubles as the
             // handshake and yields the initial session state.
@@ -1227,8 +1268,8 @@ async fn handle_cmd(core: RpcCore, cmd: Cmd) {
                 }
                 Ok(_) => match core.request(serde_json::json!({"type": "get_state"})).await {
                     Err(e) => Err(e),
-                    Ok(state) => extract_session_id(&state)
-                        .ok_or_else(|| anyhow!("pi get_state returned no session id")),
+                    Ok(state) if extract_session_id(&state).is_some() => Ok(state),
+                    Ok(_) => Err(anyhow!("pi get_state returned no session id")),
                 },
             };
             let _ = reply.send(result);

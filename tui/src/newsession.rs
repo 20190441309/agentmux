@@ -1,4 +1,4 @@
-//! The `n` new-session wizard: a three-step picker inside
+//! New space wizard and current-space agent picker inside
 //! [`InputMode::NewSession`] — project → workspace → agent.
 //!
 //! Pure UI state held on [`App::wizard`]; [`wizard_key`] translates keys
@@ -24,6 +24,7 @@ pub enum WizardStep {
     /// Step 1: pick a project.
     #[default]
     Project,
+    ProjectPath,
     /// Step 2: pick one of the project's workspaces, or the
     /// "+ create new workspace" sentinel.
     Workspace,
@@ -36,17 +37,32 @@ pub enum WizardStep {
 /// What the wizard picked for the session's workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspacePick {
+    Directory {
+        project_id: ProjectId,
+        name: String,
+    },
     /// Reuse an existing workspace.
-    Existing { id: WorkspaceId, name: String },
+    Existing {
+        id: WorkspaceId,
+        name: String,
+    },
     /// `workspace/create` this project first, then create the session
     /// in the fresh workspace.
-    New { project_id: ProjectId, name: String },
+    New {
+        project_id: ProjectId,
+        name: String,
+    },
 }
 
 /// Wizard state — `Some` iff `app.mode == InputMode::NewSession`.
 #[derive(Debug, Clone, Default)]
 pub struct NewSessionWizard {
+    pub adding: bool,
+    pub submitting: bool,
+    pub error: Option<String>,
     pub step: WizardStep,
+    pub path: String,
+    pub registering: bool,
     /// Cursor over `app.projects` (step `Project`).
     pub project_cursor: usize,
     /// Cursor over the picked project's workspaces plus the
@@ -74,7 +90,7 @@ impl NewSessionWizard {
     /// Number of `Workspace`-step rows: the project's workspaces plus the
     /// "+ create new workspace" sentinel.
     fn workspace_row_count(&self, app: &App) -> usize {
-        self.workspace_options(app).count() + 1
+        self.workspace_options(app).count() + 2
     }
 
     /// Pickable agents — available only; the wizard never offers a
@@ -93,10 +109,43 @@ pub(crate) fn wizard_key(app: &mut App, key: KeyEvent) -> AppAction {
     // it, so a stale `&mut` can never observe a half-advanced step.
     let Some(mut wiz) = app.wizard.take() else {
         // Mode without state — recover to Normal rather than wedging.
-        app.mode = InputMode::Normal;
+        app.mode = InputMode::Editing;
         return AppAction::None;
     };
+    if wiz.submitting {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            abort(app);
+            app.set_status("Agent creation continues in the background.");
+        } else {
+            app.wizard = Some(wiz);
+        }
+        return AppAction::None;
+    }
+    if wiz.registering {
+        app.wizard = Some(wiz);
+        return AppAction::None;
+    }
     match wiz.step {
+        WizardStep::ProjectPath => {
+            match key.code {
+                KeyCode::Esc => wiz.step = WizardStep::Project,
+                KeyCode::Enter if !wiz.path.trim().is_empty() => {
+                    let path = wiz.path.trim().to_string();
+                    wiz.registering = true;
+                    app.wizard = Some(wiz);
+                    return AppAction::RegisterProject(path);
+                }
+                KeyCode::Backspace => {
+                    wiz.path.pop();
+                }
+                _ => {
+                    if let Some(c) = crate::input::plain_char(&key) {
+                        wiz.path.push(c);
+                    }
+                }
+            }
+            app.wizard = Some(wiz);
+        }
         WizardStep::Project => match key.code {
             KeyCode::Esc | KeyCode::Char('q') => abort(app),
             KeyCode::Enter => {
@@ -104,14 +153,24 @@ pub(crate) fn wizard_key(app: &mut App, key: KeyEvent) -> AppAction {
                     Some(p) => {
                         wiz.project_id = Some(p.id);
                         wiz.step = WizardStep::Workspace;
-                        wiz.workspace_cursor = 0;
+                        wiz.workspace_cursor = app
+                            .workspaces
+                            .iter()
+                            .filter(|w| w.project_id == p.id)
+                            .count();
+                        if app.agents.iter().any(|a| {
+                            a.available
+                                && matches!(a.adapter, agentmux_core::AdapterKind::Native { .. })
+                        }) {
+                            wiz.workspace_cursor += 1;
+                        }
                     }
-                    None => app.set_status("no project selected"),
+                    None => wiz.step = WizardStep::ProjectPath,
                 }
                 app.wizard = Some(wiz);
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                wiz.project_cursor = clamped(wiz.project_cursor + 1, app.projects.len());
+                wiz.project_cursor = clamped(wiz.project_cursor + 1, app.projects.len() + 1);
                 app.wizard = Some(wiz);
             }
             KeyCode::Char('k') | KeyCode::Up => {
@@ -136,6 +195,18 @@ pub(crate) fn wizard_key(app: &mut App, key: KeyEvent) -> AppAction {
                     wiz.workspace = Some(WorkspacePick::Existing { id, name });
                     wiz.step = WizardStep::Agent;
                     wiz.agent_cursor = 0;
+                } else if wiz.workspace_cursor == wiz.workspace_options(app).count() + 1 {
+                    if let Some(project_id) = wiz.project_id {
+                        let name = app
+                            .projects
+                            .iter()
+                            .find(|p| p.id == project_id)
+                            .map(|p| p.name.clone())
+                            .unwrap_or_else(|| "project".into());
+                        wiz.workspace = Some(WorkspacePick::Directory { project_id, name });
+                        wiz.step = WizardStep::Agent;
+                        wiz.agent_cursor = 0;
+                    }
                 } else {
                     // Past the last workspace row: the create-new sentinel.
                     wiz.step = WizardStep::WorkspaceName;
@@ -186,16 +257,25 @@ pub(crate) fn wizard_key(app: &mut App, key: KeyEvent) -> AppAction {
         },
         WizardStep::Agent => match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                wiz.step = WizardStep::Workspace;
-                app.wizard = Some(wiz);
+                if wiz.adding {
+                    abort(app);
+                } else {
+                    wiz.step = WizardStep::Workspace;
+                    app.wizard = Some(wiz);
+                }
             }
             KeyCode::Enter => {
                 let agent = wiz.agent_options(app).nth(wiz.agent_cursor);
                 match (wiz.workspace.clone(), agent) {
                     (Some(workspace), Some(agent)) => {
                         let agent_id: AgentId = agent.id.clone();
-                        app.wizard = None;
-                        app.mode = InputMode::Normal;
+                        if !app.wb.connected {
+                            app.set_error("Daemon disconnected. Reopen the TUI to reconnect.");
+                            app.wizard = Some(wiz);
+                            return AppAction::None;
+                        }
+                        wiz.submitting = true;
+                        app.wizard = Some(wiz);
                         return AppAction::CreateSession {
                             workspace,
                             agent_id,
@@ -234,8 +314,8 @@ fn clamped(next: usize, count: usize) -> usize {
     }
 }
 
-/// Drop the wizard and return to Normal mode.
+/// Drop the wizard and return to the editor.
 fn abort(app: &mut App) {
     app.wizard = None;
-    app.mode = InputMode::Normal;
+    app.mode = InputMode::Editing;
 }

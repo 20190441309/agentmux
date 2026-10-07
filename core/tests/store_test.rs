@@ -39,6 +39,7 @@ fn sample_workspace(project_id: ProjectId, name: &str) -> Workspace {
         name: name.into(),
         worktree_path: PathBuf::from(format!("/repos/agentmux/.agentmux/worktrees/{name}")),
         branch: format!("agentmux/{name}"),
+        managed_worktree: true,
         created_at: Utc::now(),
     }
 }
@@ -63,6 +64,8 @@ fn sample_session(workspace_id: WorkspaceId, agent_id: &AgentId) -> Session {
         agent_id: agent_id.clone(),
         state: SessionState::Created,
         acp_session_id: None,
+        native_session_file: None,
+        native_terminal: false,
         references: vec![],
         created_at: Utc::now(),
     }
@@ -96,6 +99,48 @@ fn open_creates_db_and_sessions_dir() {
     let (dir, _store) = temp_store();
     assert!(dir.path().join("db.sqlite").is_file());
     assert!(dir.path().join("sessions").is_dir());
+}
+
+#[test]
+fn native_session_identity_and_file_survive_reopen() {
+    let (dir, store) = temp_store();
+    let (_, _, _, session) = scaffold(&store);
+    let file = dir.path().join("native-session.jsonl");
+    store
+        .set_native_session(session.id, "native-id", Some(&file))
+        .unwrap();
+    drop(store);
+    let store = Store::open(dir.path()).unwrap();
+    let saved = store.get_session(session.id).unwrap().unwrap();
+    assert_eq!(saved.acp_session_id.as_deref(), Some("native-id"));
+    assert_eq!(saved.native_session_file, Some(file));
+    assert!(store
+        .set_native_session(SessionId::new(), "missing", None)
+        .is_err());
+}
+
+#[test]
+fn upgrading_legacy_schema_preserves_sessions_and_event_logs() {
+    let (dir, store) = temp_store();
+    let (_, _, _, session) = scaffold(&store);
+    let event = sample_event(session.id, 1);
+    store.append_event(&event).unwrap();
+    drop(store);
+    let conn = rusqlite::Connection::open(dir.path().join("db.sqlite")).unwrap();
+    conn.execute("ALTER TABLE sessions DROP COLUMN native_session_file", [])
+        .unwrap();
+    drop(conn);
+    for _ in 0..2 {
+        let upgraded = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            upgraded.get_session(session.id).unwrap(),
+            Some(session.clone())
+        );
+        assert_eq!(
+            upgraded.read_events(session.id).unwrap(),
+            vec![event.clone()]
+        );
+    }
 }
 
 #[test]

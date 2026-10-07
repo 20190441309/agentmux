@@ -33,6 +33,9 @@ pub enum InputMode {
     /// the overlay stays up (marked pending) until the matching
     /// `PermissionResolved` event arrives.
     Permission,
+    Sidebar,
+    TaskPicker,
+    Help,
 }
 
 /// A request from the key handler to the async main loop.
@@ -41,6 +44,22 @@ pub enum InputMode {
 /// actions and `main.rs` performs the matching `DaemonClient` calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppAction {
+    RefreshInfo,
+    RefreshContext,
+    SaveContext(agentmux_core::rpc::WorkspaceContextSaveParams),
+    CopyText {
+        session: SessionId,
+        text: String,
+    },
+    AttachNative,
+    BrowseNative,
+    OpenNative {
+        session_id: SessionId,
+        session_file: Option<std::path::PathBuf>,
+        native: bool,
+        history: bool,
+    },
+    Pi(serde_json::Value),
     /// Nothing to do (unhandled key, or a pure state change).
     None,
     /// `q` — leave the UI.
@@ -75,6 +94,15 @@ pub enum AppAction {
         session_id: SessionId,
         request_id: String,
         outcome: PermissionDecision,
+    },
+    LoadHistory,
+    InspectFile(String),
+    InspectChange(agentmux_core::rpc::WorkspaceDiffParams),
+    RefreshFiles,
+    RegisterProject(String),
+    RenameSession {
+        session_id: SessionId,
+        title: String,
     },
 }
 
@@ -173,6 +201,7 @@ pub struct SessionView {
 
 /// All renderable UI state.
 pub struct App {
+    pub wb: crate::workbench::Workbench,
     /// Sessions in display order (grouped by workspace).
     pub sessions: Vec<SessionView>,
     /// Index into `sessions` of the highlighted session.
@@ -211,12 +240,36 @@ pub struct App {
     pub unread: HashSet<SessionId>,
 }
 
-/// Upper bound on the in-memory event log — a safety valve so a long
-/// session cannot grow `events` without limit. The daemon's per-session
-/// JSONL log stays authoritative; this only bounds what the TUI renders.
-const MAX_EVENTS: usize = 10_000;
-
 impl App {
+    pub fn review_open(&self) -> bool {
+        self.wb.attention.panel.is_some()
+            || self.wb.transcript.panel.is_some()
+            || self.wb.references.panel.is_some()
+            || self.wb.info.panel.is_some()
+            || self.wb.context.panel.is_some()
+    }
+    pub fn overlay_open(&self) -> bool {
+        self.wb.context.panel.is_some()
+            || self.wb.menu
+            || self.wb.attention.panel.is_some()
+            || self.wb.transcript.panel.is_some()
+            || self.wb.references.panel.is_some()
+            || self.wb.info.panel.is_some()
+            || self.wb.naming.is_some()
+            || self.wb.pi_panel.is_some()
+            || matches!(
+                self.mode,
+                InputMode::Permission
+                    | InputMode::NewSession
+                    | InputMode::TaskPicker
+                    | InputMode::Help
+                    | InputMode::RelayPick
+            )
+    }
+    pub fn selected_is_native(&self) -> bool {
+        self.selected_session()
+            .is_some_and(|v| v.session.native_terminal)
+    }
     pub fn new(
         projects: Vec<Project>,
         workspaces: Vec<Workspace>,
@@ -224,10 +277,11 @@ impl App {
         agents: Vec<AgentProfile>,
     ) -> App {
         App {
+            wb: crate::workbench::Workbench::default(),
             sessions,
             selected: 0,
             events: Vec::new(),
-            mode: InputMode::Normal,
+            mode: InputMode::Editing,
             projects,
             workspaces,
             agents,
@@ -248,6 +302,33 @@ impl App {
     /// `PermissionResolved` closes the matching one, and every event is
     /// appended to the log the right pane renders.
     pub fn handle_event(&mut self, ev: Event) {
+        let duplicate = ev.seq != 0
+            && self
+                .events
+                .iter()
+                .any(|event| event.session_id == ev.session_id && event.seq == ev.seq);
+        // Pending permission snapshots can hydrate requests already present in history.
+        if (duplicate
+            && !matches!(
+                ev.kind,
+                EventKind::PermissionRequest { .. } | EventKind::PermissionResolved { .. }
+            ))
+            || (matches!(ev.kind, EventKind::StateChanged { .. })
+                && self.wb.attention.state_seen(ev.session_id, ev.seq))
+        {
+            return;
+        }
+        crate::commands::observe_acp_commands(self, &ev);
+        crate::transcript::observe(self, &ev);
+        crate::agent_info::observe(self, &ev);
+        self.wb
+            .reasoning
+            .entry(ev.session_id)
+            .or_default()
+            .observe(&ev);
+        if ev.resets_conversation_view() {
+            self.start_conversation(ev.session_id, ev.seq);
+        }
         if let EventKind::StateChanged { to, .. } = &ev.kind {
             if let Some(view) = self
                 .sessions
@@ -257,41 +338,82 @@ impl App {
                 view.session.state = to.clone();
             }
         }
+        if matches!(
+            &ev.kind,
+            EventKind::StateChanged {
+                to: SessionState::Done | SessionState::Error(_),
+                ..
+            }
+        ) {
+            self.wb
+                .permissions
+                .retain(|p| p.session_id != ev.session_id);
+            if self
+                .permission
+                .as_ref()
+                .is_some_and(|p| p.session_id == ev.session_id)
+            {
+                let resume = self.permission.as_ref().unwrap().resume;
+                self.permission = self.wb.permissions.pop_front();
+                self.wb.control_focus = None;
+                if self.mode == InputMode::Permission {
+                    self.mode = resume;
+                }
+            }
+        }
         match &ev.kind {
+            EventKind::TitleChanged { title } => {
+                self.apply_title(ev.session_id, title.clone(), ev.seq)
+            }
             EventKind::PermissionRequest {
                 request_id,
                 request,
             } => {
-                // Stacked requests keep the original interrupted mode —
-                // `resume` of an existing notice wins over the current
-                // (already-Permission) mode.
-                let resume = self
+                if self
                     .permission
                     .as_ref()
-                    .map(|p| p.resume)
-                    .unwrap_or(self.mode);
-                self.permission = Some(PermissionNotice {
+                    .is_some_and(|p| p.session_id == ev.session_id && p.request_id == *request_id)
+                    || self
+                        .wb
+                        .permissions
+                        .iter()
+                        .any(|p| p.session_id == ev.session_id && p.request_id == *request_id)
+                {
+                    return;
+                }
+                let notice = PermissionNotice {
                     session_id: ev.session_id,
                     request_id: request_id.clone(),
                     summary: permission_summary(request),
                     request: request.clone(),
-                    resume,
+                    resume: self.mode,
                     pending: false,
-                });
-                self.mode = InputMode::Permission;
+                };
+                if self.permission.is_none() {
+                    self.permission = Some(notice);
+                } else {
+                    self.wb.permissions.push_back(notice);
+                }
             }
             EventKind::PermissionResolved {
                 request_id,
                 outcome,
             } => {
-                // Only a resolution for the *displayed* request dismisses
-                // the dialog; a stacked/unknown one just logs.
-                if let Some(notice) = &self.permission {
-                    if notice.request_id == *request_id {
-                        self.mode = notice.resume;
-                        self.permission = None;
-                        self.set_status(format!("permission {outcome}"));
+                if self
+                    .permission
+                    .as_ref()
+                    .is_some_and(|p| p.session_id == ev.session_id && p.request_id == *request_id)
+                {
+                    let resume = self.permission.as_ref().unwrap().resume;
+                    self.permission = self.wb.permissions.pop_front();
+                    if self.mode == InputMode::Permission {
+                        self.mode = resume;
                     }
+                    self.set_status(format!("permission {outcome}"));
+                } else {
+                    self.wb.permissions.retain(|p| {
+                        !(p.session_id == ev.session_id && p.request_id == *request_id)
+                    });
                 }
             }
             _ => {}
@@ -301,11 +423,42 @@ impl App {
         if !ev.session_id.0.is_nil() && Some(ev.session_id) != self.selected_session_id() {
             self.unread.insert(ev.session_id);
         }
-        self.events.push(ev);
-        // Bound the log so a long-lived session can't grow it forever;
-        // the daemon's JSONL event log stays authoritative.
-        if self.events.len() >= MAX_EVENTS {
-            self.events.drain(..MAX_EVENTS / 4);
+        if let Some(text) = crate::workbench::prompt_text(&ev) {
+            if self
+                .wb
+                .sessions
+                .get(&ev.session_id)
+                .is_none_or(|s| ev.seq > s.conversation_start)
+            {
+                self.set_title_from_prompt(ev.session_id, text);
+            }
+        }
+        crate::attention::observe(self, &ev);
+        if !duplicate {
+            self.events.push(ev);
+        }
+        // Persisted logs remain authoritative. Evict old cached events only
+        // for sessions following live output; never shift a history reader.
+        if self.events.len() > 20_000 && self.mode != InputMode::RelayPick {
+            let mut remaining = 5_000;
+            let mut evicted = HashSet::new();
+            self.events.retain(|event| {
+                let reading = self
+                    .wb
+                    .sessions
+                    .get(&event.session_id)
+                    .is_some_and(|ui| ui.anchor.is_some());
+                if remaining > 0 && !reading {
+                    remaining -= 1;
+                    evicted.insert(event.session_id);
+                    false
+                } else {
+                    true
+                }
+            });
+            for id in evicted {
+                self.wb.sessions.entry(id).or_default().older = true;
+            }
         }
     }
 
@@ -314,6 +467,7 @@ impl App {
     pub fn mark_selected_viewed(&mut self) {
         if let Some(id) = self.selected_session_id() {
             self.unread.remove(&id);
+            self.wb.attention.viewed(id);
         }
     }
 
@@ -325,27 +479,120 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return AppAction::None;
         }
+        self.wb.interaction_epoch += 1;
+        if self.wb.inspection.is_none() || key.code == crossterm::event::KeyCode::Esc {
+            self.wb.pending_diff = None;
+        }
+        if let Some(action) = crate::attention::keyboard(self, key) {
+            return action;
+        }
+        if let Some(action) = crate::agent_info::keyboard(self, key) {
+            return action;
+        }
+        if let Some(action) = crate::context::keyboard(self, key) {
+            return action;
+        }
+        if let Some(action) = crate::references::keyboard(self, key) {
+            return action;
+        }
+        if let Some(action) = crate::transcript::keyboard(self, key) {
+            return action;
+        }
+        if let Some(action) = crate::naming::keyboard(self, key) {
+            return action;
+        }
+        if let Some(action) = crate::files::keyboard(self, key) {
+            return action;
+        }
+        if let Some(action) = crate::commands::keyboard(self, key) {
+            return action;
+        }
+        if let Some(action) = crate::interaction::keyboard(self, key) {
+            return action;
+        }
+        if let Some(action) = input::global_key(self, key) {
+            return action;
+        }
         match self.mode {
             InputMode::Normal => input::normal_key(self, key),
             InputMode::Editing => input::editing_key(self, key),
             InputMode::RelayPick => input::relay_pick_key(self, key),
             InputMode::NewSession => crate::newsession::wizard_key(self, key),
             InputMode::Permission => input::permission_key(self, key),
+            InputMode::Sidebar => input::sidebar_key(self, key),
+            InputMode::TaskPicker => input::picker_key(self, key),
+            InputMode::Help => {
+                match key.code {
+                    crossterm::event::KeyCode::Up | crossterm::event::KeyCode::PageUp => {
+                        self.wb.help_scroll = self.wb.help_scroll.saturating_sub(8)
+                    }
+                    crossterm::event::KeyCode::Down | crossterm::event::KeyCode::PageDown => {
+                        self.wb.help_scroll = self.wb.help_scroll.saturating_add(8)
+                    }
+                    _ => self.mode = self.wb.return_mode,
+                }
+                AppAction::None
+            }
+        }
+    }
+
+    pub fn paste_text(&mut self, text: &str) {
+        if self.wb.context.panel.is_some() {
+            return;
+        }
+        if self.wb.info.panel.is_some() {
+            return;
+        }
+        if self.wb.references.panel.is_some() {
+            return;
+        }
+        if crate::transcript::paste(self, text) {
+            return;
+        }
+        if self.wb.attention.panel.is_some() {
+            return;
+        }
+        if crate::files::search_active(self) {
+            self.wb.files.query.push_str(text.trim());
+            self.wb.file_cursor = 0;
+            return;
+        }
+        self.wb.interaction_epoch += 1;
+        if self.wb.naming.is_some() {
+            crate::naming::paste(self, text);
+        } else if let Some(panel) = self.wb.pi_panel.as_mut() {
+            panel.query.push_str(text.trim());
+            panel.cursor = 0;
+        } else if self.mode == InputMode::TaskPicker {
+            self.wb.picker_query.push_str(text.trim());
+            self.wb.picker_cursor = 0;
+        } else if self.mode == InputMode::Editing {
+            self.insert_text(text);
+        } else if let Some(wiz) = self
+            .wizard
+            .as_mut()
+            .filter(|w| !w.registering && !w.submitting)
+        {
+            match wiz.step {
+                crate::newsession::WizardStep::ProjectPath => wiz.path.push_str(text.trim()),
+                crate::newsession::WizardStep::WorkspaceName => {
+                    wiz.name.push_str(&text.replace(['\n', '\r'], ""))
+                }
+                _ => {}
+            }
         }
     }
 
     /// `j`/Down: move the highlight one session down, clamped.
     pub(crate) fn select_next(&mut self) {
         if !self.sessions.is_empty() {
-            self.selected = (self.selected + 1).min(self.sessions.len() - 1);
-            self.mark_selected_viewed();
+            self.select_session((self.selected + 1).min(self.sessions.len() - 1));
         }
     }
 
     /// `k`/Up: move the highlight one session up, clamped.
     pub(crate) fn select_prev(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
-        self.mark_selected_viewed();
+        self.select_session(self.selected.saturating_sub(1));
     }
 
     /// The highlighted session, if any.
@@ -366,9 +613,14 @@ impl App {
     /// newest events and stop early (viewport-bounded draw).
     pub fn events_for_selected(&self) -> impl DoubleEndedIterator<Item = &Event> {
         let selected = self.selected_session_id();
-        self.events
-            .iter()
-            .filter(move |ev| Some(ev.session_id) == selected || ev.session_id.0.is_nil())
+        let boundary = selected
+            .and_then(|id| self.wb.sessions.get(&id))
+            .map(|s| s.conversation_start)
+            .unwrap_or(0);
+        self.events.iter().filter(move |ev| {
+            (Some(ev.session_id) == selected && (boundary == 0 || ev.seq > boundary))
+                || ev.session_id.0.is_nil()
+        })
     }
 
     /// Events strictly owned by the selected session — unlike
@@ -443,7 +695,12 @@ impl App {
                     short_id(&source.session_id.to_string()).to_string(),
                 )
             });
+        self.select_session(pick.session_cursor);
         let marker = format!("[@{agent}/{short}#{}: {}]", source.seq, source.summary);
+        self.wb
+            .references
+            .markers
+            .insert((target_id, source.session_id, source.seq), marker.clone());
         if !self.input.is_empty() && !self.input.ends_with(' ') {
             self.input.push(' ');
         }
@@ -454,7 +711,7 @@ impl App {
             seq: source.seq,
             target: target_id,
         });
-        self.selected = pick.session_cursor;
+        self.wb.cursor = self.input.len();
         self.mark_selected_viewed();
         self.relay = None;
         self.mode = InputMode::Editing;
@@ -469,15 +726,49 @@ impl App {
     /// project (a workspace must live somewhere) and one available
     /// agent — anything missing gets a status hint instead.
     pub(crate) fn start_wizard(&mut self) {
-        if self.projects.is_empty() {
-            self.set_status("no projects registered — register one first (project/register)");
+        if self.wb.creating.is_some() {
+            self.set_status(
+                "An agent is being created. Wait for it to finish before adding another.",
+            );
             return;
         }
-        if !self.agents.iter().any(|a| a.available) {
-            self.set_status("no available agents — none of the configured agents probed usable");
+        self.status = None;
+        self.wb.drawer = false;
+        if self.projects.is_empty() {
+            self.wizard = Some(NewSessionWizard {
+                step: crate::newsession::WizardStep::ProjectPath,
+                ..Default::default()
+            });
+            self.mode = InputMode::NewSession;
             return;
         }
         self.wizard = Some(NewSessionWizard::default());
+        self.mode = InputMode::NewSession;
+    }
+
+    pub(crate) fn start_add_agent(&mut self) {
+        if self.wb.creating.is_some() {
+            self.set_status(
+                "An agent is being created. Wait for it to finish before adding another.",
+            );
+            return;
+        }
+        let Some(view) = self.selected_session() else {
+            self.start_wizard();
+            return;
+        };
+        let workspace = WorkspacePick::Existing {
+            id: view.session.workspace_id,
+            name: view.workspace_name.clone(),
+        };
+        self.wizard = Some(NewSessionWizard {
+            adding: true,
+            step: crate::newsession::WizardStep::Agent,
+            workspace: Some(workspace),
+            ..Default::default()
+        });
+        self.status = None;
+        self.wb.drawer = false;
         self.mode = InputMode::NewSession;
     }
 
@@ -489,15 +780,31 @@ impl App {
     /// `tool_call` upstream, so this is the defensive path for records
     /// that reached the log unnormalized.
     pub fn touched_files(&self) -> Vec<String> {
+        self.selected_session_id()
+            .map(|id| self.touched_files_for(id))
+            .unwrap_or_default()
+    }
+
+    pub fn touched_files_for(&self, id: SessionId) -> Vec<String> {
         let mut seen: Vec<String> = Vec::new();
-        for ev in self.session_events() {
+        for ev in self.events.iter().filter(|ev| ev.session_id == id) {
             match &ev.kind {
                 EventKind::FileEdited { path } => {
                     note_touched(&mut seen, path.display().to_string());
                 }
                 EventKind::SessionUpdate(v) => {
                     let update = v.get("update").unwrap_or(v);
-                    if update.get("sessionUpdate").and_then(|u| u.as_str()) == Some("tool_call") {
+                    if matches!(
+                        update.get("sessionUpdate").and_then(|u| u.as_str()),
+                        Some("tool_call" | "tool_call_update")
+                    ) {
+                        if let Some(content) = update.get("content").and_then(|v| v.as_array()) {
+                            for item in content {
+                                if let Some(path) = item.get("path").and_then(|v| v.as_str()) {
+                                    note_touched(&mut seen, path.into());
+                                }
+                            }
+                        }
                         if let Some(locations) = update.get("locations").and_then(|l| l.as_array())
                         {
                             for loc in locations {
@@ -516,6 +823,22 @@ impl App {
         seen
     }
 
+    pub fn workspace_file_participants(&self) -> std::collections::HashMap<String, Vec<SessionId>> {
+        let mut files: std::collections::HashMap<String, Vec<SessionId>> = Default::default();
+        if let Some(selected) = self.selected_session() {
+            for view in self
+                .sessions
+                .iter()
+                .filter(|v| v.session.workspace_id == selected.session.workspace_id)
+            {
+                for path in self.touched_files_for(view.session.id) {
+                    files.entry(path).or_default().push(view.session.id);
+                }
+            }
+        }
+        files
+    }
+
     /// Insert a session keeping the list grouped by workspace: it lands
     /// after the existing sessions of the same workspace, or at the end
     /// when its workspace isn't listed. Returns the new index.
@@ -526,6 +849,9 @@ impl App {
             .rposition(|v| v.session.workspace_id == view.session.workspace_id)
             .map(|i| i + 1)
             .unwrap_or(self.sessions.len());
+        if !self.sessions.is_empty() && insert_at <= self.selected {
+            self.selected += 1;
+        }
         self.sessions.insert(insert_at, view);
         insert_at
     }
@@ -539,17 +865,24 @@ impl App {
     /// matching notice (the request is still parked agent-side — the
     /// overlay must stay up so the user can answer again) and show the
     /// failure.
-    pub fn permission_answer_failed(&mut self, request_id: &str, error: String) {
-        if let Some(notice) = &mut self.permission {
-            if notice.request_id == request_id {
-                notice.pending = false;
-                self.set_status(format!(
-                    "permission response failed: {error} — answer again"
-                ));
-                return;
-            }
+    pub fn permission_answer_failed(
+        &mut self,
+        session_id: SessionId,
+        request_id: &str,
+        error: String,
+    ) {
+        let notice = self
+            .permission
+            .iter_mut()
+            .chain(self.wb.permissions.iter_mut())
+            .find(|p| p.session_id == session_id && p.request_id == request_id);
+        if let Some(notice) = notice {
+            notice.pending = false;
+            self.set_error_for(
+                Some(session_id),
+                format!("permission response failed: {error} — answer again"),
+            );
         }
-        self.set_status(format!("permission response failed: {error}"));
     }
 
     /// Badge `(glyph, label)` for a session state — the contract between
@@ -590,6 +923,8 @@ pub(crate) fn event_summary(ev: &Event) -> String {
         return truncate(summary, 80);
     }
     let text = match &ev.kind {
+        EventKind::TitleChanged { title } => format!("named: {title}"),
+        EventKind::ConversationStarted => "new conversation".into(),
         EventKind::SessionUpdate(v) => {
             let update = v.get("update").unwrap_or(v);
             match update.get("sessionUpdate").and_then(|u| u.as_str()) {
@@ -691,6 +1026,7 @@ mod tests {
             name: name.to_string(),
             worktree_path: format!("/wt/{name}").into(),
             branch: name.to_string(),
+            managed_worktree: true,
             created_at: Utc::now(),
         }
     }
@@ -715,6 +1051,8 @@ mod tests {
             agent_id: AgentId::new("claude-code"),
             state,
             acp_session_id: None,
+            native_session_file: None,
+            native_terminal: false,
             references: vec![],
             created_at: Utc::now(),
         }
@@ -740,7 +1078,9 @@ mod tests {
                 workspace_name: ws.name.clone(),
             })
             .collect();
-        App::new(vec![proj], vec![ws], sessions, vec![agent("claude", true)])
+        let mut app = App::new(vec![proj], vec![ws], sessions, vec![agent("claude", true)]);
+        app.mode = InputMode::Normal; // Explicitly exercise legacy shortcuts.
+        app
     }
 
     /// An app with one project, one workspace and two agents (one
@@ -748,12 +1088,14 @@ mod tests {
     fn wizard_app() -> App {
         let proj = project("myproj");
         let ws = workspace_in(proj.id, "ws1");
-        App::new(
+        let mut app = App::new(
             vec![proj],
             vec![ws],
             vec![],
             vec![agent("mock", true), agent("gone", false)],
-        )
+        );
+        app.mode = InputMode::Normal;
+        app
     }
 
     // --- event handling -------------------------------------------------
@@ -850,16 +1192,15 @@ mod tests {
     }
 
     #[test]
-    fn normal_n_without_projects_stays_normal() {
-        // No projects → nowhere to create a workspace; status explains.
+    fn new_task_without_projects_opens_path_form() {
         let mut app = App::new(vec![], vec![], vec![], vec![agent("mock", true)]);
-        assert_eq!(app.handle_key(key(KeyCode::Char('n'))), AppAction::None);
-        assert_eq!(app.mode, InputMode::Normal);
-        assert!(app.status.is_some());
+        app.start_wizard();
+        assert_eq!(app.mode, InputMode::NewSession);
+        assert_eq!(app.wizard.as_ref().unwrap().step, WizardStep::ProjectPath);
     }
 
     #[test]
-    fn normal_n_without_available_agents_stays_normal() {
+    fn normal_n_without_available_agents_keeps_wizard_accessible() {
         let proj = project("p");
         let mut app = App::new(
             vec![proj.clone()],
@@ -867,17 +1208,15 @@ mod tests {
             vec![],
             vec![agent("mock", false)],
         );
+        app.mode = InputMode::Normal;
         app.handle_key(key(KeyCode::Char('n')));
-        assert_eq!(app.mode, InputMode::Normal);
-        assert!(app.status.is_some());
+        assert_eq!(app.mode, InputMode::NewSession);
+        assert!(app.wizard.is_some());
     }
 
     #[test]
-    fn normal_tab_toggles_diff_pane() {
+    fn tab_does_not_toggle_the_file_view() {
         let mut app = app_with_sessions(&[SessionState::Ready]);
-        assert!(!app.show_diff);
-        app.handle_key(key(KeyCode::Tab));
-        assert!(app.show_diff);
         app.handle_key(key(KeyCode::Tab));
         assert!(!app.show_diff);
     }
@@ -975,14 +1314,17 @@ mod tests {
     }
 
     #[test]
-    fn editing_esc_and_ctrl_c_return_to_normal() {
+    fn editing_esc_and_ctrl_c_keep_editor_active() {
         let mut app = app_with_sessions(&[SessionState::Ready]);
         app.mode = InputMode::Editing;
         app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.mode, InputMode::Normal);
+        assert_eq!(app.mode, InputMode::Editing);
         app.mode = InputMode::Editing;
-        assert_eq!(app.handle_key(ctrl(KeyCode::Char('c'))), AppAction::None);
-        assert_eq!(app.mode, InputMode::Normal);
+        assert_eq!(
+            app.handle_key(ctrl(KeyCode::Char('c'))),
+            AppAction::CancelPrompt
+        );
+        assert_eq!(app.mode, InputMode::Editing);
     }
 
     #[test]
@@ -1076,16 +1418,16 @@ mod tests {
         let sid = app.sessions[0].session.id;
         app.handle_event(event(sid, EventKind::Orchestrator("x".into())));
 
-        app.handle_key(key(KeyCode::Char('@')));
+        app.start_relay();
         app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.mode, InputMode::Normal);
+        assert_eq!(app.mode, InputMode::Editing);
         assert!(app.relay.is_none());
 
-        app.handle_key(key(KeyCode::Char('@')));
+        app.start_relay();
         app.handle_key(key(KeyCode::Enter)); // → stage Session
         assert_eq!(app.relay.as_ref().unwrap().stage, RelayStage::Session);
         app.handle_key(key(KeyCode::Char('q')));
-        assert_eq!(app.mode, InputMode::Normal);
+        assert_eq!(app.mode, InputMode::Editing);
         assert!(app.relay.is_none());
         assert!(app.pending_relays.is_empty());
         assert_eq!(app.input, "");
@@ -1139,7 +1481,7 @@ mod tests {
     /// carrying the request id, and the overlay stays pending until the
     /// `PermissionResolved` event lands.
     #[test]
-    fn permission_event_opens_dialog_and_y_answers_allow_once() {
+    fn permission_event_waits_for_review_and_y_answers_allow_once() {
         let mut app = app_with_sessions(&[SessionState::Prompting]);
         let sid = app.sessions[0].session.id;
         app.handle_event(perm_request_event(
@@ -1147,6 +1489,8 @@ mod tests {
             "req-1",
             perm_options(&[("Reject", "reject_once"), ("Allow", "allow_once")]),
         ));
+        assert_ne!(app.mode, InputMode::Permission);
+        app.open_permissions();
         assert_eq!(app.mode, InputMode::Permission);
         let notice = app.permission.as_ref().expect("permission notice");
         assert!(
@@ -1195,6 +1539,8 @@ mod tests {
             "req-1",
             perm_options(&[("Allow", "allow_once"), ("No", "reject_once")]),
         ));
+        assert_ne!(app.mode, InputMode::Permission);
+        app.open_permissions();
         // `a` is a no-op — allow_always wasn't offered.
         assert_eq!(app.handle_key(key(KeyCode::Char('a'))), AppAction::None);
         assert!(!app.permission.as_ref().unwrap().pending);
@@ -1215,6 +1561,8 @@ mod tests {
             "req-2",
             perm_options(&[("Always", "allow_always"), ("No", "reject_once")]),
         ));
+        assert_ne!(app.mode, InputMode::Permission);
+        app.open_permissions();
         assert_eq!(
             app.handle_key(key(KeyCode::Char('a'))),
             AppAction::RespondPermission {
@@ -1227,14 +1575,8 @@ mod tests {
         let mut app = app_with_sessions(&[SessionState::Prompting]);
         let sid = app.sessions[0].session.id;
         app.handle_event(perm_request_event(sid, "req-3", perm_options(&[])));
-        assert_eq!(
-            app.handle_key(key(KeyCode::Esc)),
-            AppAction::RespondPermission {
-                session_id: sid,
-                request_id: "req-3".into(),
-                outcome: PermissionDecision::Reject,
-            }
-        );
+        app.open_permissions();
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), AppAction::None);
     }
 
     /// The dialog interrupts whatever mode was active; resolution
@@ -1250,6 +1592,8 @@ mod tests {
             "req-1",
             perm_options(&[]),
         ));
+        assert_ne!(app.mode, InputMode::Permission);
+        app.open_permissions();
         assert_eq!(app.mode, InputMode::Permission);
 
         // A resolved for a different request_id must not dismiss.
@@ -1286,10 +1630,11 @@ mod tests {
         let mut app = app_with_sessions(&[SessionState::Prompting]);
         let sid = app.sessions[0].session.id;
         app.handle_event(perm_request_event(sid, "req-1", perm_options(&[])));
+        app.open_permissions();
         app.handle_key(key(KeyCode::Char('y')));
         assert!(app.permission.as_ref().unwrap().pending);
 
-        app.permission_answer_failed("req-1", "daemon gone".into());
+        app.permission_answer_failed(sid, "req-1", "daemon gone".into());
         assert!(!app.permission.as_ref().unwrap().pending);
         assert!(app.status.as_deref().unwrap().contains("answer again"));
         assert_eq!(
@@ -1306,6 +1651,53 @@ mod tests {
     // --- new-session wizard (Task 14) -----------------------------------------
 
     #[test]
+    fn terminated_agent_discards_its_permissions_and_preserves_other_agents() {
+        for terminal in [
+            SessionState::Done,
+            SessionState::Error("disconnected".into()),
+        ] {
+            let mut app = app_with_sessions(&[SessionState::Ready, SessionState::Ready]);
+            let first = app.sessions[0].session.id;
+            let second = app.sessions[1].session.id;
+            app.mode = InputMode::Editing;
+            app.insert_text("keep draft");
+            for (sid, request) in [(first, "same-id"), (first, "queued"), (second, "same-id")] {
+                app.handle_event(perm_request_event(sid, request, perm_options(&[])));
+            }
+            app.open_permissions();
+            app.handle_event(event(
+                first,
+                EventKind::StateChanged {
+                    from: SessionState::WaitingPermission,
+                    to: terminal,
+                },
+            ));
+            assert_eq!(app.mode, InputMode::Editing);
+            assert_eq!(app.input, "keep draft");
+            assert!(app.wb.permissions.is_empty());
+            assert_eq!(app.permission.as_ref().unwrap().session_id, second);
+            app.permission.as_mut().unwrap().pending = true;
+            app.permission_answer_failed(first, "same-id", "late failure".into());
+            assert!(app.permission.as_ref().unwrap().pending);
+        }
+    }
+
+    #[test]
+    fn permission_failure_retries_only_matching_agent_in_queue() {
+        let mut app = app_with_sessions(&[SessionState::Ready, SessionState::Ready]);
+        let first = app.sessions[0].session.id;
+        let second = app.sessions[1].session.id;
+        for sid in [first, second] {
+            app.handle_event(perm_request_event(sid, "same-id", perm_options(&[])));
+        }
+        app.permission.as_mut().unwrap().pending = true;
+        app.wb.permissions[0].pending = true;
+        app.permission_answer_failed(second, "same-id", "retry".into());
+        assert!(app.permission.as_ref().unwrap().pending);
+        assert!(!app.wb.permissions[0].pending);
+    }
+
+    #[test]
     fn wizard_flow_existing_workspace() {
         let mut app = wizard_app();
         let ws_id = app.workspaces[0].id;
@@ -1313,6 +1705,7 @@ mod tests {
         assert_eq!(app.wizard.as_ref().unwrap().step, WizardStep::Project);
         app.handle_key(key(KeyCode::Enter)); // pick project
         assert_eq!(app.wizard.as_ref().unwrap().step, WizardStep::Workspace);
+        app.handle_key(key(KeyCode::Up)); // reuse ws1 instead of the new-space default
         app.handle_key(key(KeyCode::Enter)); // pick ws1
         assert_eq!(app.wizard.as_ref().unwrap().step, WizardStep::Agent);
         // `j` clamps over the single available agent (`gone` is filtered).
@@ -1328,8 +1721,9 @@ mod tests {
                 agent_id: AgentId::new("mock"),
             }
         );
-        assert_eq!(app.mode, InputMode::Normal);
-        assert!(app.wizard.is_none(), "wizard finished");
+        assert_eq!(app.mode, InputMode::NewSession);
+        assert!(app.wizard.as_ref().unwrap().submitting);
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), AppAction::None);
     }
 
     #[test]
@@ -1338,8 +1732,8 @@ mod tests {
         let pid = app.projects[0].id;
         app.handle_key(key(KeyCode::Char('n')));
         app.handle_key(key(KeyCode::Enter)); // project
-                                             // Options: ws1, "+ new workspace" — `j` moves onto the sentinel.
-        app.handle_key(key(KeyCode::Char('j')));
+                                             // New space is already selected; moving down would pick the project directory.
+        assert_eq!(app.wizard.as_ref().unwrap().workspace_cursor, 1);
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.wizard.as_ref().unwrap().step, WizardStep::WorkspaceName);
         for c in "wt2".chars() {
@@ -1361,17 +1755,74 @@ mod tests {
     }
 
     #[test]
+    fn add_agent_pins_workspace_and_keeps_source_draft() {
+        let mut app = wizard_app();
+        let ws = app.workspaces[0].clone();
+        app.add_session(SessionView {
+            session: session(ws.id, SessionState::Ready),
+            agent_name: "Mock".into(),
+            workspace_name: ws.name.clone(),
+        });
+        app.insert_text("keep source draft");
+        app.start_add_agent();
+        assert!(app.wizard.as_ref().unwrap().adding);
+        assert_eq!(app.wizard.as_ref().unwrap().step, WizardStep::Agent);
+        // The target is materialised at opening, not derived on confirmation.
+        app.sessions[0].session.workspace_id = WorkspaceId::new();
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            AppAction::CreateSession {
+                workspace: WorkspacePick::Existing {
+                    id: ws.id,
+                    name: ws.name
+                },
+                agent_id: AgentId::new("mock"),
+            }
+        );
+        assert_eq!(app.input, "keep source draft");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), AppAction::None);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.wizard.is_none());
+        assert_eq!(app.input, "keep source draft");
+    }
+
+    #[test]
+    fn add_agent_without_selection_uses_full_wizard_and_cancel_is_safe() {
+        let mut app = wizard_app();
+        app.start_add_agent();
+        assert_eq!(app.wizard.as_ref().unwrap().step, WizardStep::Project);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.wizard.is_none());
+        assert!(app.sessions.is_empty());
+    }
+
+    #[test]
+    fn disconnected_add_agent_retains_target_and_draft_without_creating() {
+        let mut app = app_with_sessions(&[SessionState::Ready]);
+        app.agents.push(agent("mock", true));
+        app.insert_text("keep");
+        app.wb.connected = false;
+        app.start_add_agent();
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), AppAction::None);
+        assert!(!app.wizard.as_ref().unwrap().submitting);
+        assert_eq!(app.input, "keep");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.wizard.is_none());
+    }
+
+    #[test]
     fn wizard_esc_steps_back_then_aborts() {
         let mut app = wizard_app();
         app.handle_key(key(KeyCode::Char('n')));
         app.handle_key(key(KeyCode::Enter)); // → Workspace
+        app.handle_key(key(KeyCode::Up));
         app.handle_key(key(KeyCode::Enter)); // → Agent
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.wizard.as_ref().unwrap().step, WizardStep::Workspace);
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.wizard.as_ref().unwrap().step, WizardStep::Project);
         app.handle_key(key(KeyCode::Esc));
-        assert_eq!(app.mode, InputMode::Normal);
+        assert_eq!(app.mode, InputMode::Editing);
         assert!(app.wizard.is_none());
     }
 
@@ -1380,7 +1831,7 @@ mod tests {
         let mut app = wizard_app();
         app.handle_key(key(KeyCode::Char('n')));
         app.handle_key(key(KeyCode::Enter));
-        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.wizard.as_ref().unwrap().workspace_cursor, 1);
         app.handle_key(key(KeyCode::Enter)); // WorkspaceName step
         app.handle_key(key(KeyCode::Char('a')));
         app.handle_key(key(KeyCode::Char('b')));

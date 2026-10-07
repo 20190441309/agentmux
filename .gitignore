@@ -1,2 +1,16 @@
-target/
+# Build output (directory or local symlink)
+/target
+
+# Local runtime and tooling data
+.agentmux/
 .superpowers/
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# Local secrets and configuration
+.env
+.env.*
+!.env.example
+/config.toml

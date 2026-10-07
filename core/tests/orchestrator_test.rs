@@ -145,6 +145,39 @@ async fn new_session(env: &TestEnv, workspace_name: &str) -> (WorkspaceId, Sessi
     (ws, sid)
 }
 
+#[tokio::test]
+async fn workbench_titles_are_validated_persisted_and_broadcast() {
+    let env = setup();
+    let (_, id) = new_session(&env, "names").await;
+    let mut events = env.orch.subscribe();
+    let name = env
+        .orch
+        .set_session_title(id, "  回归测试  ".into())
+        .unwrap();
+    assert!(matches!(&name.kind, EventKind::TitleChanged { title } if title == "回归测试"));
+    let received = recv_until(&mut events, EVENT_TIMEOUT, |e| {
+        e.seq == name.seq && e.session_id == id
+    })
+    .await;
+    assert!(received.iter().any(|e| e == &name));
+    assert!(env.orch.read_events(id).unwrap().iter().any(|e| e == &name));
+    for bad in [
+        " ".into(),
+        "two\nlines".into(),
+        "escape\x1b".into(),
+        "two\u{2028}lines".into(),
+        "two\u{2029}paragraphs".into(),
+        "x".repeat(61),
+    ] {
+        assert!(env.orch.set_session_title(id, bad).is_err());
+    }
+    assert!(env
+        .orch
+        .set_session_title(SessionId::new(), "unknown".into())
+        .is_err());
+    env.orch.kill(id).await.unwrap();
+}
+
 /// Collect bus events until `pred` matches or `timeout` elapses; returns
 /// every event seen up to and including the match.
 async fn recv_until<F>(
@@ -222,8 +255,13 @@ fn chunk_text(e: &Event, session_id: SessionId) -> Option<&str> {
         return None;
     }
     match &e.kind {
-        EventKind::SessionUpdate(v) if v["update"]["sessionUpdate"] == "agent_message_chunk" => {
-            v["update"]["content"]["text"].as_str()
+        EventKind::SessionUpdate(v) => {
+            let update = v.get("update").unwrap_or(v);
+            if update["sessionUpdate"] == "agent_message_chunk" {
+                update["content"]["text"].as_str()
+            } else {
+                None
+            }
         }
         _ => None,
     }
@@ -255,7 +293,9 @@ async fn prompt_roundtrip_streams_updates_and_returns_to_ready() {
     let updates: Vec<&serde_json::Value> = session_events
         .iter()
         .filter_map(|e| match &e.kind {
-            EventKind::SessionUpdate(v) => Some(v),
+            EventKind::SessionUpdate(v) if v["update"]["sessionUpdate"] != "user_message_chunk" => {
+                Some(v)
+            }
             _ => None,
         })
         .collect();
@@ -269,6 +309,17 @@ async fn prompt_roundtrip_streams_updates_and_returns_to_ready() {
     );
     assert_eq!(updates[1]["update"]["kind"], serde_json::json!("edit"));
 
+    assert!(
+        env.orch
+            .read_events(sid)
+            .unwrap()
+            .iter()
+            .any(|e| matches!(&e.kind,
+        EventKind::SessionUpdate(v) if v["update"]["sessionUpdate"] == "user_message_chunk"
+            && v["update"]["content"]["text"] == "hi")),
+        "original prompt is replayable without injected context"
+    );
+
     // The orchestrator assigned real sequence numbers to adapter events.
     assert!(
         session_events.iter().all(|e| e.seq > 0),
@@ -280,6 +331,50 @@ async fn prompt_roundtrip_streams_updates_and_returns_to_ready() {
         SessionState::Ready,
         "session should return to Ready after the turn"
     );
+}
+
+#[tokio::test]
+async fn acp_native_commands_are_not_prefixed_with_shared_context_or_references() {
+    let env = setup();
+    let (ws, sid) = new_session(&env, "commands").await;
+    let other = env
+        .orch
+        .create_session(ws, &AgentId::new("mock"), None)
+        .await
+        .unwrap();
+    let worktree = env.orch.get_workspace(ws).unwrap().unwrap().worktree_path;
+    append_activity(
+        &worktree,
+        "mock",
+        "shared activity must not precede slash commands",
+    )
+    .unwrap();
+    let mut rx = env.orch.subscribe();
+    env.orch
+        .prompt(sid, "/resume".into(), vec![])
+        .await
+        .unwrap();
+    let seen = recv_until(&mut rx, EVENT_TIMEOUT, |e| {
+        chunk_text(e, sid).is_some_and(|t| t == "mock reply: /resume")
+    })
+    .await;
+    assert!(seen
+        .iter()
+        .any(|e| chunk_text(e, sid).is_some_and(|t| t == "mock reply: /resume")));
+    assert!(env
+        .orch
+        .prompt(
+            sid,
+            "/resume".into(),
+            vec![SessionRef {
+                session_id: other,
+                event_seq: 0
+            }]
+        )
+        .await
+        .is_err());
+    env.orch.kill(sid).await.unwrap();
+    env.orch.kill(other).await.unwrap();
 }
 
 /// ② A prompt already in flight holds the per-session serialization
@@ -492,6 +587,7 @@ async fn create_session_rejects_unknown_or_unavailable_agent() {
 async fn resume_done_session_respawns_to_ready() {
     let env = setup();
     let (_ws, sid) = new_session(&env, "ws1").await;
+    let original_id = env.orch.get_session(sid).unwrap().unwrap().acp_session_id;
 
     env.orch.kill(sid).await.expect("kill should succeed");
     assert_eq!(
@@ -499,7 +595,22 @@ async fn resume_done_session_respawns_to_ready() {
         SessionState::Done
     );
 
-    env.orch.resume(sid).await.expect("resume should succeed");
+    let mut profile = mock_profile();
+    profile.env.insert("MOCK_FORBID_NEW".into(), "1".into());
+    env.orch.register_agent(profile).unwrap();
+    env.orch
+        .resume(sid)
+        .await
+        .expect("resume must load the native conversation, not create another");
+    assert_eq!(
+        env.orch.get_session(sid).unwrap().unwrap().acp_session_id,
+        original_id
+    );
+    let history = env.orch.read_events(sid).unwrap();
+    assert!(!history.iter().any(|e| e.starts_conversation()));
+    assert!(!history
+        .iter()
+        .any(|e| chunk_text(e, sid).is_some_and(|t| t.contains("mock replay sentinel"))));
     assert_eq!(
         env.orch.get_session(sid).unwrap().unwrap().state,
         SessionState::Ready
@@ -518,6 +629,159 @@ async fn resume_done_session_respawns_to_ready() {
         events.iter().any(|e| chunk_text(e, sid).is_some()),
         "resumed session should echo the new prompt"
     );
+}
+
+#[tokio::test]
+async fn acp_command_catalog_survives_setup_and_native_restore_without_replaying_messages() {
+    let env = setup();
+    let mut profile = mock_profile();
+    profile
+        .env
+        .insert("MOCK_COMMANDS".into(), "init,review".into());
+    env.orch.register_agent(profile.clone()).unwrap();
+    let (_, sid) = new_session(&env, "commands").await;
+    // A prompt makes fanout catch up before inspecting the persisted log.
+    env.orch
+        .prompt(sid, "/review branch main".into(), vec![])
+        .await
+        .unwrap();
+    let mut rx = env.orch.subscribe();
+    profile
+        .env
+        .insert("MOCK_COMMANDS".into(), "new,refreshed".into());
+    profile.env.insert("MOCK_FORBID_NEW".into(), "1".into());
+    env.orch.kill(sid).await.unwrap();
+    env.orch.register_agent(profile).unwrap();
+    env.orch.resume(sid).await.unwrap();
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |e| {
+        e.session_id == sid && e.available_commands().is_some()
+    })
+    .await;
+    assert!(events.iter().any(|e| e
+        .available_commands()
+        .is_some_and(|commands| { commands.iter().any(|c| c["name"] == "refreshed") })));
+    let history = env.orch.read_events(sid).unwrap();
+    let catalogs: Vec<_> = history
+        .iter()
+        .filter_map(Event::available_commands)
+        .collect();
+    assert_eq!(catalogs.len(), 2);
+    assert_eq!(catalogs[0][0]["name"], "init");
+    assert_eq!(catalogs[1][1]["name"], "refreshed");
+    assert!(!history
+        .iter()
+        .any(|e| chunk_text(e, sid).is_some_and(|t| t.contains("mock replay sentinel"))));
+}
+
+#[tokio::test]
+async fn acp_catalog_survives_native_replay_larger_than_the_connection_buffer() {
+    let env = setup();
+    let mut profile = mock_profile();
+    profile
+        .env
+        .insert("MOCK_COMMANDS".into(), "init,review".into());
+    env.orch.register_agent(profile.clone()).unwrap();
+    let (_, sid) = new_session(&env, "catalog-overflow").await;
+    env.orch
+        .prompt(sid, "before restore".into(), vec![])
+        .await
+        .unwrap();
+    env.orch.kill(sid).await.unwrap();
+    profile
+        .env
+        .insert("MOCK_COMMANDS".into(), "changed-command".into());
+    profile
+        .env
+        .insert("MOCK_LOAD_REPLAY_COUNT".into(), "600".into());
+    env.orch.register_agent(profile).unwrap();
+    env.orch.resume(sid).await.unwrap();
+    let history = env.orch.read_events(sid).unwrap();
+    let latest = history
+        .iter()
+        .rev()
+        .find_map(Event::available_commands)
+        .unwrap();
+    assert_eq!(latest[0]["name"], "changed-command");
+    assert!(!history
+        .iter()
+        .any(|e| chunk_text(e, sid).is_some_and(|t| t.contains("mock replay sentinel"))));
+}
+
+#[tokio::test]
+async fn acp_restore_capability_missing_or_load_failed_never_creates_replacement() {
+    for flag in ["MOCK_NO_LOAD", "MOCK_LOAD_FAIL"] {
+        let env = setup();
+        let (_, sid) = new_session(&env, "restore").await;
+        let original = env.orch.get_session(sid).unwrap().unwrap();
+        env.orch.kill(sid).await.unwrap();
+        let mut profile = mock_profile();
+        profile.env.insert(flag.into(), "1".into());
+        env.orch.register_agent(profile).unwrap();
+        let error = env.orch.resume(sid).await.unwrap_err();
+        if flag == "MOCK_NO_LOAD" {
+            assert!(
+                error
+                    .to_string()
+                    .contains("does not support native session restoration"),
+                "{error:#}"
+            );
+        }
+        let failed = env.orch.get_session(sid).unwrap().unwrap();
+        assert!(matches!(failed.state, SessionState::Error(_)));
+        assert_eq!(failed.acp_session_id, original.acp_session_id);
+        assert!(!env
+            .orch
+            .read_events(sid)
+            .unwrap()
+            .iter()
+            .any(|e| e.starts_conversation()));
+        env.orch.register_agent(mock_profile()).unwrap();
+        env.orch.resume(sid).await.unwrap();
+        assert_eq!(
+            env.orch.get_session(sid).unwrap().unwrap().acp_session_id,
+            original.acp_session_id
+        );
+        env.orch.kill(sid).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn failed_initial_setup_can_retry_without_an_existing_native_conversation() {
+    let env = setup();
+    let ws = env
+        .orch
+        .create_workspace(env.project_id, "retry", "main")
+        .await
+        .unwrap();
+    let mut profile = mock_profile();
+    profile.adapter = AdapterKind::Acp {
+        command: "/bin/sh".into(),
+        args: vec!["-c".into(), "exit 1".into()],
+    };
+    env.orch.register_agent(profile).unwrap();
+    let error = env
+        .orch
+        .create_session(ws, &AgentId::new("mock"), None)
+        .await
+        .unwrap_err();
+    let sid = error
+        .downcast_ref::<agentmux_core::orchestrator::SessionSetupFailure>()
+        .unwrap()
+        .session_id;
+    assert!(env
+        .orch
+        .get_session(sid)
+        .unwrap()
+        .unwrap()
+        .acp_session_id
+        .is_none());
+    env.orch.register_agent(mock_profile()).unwrap();
+    env.orch.resume(sid).await.unwrap();
+    assert_eq!(
+        env.orch.get_session(sid).unwrap().unwrap().state,
+        SessionState::Ready
+    );
+    env.orch.kill(sid).await.unwrap();
 }
 
 /// Merge-blocker regression: a session persisted in a non-terminal state
@@ -675,6 +939,165 @@ fn setup_with_pi() -> TestEnv {
         data,
         orch,
         project_id,
+    }
+}
+
+#[tokio::test]
+async fn pi_restore_after_daemon_restart_retains_native_context_and_workbench_history() {
+    let env = setup_with_pi();
+    let ws = env
+        .orch
+        .create_workspace(env.project_id, "native", "main")
+        .await
+        .unwrap();
+    let sid = env
+        .orch
+        .create_session(ws, &AgentId::new("pi"), None)
+        .await
+        .unwrap();
+    env.orch
+        .prompt(sid, "native_context_secret".into(), vec![])
+        .await
+        .unwrap();
+    env.orch
+        .set_session_title(sid, "keep this title".into())
+        .unwrap();
+    let original = env.orch.get_session(sid).unwrap().unwrap();
+    assert!(original.native_session_file.as_ref().unwrap().is_file());
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    while !env
+        .orch
+        .read_events(sid)
+        .unwrap()
+        .iter()
+        .any(|e| matches!(&e.kind, EventKind::SessionUpdate(v) if v["type"] == "agent_settled"))
+    {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+    let original_history = env.orch.read_events(sid).unwrap();
+    drop(env.orch);
+    let cfg = Config {
+        agents: vec![pi_profile()],
+        ..Config::default()
+    };
+    let orch = Orchestrator::new(
+        Store::open(env.data.path()).unwrap(),
+        AgentRegistry::from_config(&cfg),
+        env.data.path().to_path_buf(),
+    );
+    orch.resume(sid).await.unwrap();
+    let restored = orch.get_session(sid).unwrap().unwrap();
+    assert_eq!(restored.acp_session_id, original.acp_session_id);
+    assert_eq!(restored.native_session_file, original.native_session_file);
+    assert_eq!(restored.state, SessionState::Ready);
+    assert_eq!(
+        orch.pi_command(sid, serde_json::json!({"type":"get_state"}))
+            .await
+            .unwrap()["messageCount"],
+        1
+    );
+    let history = orch.read_events(sid).unwrap();
+    assert!(history.starts_with(&original_history));
+    assert!(!history.iter().any(|e| e.resets_conversation_view()));
+    let mut rx = orch.subscribe();
+    orch.prompt(sid, "recallprobe".into(), vec![])
+        .await
+        .unwrap();
+    let seen = recv_until(&mut rx, EVENT_TIMEOUT, |e| {
+        chunk_text(e, sid).is_some_and(|t| t.contains("remembered context: native_context_secret"))
+    })
+    .await;
+    assert!(
+        seen.iter().any(|e| chunk_text(e, sid)
+            .is_some_and(|t| t.contains("remembered context: native_context_secret"))),
+        "the agent must recall native context, without event-log injection"
+    );
+    orch.kill(sid).await.unwrap();
+}
+
+#[tokio::test]
+async fn pi_restore_cancel_failure_and_wrong_identity_preserve_original_locator() {
+    for flag in [
+        "FAKE_PI_CANCEL_SWITCH",
+        "FAKE_PI_FAIL_SWITCH",
+        "FAKE_PI_WRONG_ID",
+    ] {
+        let env = setup_with_pi();
+        let ws = env
+            .orch
+            .create_workspace(env.project_id, "native", "main")
+            .await
+            .unwrap();
+        let sid = env
+            .orch
+            .create_session(ws, &AgentId::new("pi"), None)
+            .await
+            .unwrap();
+        let original = env.orch.get_session(sid).unwrap().unwrap();
+        env.orch.kill(sid).await.unwrap();
+        let mut profile = pi_profile();
+        profile.env.insert(flag.into(), "1".into());
+        env.orch.register_agent(profile).unwrap();
+        assert!(env.orch.resume(sid).await.is_err(), "{flag}");
+        let failed = env.orch.get_session(sid).unwrap().unwrap();
+        assert_eq!(failed.acp_session_id, original.acp_session_id);
+        assert_eq!(failed.native_session_file, original.native_session_file);
+        assert!(matches!(failed.state, SessionState::Error(_)));
+        assert!(!env
+            .orch
+            .read_events(sid)
+            .unwrap()
+            .iter()
+            .any(|e| e.starts_conversation()));
+        env.orch.register_agent(pi_profile()).unwrap();
+        env.orch.resume(sid).await.unwrap();
+        env.orch.kill(sid).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn pi_missing_or_legacy_locator_does_not_silently_start_a_new_conversation() {
+    for legacy in [true, false] {
+        let env = setup_with_pi();
+        let ws = env
+            .orch
+            .create_workspace(env.project_id, "native", "main")
+            .await
+            .unwrap();
+        let sid = env
+            .orch
+            .create_session(ws, &AgentId::new("pi"), None)
+            .await
+            .unwrap();
+        let original = env.orch.get_session(sid).unwrap().unwrap();
+        env.orch.kill(sid).await.unwrap();
+        if legacy {
+            Store::open(env.data.path())
+                .unwrap()
+                .set_native_session(sid, original.acp_session_id.as_deref().unwrap(), None)
+                .unwrap();
+        } else {
+            std::fs::remove_file(original.native_session_file.as_ref().unwrap()).unwrap();
+        }
+        assert!(env.orch.resume(sid).await.is_err());
+        let failed = env.orch.get_session(sid).unwrap().unwrap();
+        assert_eq!(failed.acp_session_id, original.acp_session_id);
+        assert_eq!(
+            failed.native_session_file,
+            if legacy {
+                None
+            } else {
+                original.native_session_file
+            }
+        );
+        assert!(matches!(failed.state, SessionState::Error(_)));
+        assert!(!env
+            .orch
+            .read_events(sid)
+            .unwrap()
+            .iter()
+            .any(|e| e.starts_conversation()));
     }
 }
 
@@ -1110,4 +1533,63 @@ async fn stderr_log_is_written_and_cleaned_on_workspace_delete() {
         !log_path.exists(),
         "stderr log should be removed on workspace delete"
     );
+}
+
+#[tokio::test]
+async fn pi_commands_preserve_slash_prefix_and_expose_controls() {
+    let env = setup_with_pi();
+    let ws = env
+        .orch
+        .create_workspace(env.project_id, "slash", "main")
+        .await
+        .unwrap();
+    let sid = env
+        .orch
+        .create_session(ws, &AgentId::new("pi"), None)
+        .await
+        .unwrap();
+    let _other = env
+        .orch
+        .create_session(ws, &AgentId::new("pi"), None)
+        .await
+        .unwrap();
+    let commands = env
+        .orch
+        .pi_command(sid, serde_json::json!({"type":"get_commands"}))
+        .await
+        .unwrap();
+    assert_eq!(commands["commands"][0]["name"], "fix-tests");
+    env.orch
+        .pi_command(
+            sid,
+            serde_json::json!({"type":"set_thinking_level", "level":"high"}),
+        )
+        .await
+        .unwrap();
+    assert!(env
+        .orch
+        .pi_command(sid, serde_json::json!({"type":"bash", "command":"false"}))
+        .await
+        .is_err());
+    let mut rx = env.orch.subscribe();
+    env.orch
+        .prompt(sid, "/fix-tests argument".into(), vec![])
+        .await
+        .unwrap();
+    let events = recv_until(&mut rx, EVENT_TIMEOUT, |e| {
+        chunk_text(e, sid).is_some_and(|t| t.contains("fake pi reply:"))
+    })
+    .await;
+    let reply = events.iter().find_map(|e| chunk_text(e, sid)).unwrap();
+    assert_eq!(reply, "fake pi reply: /fix-tests argument");
+    assert_eq!(
+        env.orch.get_session(sid).unwrap().unwrap().state,
+        SessionState::Ready
+    );
+    env.orch.kill(sid).await.unwrap();
+    assert!(env
+        .orch
+        .pi_command(sid, serde_json::json!({"type":"get_state"}))
+        .await
+        .is_err());
 }

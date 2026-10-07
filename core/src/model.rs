@@ -31,7 +31,12 @@ pub struct Workspace {
     pub worktree_path: PathBuf,
     /// Branch checked out in the worktree.
     pub branch: String,
+    #[serde(default = "default_true")]
+    pub managed_worktree: bool,
     pub created_at: DateTime<Utc>,
+}
+fn default_true() -> bool {
+    true
 }
 
 /// How the orchestrator spawns and talks to an agent process.
@@ -42,6 +47,23 @@ pub enum AdapterKind {
     Acp { command: PathBuf, args: Vec<String> },
     /// Pi RPC agent variant.
     PiRpc { command: PathBuf, args: Vec<String> },
+    /// Original interactive CLI, owned by the daemon in an independent PTY.
+    Native {
+        command: PathBuf,
+        args: Vec<String>,
+        #[serde(default)]
+        session_backend: Option<NativeSessionBackend>,
+        #[serde(default)]
+        resume_args: Vec<String>,
+        #[serde(default)]
+        history_args: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NativeSessionBackend {
+    Pi,
 }
 
 /// A configured agent that the orchestrator can run inside a workspace.
@@ -115,6 +137,12 @@ pub struct Session {
     /// Adapter-level session id (e.g. the ACP `sessionId`), populated once
     /// the agent has created or loaded its session.
     pub acp_session_id: Option<String>,
+    /// Pi's native session file, needed to restore the original conversation.
+    /// Older daemon responses omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_session_file: Option<PathBuf>,
+    #[serde(default)]
+    pub native_terminal: bool,
     /// Cross-session references handed to this session as context.
     pub references: Vec<SessionRef>,
     pub created_at: DateTime<Utc>,
@@ -123,6 +151,10 @@ pub struct Session {
 /// The payload of an [`Event`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EventKind {
+    /// User-assigned workbench title; scoped to the current conversation.
+    TitleChanged { title: String },
+    /// An explicitly new native conversation (also used by legacy restarts).
+    ConversationStarted,
     /// A raw ACP `session/update` notification, kept as opaque JSON for now;
     /// converted to a strong type internally once the ACP crate lands
     /// (Task 5).
@@ -168,6 +200,38 @@ pub struct Event {
     pub seq: u64,
     pub ts: DateTime<Utc>,
     pub kind: EventKind,
+}
+
+impl Event {
+    /// ACP command catalogs are complete snapshots, including an empty list.
+    pub fn available_commands(&self) -> Option<&[serde_json::Value]> {
+        let EventKind::SessionUpdate(value) = &self.kind else {
+            return None;
+        };
+        let update = value.get("update").unwrap_or(value);
+        if update
+            .get("sessionUpdate")
+            .and_then(serde_json::Value::as_str)
+            != Some("available_commands_update")
+        {
+            return None;
+        }
+        Some(update.get("availableCommands")?.as_array()?.as_slice())
+    }
+
+    /// Only an explicitly new conversation invalidates the displayed history.
+    /// Losing the daemon connection does not discard native context.
+    pub fn resets_conversation_view(&self) -> bool {
+        self.starts_conversation()
+    }
+
+    /// Includes the lifecycle note persisted by daemons before this marker
+    /// had a dedicated event type.
+    pub fn starts_conversation(&self) -> bool {
+        matches!(self.kind, EventKind::ConversationStarted)
+            || matches!(&self.kind, EventKind::Orchestrator(note)
+                if note.starts_with("session resumed with a fresh adapter session"))
+    }
 }
 
 #[cfg(test)]
@@ -238,6 +302,7 @@ mod tests {
             name: "feature-x".into(),
             worktree_path: PathBuf::from("/repos/agentmux-wt/feature-x"),
             branch: "feature-x".into(),
+            managed_worktree: true,
             created_at: Utc::now(),
         };
         let profile = AgentProfile {
@@ -264,6 +329,8 @@ mod tests {
             agent_id: AgentId::new("claude-code"),
             state: SessionState::WaitingPermission,
             acp_session_id: Some("acp-session-42".into()),
+            native_session_file: Some(PathBuf::from("/sessions/native.jsonl")),
+            native_terminal: false,
             references: vec![SessionRef {
                 session_id: SessionId::new(),
                 event_seq: 7,
@@ -272,6 +339,27 @@ mod tests {
         };
 
         roundtrip(&session);
+        let mut legacy = serde_json::to_value(&session).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("native_session_file");
+        let decoded: Session = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.native_session_file.is_none());
+    }
+
+    #[test]
+    fn daemon_disconnect_does_not_start_a_new_conversation() {
+        let event = Event {
+            session_id: SessionId::new(),
+            seq: 1,
+            ts: Utc::now(),
+            kind: EventKind::StateChanged {
+                from: SessionState::Ready,
+                to: SessionState::Error("daemon restarted".into()),
+            },
+        };
+        assert!(!event.resets_conversation_view());
     }
 
     #[test]

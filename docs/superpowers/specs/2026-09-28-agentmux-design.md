@@ -10,6 +10,8 @@
 
 定位：开源项目，对标 vibe-kanban（编排层）与 claude-squad（TUI），架构同构于 opencode 的 client-server 分层。
 
+**2026-09-30 定位修订（用户已确认）：** agentmux 是管理 Agent 的壳，不应裁剪 Agent 原生能力。采用“原生托管保完整、结构化接入做增强”；下文 v1 排除 PTY 的旧边界被修订，原生托管现在是必做项。恢复必须加载原生对话，不能静默新建替代。实施与验收见 [Agent 能力完整性计划](../plans/2026-09-30-agent-capability-preservation-plan.md)。
+
 技术栈：**Rust**。ACP（Agent Client Protocol）作为统一事件模型与 agent 接入协议。
 
 ## 2. 目标与非目标
@@ -27,7 +29,7 @@
 ### 非目标（v1 明确不做）
 
 - agent 间自动委派路由（coordinator 模式）— backlog
-- PTY 透传模式（不内嵌 agent 自带 TUI）— 只做结构化接入
+- ~~PTY 透传模式（不内嵌 agent 自带 TUI）— 只做结构化接入~~ — 2026-09-30 已改为必做项，分阶段实现
 - 共享 worktree 内的文件锁 / 并发冲突仲裁 — 依赖 git 本身
 - 远程执行（SSH/daemon 在远端）— 本地单机
 - 桌面端 GUI — Phase 2

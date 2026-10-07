@@ -38,6 +38,11 @@ pub const M_PROJECT_REMOVE: &str = "project/remove";
 
 /// Create a worktree-backed [`Workspace`] under a project.
 pub const M_WORKSPACE_CREATE: &str = "workspace/create";
+pub const M_WORKSPACE_OPEN: &str = "workspace/open";
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceOpenParams {
+    pub project_id: ProjectId,
+}
 /// List a project's workspaces.
 pub const M_WORKSPACE_LIST: &str = "workspace/list";
 /// Remove a workspace and its worktree.
@@ -57,8 +62,100 @@ pub const M_SESSION_KILL: &str = "session/kill";
 pub const M_SESSION_LIST: &str = "session/list";
 /// Resume a `Done`/`Error` session.
 pub const M_SESSION_RESUME: &str = "session/resume";
+/// Pi RPC control commands (models, settings, command discovery).
+pub const M_SESSION_PI: &str = "session/pi";
+/// Rename a conversation in the workbench, independently of adapter names.
+pub const M_SESSION_TITLE: &str = "session/title";
+pub const M_NATIVE_LIST: &str = "session/native/list";
+pub const M_NATIVE_OPEN: &str = "session/native/open";
+pub const M_NATIVE_CHECK: &str = "session/native/check";
+pub const M_NATIVE_REPORT: &str = "session/native/report";
+pub const M_TERMINAL_ATTACH: &str = "session/terminal/attach";
+pub const M_TERMINAL_READ: &str = "session/terminal/read";
+pub const M_TERMINAL_INPUT: &str = "session/terminal/input";
+pub const M_TERMINAL_RESIZE: &str = "session/terminal/resize";
+pub const M_TERMINAL_DETACH: &str = "session/terminal/detach";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeListParams {
+    pub session_id: SessionId,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeListResult {
+    pub conversations: Vec<crate::pi_sessions::NativeConversation>,
+    pub native_available: bool,
+    pub structured_available: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeOpenParams {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub session_file: Option<PathBuf>,
+    #[serde(default)]
+    pub native: bool,
+    #[serde(default)]
+    pub history: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NativeControlParams {
+    pub session_id: SessionId,
+    pub token: String,
+    pub session_file: PathBuf,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalAttachParams {
+    pub session_id: SessionId,
+    pub rows: u16,
+    pub cols: u16,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalReadParams {
+    pub session_id: SessionId,
+    pub token: String,
+    pub after: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalInputParams {
+    pub session_id: SessionId,
+    pub token: String,
+    pub data: Vec<u8>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalResizeParams {
+    pub session_id: SessionId,
+    pub token: String,
+    pub rows: u16,
+    pub cols: u16,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalDetachParams {
+    pub session_id: SessionId,
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionTitleParams {
+    pub session_id: SessionId,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionPiParams {
+    pub session_id: SessionId,
+    pub command: Value,
+}
 /// Upgrade the connection to a [`N_SESSION_EVENT`] notification stream.
 pub const M_SESSION_SUBSCRIBE: &str = "session/subscribe";
+
+/// Read a page of persisted events, newest page when before_seq is absent.
+pub const M_SESSION_HISTORY: &str = "session/history";
+/// Read a bounded UTF-8 chunk of one serialized persisted event.
+pub const M_SESSION_EVENT_READ: &str = "session/event/read";
+/// Inspect a file's aggregate worktree diff against HEAD.
+pub const M_WORKSPACE_DIFF: &str = "workspace/diff";
+pub const M_WORKSPACE_CHANGES: &str = "workspace/changes";
+pub const M_WORKSPACE_CONTEXT: &str = "workspace/context";
+pub const M_WORKSPACE_CONTEXT_SAVE: &str = "workspace/context/save";
 
 /// List configured agents with availability probing.
 pub const M_AGENT_LIST: &str = "agent/list";
@@ -72,6 +169,24 @@ pub const M_SERVER_SHUTDOWN: &str = "server/shutdown";
 
 /// All request method names above — handy for dispatch and validation.
 pub const ALL_METHODS: &[&str] = &[
+    M_WORKSPACE_OPEN,
+    M_NATIVE_LIST,
+    M_NATIVE_OPEN,
+    M_NATIVE_CHECK,
+    M_NATIVE_REPORT,
+    M_TERMINAL_ATTACH,
+    M_TERMINAL_READ,
+    M_TERMINAL_INPUT,
+    M_TERMINAL_RESIZE,
+    M_TERMINAL_DETACH,
+    M_SESSION_TITLE,
+    M_SESSION_PI,
+    M_SESSION_HISTORY,
+    M_SESSION_EVENT_READ,
+    M_WORKSPACE_DIFF,
+    M_WORKSPACE_CHANGES,
+    M_WORKSPACE_CONTEXT,
+    M_WORKSPACE_CONTEXT_SAVE,
     M_PROJECT_REGISTER,
     M_PROJECT_LIST,
     M_PROJECT_REMOVE,
@@ -399,6 +514,134 @@ pub struct SessionResumeParams {
     pub session_id: SessionId,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistoryParams {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub before_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionHistoryResult {
+    /// Latest fresh conversation boundary, even if outside this page.
+    #[serde(default)]
+    pub conversation_start: u64,
+    pub events: Vec<Event>,
+    pub has_more: bool,
+    pub title: Option<String>,
+    /// Sequence of the title source, for ordering live edits against history.
+    #[serde(default)]
+    pub title_seq: u64,
+    pub pending_permissions: Vec<Event>,
+    /// Events fetched losslessly in bounded chunks by the SDK.
+    #[serde(default)]
+    pub event_refs: Vec<u64>,
+    #[serde(default)]
+    pub pending_permission_refs: Vec<u64>,
+    /// Latest ACP catalog, independent of transcript pagination.
+    #[serde(default)]
+    pub available_commands: Option<Event>,
+    /// Oversized catalogs use the same lossless chunk transport as events.
+    #[serde(default)]
+    pub available_commands_ref: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEventReadParams {
+    pub session_id: SessionId,
+    pub seq: u64,
+    #[serde(default)]
+    pub offset: usize,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEventReadResult {
+    /// A UTF-8 aligned slice of the serialized event JSON.
+    pub data: String,
+    pub next_offset: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceDiffParams {
+    pub workspace_id: WorkspaceId,
+    pub path: String,
+    #[serde(default)]
+    pub path_bytes: Option<Vec<u8>>,
+    #[serde(default)]
+    pub old_path: Option<String>,
+    #[serde(default)]
+    pub old_path_bytes: Option<Vec<u8>>,
+    #[serde(default)]
+    pub scope: DiffScope,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffScope {
+    #[default]
+    Head,
+    Staged,
+    Unstaged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceChange {
+    pub path: String,
+    pub path_bytes: Option<Vec<u8>>,
+    pub old_path: Option<String>,
+    pub old_path_bytes: Option<Vec<u8>>,
+    pub index_status: String,
+    pub worktree_status: String,
+    pub added: Option<u64>,
+    pub deleted: Option<u64>,
+    pub binary: bool,
+    pub size_bytes: Option<u64>,
+    pub unavailable: Option<String>,
+}
+
+impl WorkspaceChange {
+    pub fn key(&self) -> Vec<u8> {
+        self.path_bytes
+            .clone()
+            .unwrap_or_else(|| self.path.as_bytes().to_vec())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceChangesParams {
+    pub workspace_id: WorkspaceId,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceChangesResult {
+    pub files: Vec<WorkspaceChange>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceContextResult {
+    pub context: Option<String>,
+    pub activity: Option<String>,
+    pub context_truncated: bool,
+    pub activity_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceContextSaveParams {
+    pub workspace_id: WorkspaceId,
+    pub expected: Option<String>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceDiffResult {
+    pub text: String,
+    #[serde(default)]
+    pub scope: DiffScope,
+    #[serde(default)]
+    pub binary: bool,
+    #[serde(default)]
+    pub truncated: bool,
+}
+
 pub type SessionResumeResult = ();
 
 /// `session/subscribe` takes no parameters — the subscription covers the
@@ -452,6 +695,11 @@ pub struct ServerStatusResult {
     pub uptime_secs: u64,
     /// Sessions currently tracked by the orchestrator.
     pub sessions: usize,
+    /// Effective absolute paths, absent on older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_path: Option<PathBuf>,
 }
 
 /// `server/shutdown` takes no parameters.
@@ -487,7 +735,13 @@ mod tests {
         let mut sorted = ALL_METHODS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), 18, "duplicate method constants");
+        assert_eq!(
+            sorted.len(),
+            ALL_METHODS.len(),
+            "duplicate method constants"
+        );
+        assert!(ALL_METHODS.contains(&M_SESSION_HISTORY));
+        assert!(ALL_METHODS.contains(&M_WORKSPACE_DIFF));
         assert!(ALL_METHODS.iter().all(|m| m.contains('/')));
     }
 
