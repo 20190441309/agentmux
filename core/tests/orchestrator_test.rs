@@ -1456,13 +1456,22 @@ async fn prompt_timeout_marks_session_error() {
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 
-    // The timed-out turn's agent was stopped, not left running behind an
-    // `Error` state that lets workspace removal proceed.
-    let err = orch
-        .cancel(sid)
-        .await
-        .expect_err("no live connection may remain after a failed turn");
-    assert!(err.to_string().contains("no live connection"), "{err:#}");
+    // The timed-out turn's agent is stopped after a short grace period,
+    // not left running behind an `Error` state that lets workspace
+    // removal proceed.
+    let deadline = Instant::now() + EVENT_TIMEOUT;
+    loop {
+        match orch.cancel(sid).await {
+            Err(err) if err.to_string().contains("no live connection") => break,
+            _ => {
+                assert!(
+                    Instant::now() < deadline,
+                    "a live connection remained after the failed turn"
+                );
+                tokio::time::sleep(POLL_INTERVAL * 10).await;
+            }
+        }
+    }
 
     orch.kill(sid).await.expect("kill should succeed");
 }

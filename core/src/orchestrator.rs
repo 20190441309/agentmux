@@ -1588,20 +1588,31 @@ impl Orchestrator {
                 // A failed turn almost always means the connection died
                 // (the fan-out's `AgentExited` marks `Error` too —
                 // `unless_terminal` keeps the two paths from fighting).
-                // A timed-out turn may still be running, though: stop the
-                // agent before `Error` lets workspace removal proceed under
-                // it. Only this turn's conn is closed — never one a later
-                // resume installed — and the fan-out drains to its end.
-                {
-                    let mut current = slot.conn.lock().unwrap();
-                    if current
+                // A timed-out turn may still be running, though. Give a
+                // dying agent's exit path (stderr tail + `AgentExited`)
+                // time to land, then stop the agent if its fan-out is still
+                // draining — before `Error` lets workspace removal proceed
+                // under it. Only this turn's conn is closed, never one a
+                // later resume installed.
+                let (slot, conn) = (slot.clone(), live.conn.clone());
+                tokio::spawn(async move {
+                    tokio::time::sleep(FAILED_TURN_GRACE).await;
+                    let running = slot
+                        .fanout
+                        .lock()
+                        .unwrap()
                         .as_ref()
-                        .is_some_and(|c| Arc::ptr_eq(&c.conn, &live.conn))
+                        .is_some_and(|fanout| !fanout.is_finished());
+                    let mut current = slot.conn.lock().unwrap();
+                    if running
+                        && current
+                            .as_ref()
+                            .is_some_and(|c| Arc::ptr_eq(&c.conn, &conn))
                     {
                         current.take();
+                        conn.close();
                     }
-                }
-                live.conn.close();
+                });
                 let _ = self.sink.transition(
                     session_id,
                     SessionState::Error(format!("prompt failed: {e:#}")),
@@ -1969,6 +1980,11 @@ impl Orchestrator {
         }
     }
 }
+
+/// How long a failed turn's agent may take to exit on its own (its exit
+/// watcher waits up to [`crate::stderr::EOF_WAIT`] for stderr) before the
+/// orchestrator stops it.
+const FAILED_TURN_GRACE: Duration = Duration::from_secs(2);
 
 /// The per-session fan-out task: drain `conn.events()`, restamp each
 /// event with the orchestrator's `session_id`, assign the real `seq`,
