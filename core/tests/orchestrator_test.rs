@@ -1456,6 +1456,14 @@ async fn prompt_timeout_marks_session_error() {
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 
+    // The timed-out turn's agent was stopped, not left running behind an
+    // `Error` state that lets workspace removal proceed.
+    let err = orch
+        .cancel(sid)
+        .await
+        .expect_err("no live connection may remain after a failed turn");
+    assert!(err.to_string().contains("no live connection"), "{err:#}");
+
     orch.kill(sid).await.expect("kill should succeed");
 }
 
@@ -1592,4 +1600,62 @@ async fn pi_commands_preserve_slash_prefix_and_expose_controls() {
         .pi_command(sid, serde_json::json!({"type":"get_state"}))
         .await
         .is_err());
+}
+
+/// `session/prompt` on a native PTY session is refused up front: the
+/// session must stay live instead of being marked `Error` under a
+/// still-running terminal child.
+#[tokio::test]
+async fn prompt_on_native_session_is_rejected_without_killing_it() {
+    let repo = init_repo();
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(data.path()).unwrap();
+    let project_id = ProjectId::new();
+    store
+        .insert_project(&Project {
+            id: project_id,
+            root_path: repo.path().to_path_buf(),
+            name: "native-project".into(),
+        })
+        .unwrap();
+    let native = AgentProfile {
+        id: AgentId::new("pty"),
+        name: "PTY".into(),
+        adapter: AdapterKind::Native {
+            command: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "sleep 30".into()],
+            session_backend: None,
+            resume_args: vec![],
+            history_args: vec![],
+        },
+        env: BTreeMap::new(),
+        available: true,
+    };
+    let cfg = Config {
+        agents: vec![native],
+        ..Config::default()
+    };
+    let orch = Orchestrator::new(
+        store,
+        AgentRegistry::from_config(&cfg),
+        data.path().to_path_buf(),
+    );
+    let ws = orch
+        .create_workspace(project_id, "native", "main")
+        .await
+        .unwrap();
+    let sid = orch
+        .create_session(ws, &AgentId::new("pty"), None)
+        .await
+        .unwrap();
+    let before = orch.get_session(sid).unwrap().unwrap().state;
+    let err = orch
+        .prompt(sid, "hello".into(), vec![])
+        .await
+        .expect_err("native sessions take input in their own terminal");
+    assert!(err.to_string().contains("native terminal"), "{err:#}");
+    let after = orch.get_session(sid).unwrap().unwrap().state;
+    assert_eq!(after, before, "a refused prompt must not change state");
+    assert!(!matches!(after, SessionState::Error(_)));
+    orch.kill(sid).await.unwrap();
 }

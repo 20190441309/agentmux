@@ -1141,3 +1141,67 @@ async fn large_history_pages_and_single_events_preserve_content_and_connection()
     client.shutdown().await.unwrap();
     td.wait_exited();
 }
+
+/// A second daemon over the same data dir — same socket or another one —
+/// exits without touching the store: live sessions of the running daemon
+/// must not be swept to `Error("daemon restarted")`.
+#[tokio::test]
+async fn second_daemon_on_the_same_data_dir_leaves_live_sessions_alone() {
+    let td = spawn_daemon(Some(&mock_config()));
+    let mut client = DaemonClient::connect_to(&td.sock).await.unwrap();
+    let project = client.register_project(td.repo.path(), None).await.unwrap();
+    let workspace = client
+        .create_workspace(project.id, "ws1", Some("main"))
+        .await
+        .unwrap();
+    let session = client
+        .create_session(workspace.id, AgentId::new("mock"), None)
+        .await
+        .unwrap();
+    assert_eq!(session.state, SessionState::Ready);
+
+    let data_dir = td.sock.parent().unwrap();
+    for socket in [td.sock.clone(), data_dir.join("other.sock")] {
+        let mut second = Command::new(server_binary())
+            .arg("--serve")
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--data-dir")
+            .arg(data_dir)
+            .arg("--config")
+            .arg(data_dir.join("config.toml"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn second daemon");
+        // A regression would leave the second daemon serving: bound the wait.
+        let deadline = Instant::now() + TIMEOUT;
+        let status = loop {
+            if let Some(status) = second.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() > deadline {
+                let _ = second.kill();
+                let _ = second.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            status.is_some_and(|s| !s.success()),
+            "{} must refuse to start, got {status:?}",
+            socket.display()
+        );
+    }
+
+    let after = client
+        .list_sessions(workspace.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|s| s.id == session.id)
+        .unwrap();
+    assert_eq!(after.state, SessionState::Ready, "live session was swept");
+    client.prompt(session.id, "hi", vec![]).await.unwrap();
+}

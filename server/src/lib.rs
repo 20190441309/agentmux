@@ -6,6 +6,6 @@
 pub mod rpc_server;
 
 pub use rpc_server::{
-    bind_unix_listener, build_daemon, default_config_path, default_data_dir, dispatch, Daemon,
-    ServerPaths,
+    bind_unix_listener, build_daemon, default_config_path, default_data_dir, dispatch,
+    lock_data_dir, Daemon, ServerPaths,
 };

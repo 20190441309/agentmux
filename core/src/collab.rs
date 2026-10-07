@@ -38,6 +38,49 @@ const CONTEXT_TEMPLATE: &str = "\
 # know; read it before editing files another agent may be working on.
 ";
 
+/// Pattern added to the repository's `info/exclude`. Anchored, so it
+/// matches `.agentmux/` at the root of the main checkout and of every
+/// linked worktree (they share the common `info/exclude`).
+const EXCLUDE_PATTERN: &str = "/.agentmux/";
+
+/// Keep agentmux's own files out of `git status`, `git add -A` and the
+/// workspace change list: append [`EXCLUDE_PATTERN`] to the repository's
+/// `info/exclude` unless already present. Best-effort — a directory that
+/// is not inside a git work tree is left alone, and failures are ignored
+/// so collaboration never breaks over bookkeeping.
+pub fn exclude_shared_dir(root: &Path) {
+    let Ok(output) = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .current_dir(root)
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    // Relative output is relative to `root` (the command's cwd).
+    let path = root.join(String::from_utf8_lossy(&output.stdout).trim());
+    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    if current.lines().any(|line| line.trim() == EXCLUDE_PATTERN) {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+        let separator = if current.is_empty() || current.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        let _ = write!(
+            file,
+            "{separator}# agentmux shared blackboard and worktrees\n{EXCLUDE_PATTERN}\n"
+        );
+    }
+}
+
 /// Create `<worktree_path>/.agentmux/` with a `context.md` template and an
 /// empty `activity.md`.
 ///
@@ -46,6 +89,7 @@ const CONTEXT_TEMPLATE: &str = "\
 pub fn init_shared_dir(worktree_path: &Path) -> Result<()> {
     let shared = worktree_path.join(SHARED_DIR);
     std::fs::create_dir_all(&shared).context("failed to create .agentmux directory")?;
+    exclude_shared_dir(worktree_path);
 
     let context_path = shared.join("context.md");
     if !context_path.exists() {
@@ -68,7 +112,10 @@ pub fn init_shared_dir(worktree_path: &Path) -> Result<()> {
 /// safe to call without [`init_shared_dir`].
 pub fn append_activity(worktree_path: &Path, agent_name: &str, summary: &str) -> Result<()> {
     let shared = worktree_path.join(SHARED_DIR);
-    std::fs::create_dir_all(&shared).context("failed to create .agentmux directory")?;
+    if !shared.is_dir() {
+        std::fs::create_dir_all(&shared).context("failed to create .agentmux directory")?;
+        exclude_shared_dir(worktree_path);
+    }
 
     let mut file = OpenOptions::new()
         .create(true)

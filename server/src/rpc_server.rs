@@ -203,6 +203,35 @@ pub fn build_daemon(paths: &ServerPaths) -> Result<Arc<Daemon>> {
     Ok(daemon)
 }
 
+/// Lock file guarding a data dir against a second daemon.
+const LOCK_FILE: &str = "daemon.lock";
+
+/// Take an exclusive, process-lifetime lock on `<data_dir>/daemon.lock`.
+///
+/// [`build_daemon`] sweeps every non-terminal session in the store to
+/// `Error("daemon restarted")`, so it must only run in the one daemon
+/// that owns the data dir — a second daemon (same socket, or another
+/// socket over the same data dir) would otherwise break live sessions
+/// before discovering the conflict. Keep the returned file alive while
+/// serving; the OS releases the lock when the process exits, even on a
+/// crash. A held lock fails with [`io::ErrorKind::WouldBlock`].
+pub fn lock_data_dir(data_dir: &Path) -> io::Result<std::fs::File> {
+    std::fs::create_dir_all(data_dir)?;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(data_dir.join(LOCK_FILE))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            format!("{} is in use by another daemon", data_dir.display()),
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(e),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Listener
 // ---------------------------------------------------------------------------

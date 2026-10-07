@@ -266,3 +266,41 @@ fn preamble_keeps_only_the_last_20_activity_lines() {
     );
     assert!(!preamble.contains("a: line 0"));
 }
+
+/// `.agentmux/` never shows up as untracked: the shared dir of a plain
+/// checkout and of a linked worktree are both excluded, exactly once.
+#[test]
+fn shared_dir_is_excluded_from_git_status_once() {
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-b", "main"]);
+    git(repo.path(), &["config", "user.email", "t@example.com"]);
+    git(repo.path(), &["config", "user.name", "t"]);
+    std::fs::write(repo.path().join("README.md"), "x\n").unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-m", "init"]);
+
+    append_activity(repo.path(), "agent", "edited README.md").unwrap();
+    init_shared_dir(repo.path()).unwrap();
+    assert_eq!(git(repo.path(), &["status", "--porcelain"]), "");
+
+    let linked = repo.path().join("linked");
+    git(
+        repo.path(),
+        &["worktree", "add", "-b", "side", linked.to_str().unwrap()],
+    );
+    init_shared_dir(&linked).unwrap();
+    append_activity(&linked, "agent", "edited README.md").unwrap();
+    assert_eq!(git(&linked, &["status", "--porcelain"]), "");
+
+    let exclude = std::fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
+    assert_eq!(exclude.matches("/.agentmux/").count(), 1, "{exclude}");
+}

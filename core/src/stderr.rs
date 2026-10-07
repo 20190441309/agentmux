@@ -99,12 +99,16 @@ impl SharedTail {
 
     async fn wait_eof_inner(&self) {
         loop {
+            // `notify_waiters` stores no permit: register interest before
+            // checking the flag so a `finish` landing in between still
+            // wakes this waiter.
+            let notified = self.inner.eof.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self.inner.drained.load(Ordering::Acquire) {
                 return;
             }
-            // `Notify` keeps a stored permit, so a `finish` landing
-            // between the flag check and `notified()` is not lost.
-            self.inner.eof.notified().await;
+            notified.await;
         }
     }
 
@@ -161,9 +165,24 @@ where
     let tail = SharedTail::new();
     let task_tail = tail.clone();
     let drain = tokio::spawn(async move {
-        let mut lines = BufReader::new(stderr).lines();
+        let mut reader = BufReader::new(stderr);
         let mut log = path.and_then(|p| CappedLog::open(&p).ok());
-        while let Ok(Some(line)) = lines.next_line().await {
+        let mut buf = Vec::new();
+        // Raw bytes, decoded lossily: stderr is not guaranteed UTF-8, and
+        // stopping on a stray byte would close the pipe under the agent.
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            if buf.last() == Some(&b'\n') {
+                buf.pop();
+                if buf.last() == Some(&b'\r') {
+                    buf.pop();
+                }
+            }
+            let line = String::from_utf8_lossy(&buf).into_owned();
             task_tail.push(line.clone());
             if let Some(log) = &mut log {
                 log.write_line(&line);
@@ -260,6 +279,37 @@ mod tests {
         );
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("truncated"), "{content:?}");
+    }
+
+    #[tokio::test]
+    async fn drain_survives_invalid_utf8_and_keeps_reading() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let capture = spawn_drain(reader, None);
+        writer
+            .write_all(b"before \xff\xfe bytes\r\n")
+            .await
+            .unwrap();
+        writer.write_all(b"after\n").await.unwrap();
+        drop(writer);
+        capture.tail().wait_eof(Duration::from_secs(5)).await;
+        let lines = capture.tail().lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(lines[0].starts_with("before "), "{lines:?}");
+        assert_eq!(lines[1], "after");
+    }
+
+    #[tokio::test]
+    async fn eof_wakes_a_waiter_that_registered_before_finish() {
+        let tail = SharedTail::new();
+        let waiter = tail.clone();
+        let task = tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            waiter.wait_eof(Duration::from_secs(5)).await;
+            start.elapsed()
+        });
+        tokio::task::yield_now().await;
+        tail.finish();
+        assert!(task.await.unwrap() < Duration::from_secs(1));
     }
 
     #[tokio::test]

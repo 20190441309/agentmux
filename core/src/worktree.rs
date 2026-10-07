@@ -43,6 +43,8 @@ impl WorktreeManager {
 
         std::fs::create_dir_all(worktree_path.parent().unwrap())
             .context("failed to create .agentmux/worktrees")?;
+        // Worktrees live inside the user's checkout; keep them out of its status.
+        crate::collab::exclude_shared_dir(repo_root);
 
         // Snapshot what already exists so that failure cleanup below only
         // removes what *this* call may have created — e.g. a duplicate `name`

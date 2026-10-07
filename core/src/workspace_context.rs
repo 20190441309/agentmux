@@ -55,7 +55,10 @@ pub fn save(root: &Path, expected: Option<&str>, text: &str) -> Result<Workspace
         root,
         Path::new(".agentmux"),
     )?);
-    fs::create_dir_all(&directory)?;
+    if !directory.is_dir() {
+        fs::create_dir_all(&directory)?;
+        crate::collab::exclude_shared_dir(root);
+    }
     let relative = crate::workspace_files::safe_path(root, Path::new(".agentmux/context.md"))?;
     let current = load(root)?;
     ensure!(

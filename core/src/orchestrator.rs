@@ -1515,6 +1515,12 @@ impl Orchestrator {
                 session.state
             );
         }
+        // Reject before any transition: failing later would mark a live
+        // native PTY session `Error` while its child keeps running.
+        ensure!(
+            !session.native_terminal,
+            "open the native terminal to send input to this agent"
+        );
         let slot = self.slot(session_id)?;
         // Serializes turns; a held lock means a prompt is in flight.
         let _permit = slot
@@ -1576,6 +1582,20 @@ impl Orchestrator {
                 // A failed turn almost always means the connection died
                 // (the fan-out's `AgentExited` marks `Error` too —
                 // `unless_terminal` keeps the two paths from fighting).
+                // A timed-out turn may still be running, though: stop the
+                // agent before `Error` lets workspace removal proceed under
+                // it. Only this turn's conn is closed — never one a later
+                // resume installed — and the fan-out drains to its end.
+                {
+                    let mut current = slot.conn.lock().unwrap();
+                    if current
+                        .as_ref()
+                        .is_some_and(|c| Arc::ptr_eq(&c.conn, &live.conn))
+                    {
+                        current.take();
+                    }
+                }
+                live.conn.close();
                 let _ = self.sink.transition(
                     session_id,
                     SessionState::Error(format!("prompt failed: {e:#}")),

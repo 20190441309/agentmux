@@ -17,7 +17,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process::{exit, Command, Stdio};
 
-use agentmux_server::{bind_unix_listener, build_daemon, ServerPaths};
+use agentmux_server::{bind_unix_listener, build_daemon, lock_data_dir, ServerPaths};
 
 enum Mode {
     Serve,
@@ -76,13 +76,28 @@ async fn main() {
     }
 }
 
-/// `--serve`: build the daemon and run it in the foreground until
-/// `server/shutdown` (or the socket going away).
+/// `--serve`: claim the data dir and socket, then build the daemon and
+/// run it in the foreground until `server/shutdown` (or the socket going
+/// away).
+///
+/// Order matters: building the daemon sweeps every live session in the
+/// store to `Error`, so it only happens once this process provably owns
+/// both the data dir (lock) and the socket (bind).
 async fn serve(paths: ServerPaths) -> i32 {
-    let daemon = match build_daemon(&paths) {
-        Ok(d) => d,
+    let _lock = match lock_data_dir(&paths.data_dir) {
+        Ok(lock) => lock,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            eprintln!(
+                "agentmux-server: another daemon is already using {}",
+                paths.data_dir.display()
+            );
+            return 1;
+        }
         Err(e) => {
-            eprintln!("agentmux-server: init failed: {e:#}");
+            eprintln!(
+                "agentmux-server: cannot lock {}: {e}",
+                paths.data_dir.display()
+            );
             return 1;
         }
     };
@@ -100,6 +115,13 @@ async fn serve(paths: ServerPaths) -> i32 {
                 "agentmux-server: cannot bind {}: {e}",
                 paths.socket_path.display()
             );
+            return 1;
+        }
+    };
+    let daemon = match build_daemon(&paths) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("agentmux-server: init failed: {e:#}");
             return 1;
         }
     };

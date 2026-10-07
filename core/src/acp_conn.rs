@@ -1002,10 +1002,12 @@ impl acp::Client for AcpClientHandler {
         let path = self.resolve_in_cwd(&args.path)?;
         std::fs::write(&path, &args.content).map_err(acp::Error::into_internal_error)?;
         // Surface the edit so the TUI/orchestrator can display it.
-        let rel = path
-            .strip_prefix(&*self.cwd.lock().unwrap())
-            .unwrap_or(&path)
-            .to_path_buf();
+        // `path` is canonical, so strip the canonical cwd: a cwd under a
+        // symlink (macOS `/var`, a linked $HOME) must still yield a
+        // workspace-relative path.
+        let cwd = self.cwd.lock().unwrap().clone();
+        let base = cwd.canonicalize().unwrap_or(cwd);
+        let rel = path.strip_prefix(&base).unwrap_or(&path).to_path_buf();
         emit(
             &self.event_tx,
             self.session_id,
@@ -1102,6 +1104,28 @@ mod tests {
         assert!(h.resolve_in_cwd(Path::new("new.txt")).is_ok());
         // Lexical `..` escape is refused.
         assert!(h.resolve_in_cwd(Path::new("../outside.txt")).is_err());
+    }
+
+    /// A session cwd reached through a symlinked directory still reports
+    /// workspace-relative `FileEdited` paths, not canonical absolute ones.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_edited_is_relative_when_cwd_is_under_a_symlink() {
+        let real = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let linked = links.path().join("ws");
+        std::os::unix::fs::symlink(real.path(), &linked).unwrap();
+        std::fs::create_dir(real.path().join("src")).unwrap();
+
+        let (h, mut rx, _) = handler_with(&linked);
+        let req = acp::WriteTextFileRequest::new("s", linked.join("src/x.rs"), "fn x() {}");
+        h.write_text_file(req).await.unwrap();
+        let event = rx.recv().await.unwrap();
+        assert!(
+            matches!(&event.kind, EventKind::FileEdited { path } if path == Path::new("src/x.rs")),
+            "{:?}",
+            event.kind
+        );
     }
 
     /// The core escape vector: a *dangling* symlink inside the cwd whose
