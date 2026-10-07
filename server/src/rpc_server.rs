@@ -806,7 +806,7 @@ pub async fn dispatch(orch: &Orchestrator, method: &str, params: Value) -> Resul
                 .get_session(p.session_id)
                 .map_err(RpcError::from)?
                 .ok_or_else(|| RpcError::internal("session not found"))?;
-            let all = orch.read_events(p.session_id).map_err(RpcError::from)?;
+            let all = orch.events(p.session_id).map_err(RpcError::from)?;
             let conversation_start = all
                 .iter()
                 .filter(|e| e.resets_conversation_view())
@@ -859,7 +859,7 @@ pub async fn dispatch(orch: &Orchestrator, method: &str, params: Value) -> Resul
                 session.state,
                 agentmux_core::SessionState::Done | agentmux_core::SessionState::Error(_)
             ) {
-                for e in &all {
+                for e in all.iter() {
                     match &e.kind {
                         EventKind::PermissionRequest { request_id, .. } => {
                             pending.insert(request_id.clone(), e.clone());
@@ -903,8 +903,8 @@ pub async fn dispatch(orch: &Orchestrator, method: &str, params: Value) -> Resul
                     available_commands = None;
                 }
             }
-            let eligible: Vec<_> = all
-                .into_iter()
+            let eligible: Vec<&Event> = all
+                .iter()
                 .filter(|e| p.before_seq.is_none_or(|seq| e.seq < seq))
                 .collect();
             let mut bytes = 0;
@@ -921,7 +921,7 @@ pub async fn dispatch(orch: &Orchestrator, method: &str, params: Value) -> Resul
                     break;
                 }
                 bytes += size;
-                events.push(event.clone());
+                events.push((*event).clone());
             }
             let has_more = eligible.len() > events.len() + event_refs.len();
             events.reverse();
@@ -964,12 +964,11 @@ pub async fn dispatch(orch: &Orchestrator, method: &str, params: Value) -> Resul
         }
         rpc::M_SESSION_EVENT_READ => {
             let p: rpc::SessionEventReadParams = parse_params(params)?;
-            let event = orch
-                .read_events(p.session_id)
-                .map_err(RpcError::from)?
-                .into_iter()
-                .find(|e| e.seq == p.seq)
-                .ok_or_else(|| RpcError::internal("event not found"))?;
+            let events = orch.events(p.session_id).map_err(RpcError::from)?;
+            let event = events
+                .binary_search_by_key(&p.seq, |e| e.seq)
+                .map(|i| &events[i])
+                .map_err(|_| RpcError::internal("event not found"))?;
             let json =
                 serde_json::to_string(&event).map_err(|e| RpcError::internal(e.to_string()))?;
             if p.offset >= json.len() || !json.is_char_boundary(p.offset) {

@@ -12,9 +12,12 @@
 //! `serde_json` strings. `Event.seq` is assigned by the caller — the store
 //! only persists it and guarantees `read_events` returns rows in seq order.
 
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -34,6 +37,16 @@ const DB_FILE: &str = "db.sqlite";
 /// per session.
 const EVENTS_DIR: &str = "sessions";
 
+/// How many sessions keep an open append handle and parsed events.
+const CACHED_LOGS: usize = 32;
+
+/// Upper bound on log bytes kept parsed in memory across sessions; the
+/// least recently used parsed views go first (their append handles stay).
+const PARSED_BUDGET: u64 = 64 * 1024 * 1024;
+
+/// Bytes read from the end of a log to find its last `seq` cheaply.
+const TAIL_PROBE: u64 = 256 * 1024;
+
 /// Metadata + event-log store rooted at a `data_dir`.
 ///
 /// All methods take `&self`. `Store` is `Send` but not `Sync` (rusqlite
@@ -42,6 +55,73 @@ const EVENTS_DIR: &str = "sessions";
 pub struct Store {
     conn: Connection,
     data_dir: PathBuf,
+    logs: RefCell<LogCache>,
+}
+
+/// Recently used event logs: an open append handle and, once read, the
+/// parsed events — kept in step with appends so history pages and event
+/// lookups do not re-read and re-parse the whole file. Every use checks the
+/// file length against what the entry accounts for; any outside change
+/// (another writer, a torn tail, deletion) drops the stale view.
+#[derive(Default)]
+struct LogCache {
+    entries: HashMap<SessionId, LogEntry>,
+    /// Least recently used first.
+    order: VecDeque<SessionId>,
+}
+
+#[derive(Default)]
+struct LogEntry {
+    writer: Option<File>,
+    /// File length this entry accounts for: complete lines only.
+    len: Option<u64>,
+    /// Parsed events in `seq` order, valid for exactly `len` bytes.
+    events: Option<Arc<Vec<Event>>>,
+}
+
+impl LogCache {
+    /// The entry for `id`, created if missing and marked most recent;
+    /// the least recently used entry is evicted past [`CACHED_LOGS`].
+    fn entry(&mut self, id: SessionId) -> &mut LogEntry {
+        if let Some(pos) = self.order.iter().position(|s| *s == id) {
+            self.order.remove(pos);
+        } else if self.order.len() >= CACHED_LOGS {
+            if let Some(old) = self.order.pop_front() {
+                self.entries.remove(&old);
+            }
+        }
+        self.order.push_back(id);
+        self.entries.entry(id).or_default()
+    }
+
+    /// Drop parsed views, least recently used first (never `keep`), until
+    /// the parsed logs fit in [`PARSED_BUDGET`].
+    fn trim(&mut self, keep: SessionId) {
+        let mut total: u64 = self
+            .entries
+            .values()
+            .filter(|e| e.events.is_some())
+            .filter_map(|e| e.len)
+            .sum();
+        for id in &self.order {
+            if total <= PARSED_BUDGET {
+                break;
+            }
+            if *id == keep {
+                continue;
+            }
+            if let Some(entry) = self.entries.get_mut(id) {
+                if entry.events.take().is_some() {
+                    total -= entry.len.unwrap_or(0);
+                }
+            }
+        }
+    }
+
+    fn forget(&mut self, id: SessionId) {
+        self.entries.remove(&id);
+        self.order.retain(|s| *s != id);
+    }
 }
 
 impl Store {
@@ -97,6 +177,7 @@ impl Store {
         Ok(Store {
             conn,
             data_dir: data_dir.to_path_buf(),
+            logs: RefCell::default(),
         })
     }
 
@@ -425,30 +506,54 @@ impl Store {
     /// Append `ev` to `<data_dir>/sessions/<session_id>.jsonl`.
     ///
     /// The event's `seq` is taken as-is — sequencing is the orchestrator's
-    /// job. The file is opened per call, so appends interleaved across many
-    /// sessions stay cheap and there is no per-session writer state to
-    /// flush on crash.
+    /// job. Recently used logs keep their append handle open, so a
+    /// streaming agent costs one `fstat` + one `write` per event.
     ///
-    /// Crash safety: if a previous write was torn (the file does not end
-    /// with `'\n'`), the partial tail is truncated *before* appending so it
-    /// can never glue onto this event's line. The event itself is written
-    /// as a single `write_all` of `json + '\n'`, keeping the torn window as
-    /// small as a single syscall can make it.
+    /// Crash safety: if the file is not exactly as long as this store left
+    /// it — a torn write from a crash, or an outside writer — the partial
+    /// tail is truncated *before* appending so it can never glue onto this
+    /// event's line. The event itself is written as a single `write_all` of
+    /// `json + '\n'`, keeping the torn window as small as a single syscall
+    /// can make it.
     pub fn append_event(&self, ev: &Event) -> Result<()> {
         let path = self.event_log_path(ev.session_id);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)
-            .with_context(|| format!("failed to open event log {}", path.display()))?;
-        drop_torn_tail(&mut file, &path)?;
-
         let mut line = serde_json::to_string(ev).context("failed to serialize event")?;
         line.push('\n');
-        file.write_all(line.as_bytes())
-            .with_context(|| format!("failed to append to {}", path.display()))?;
-        Ok(())
+        let mut logs = self.logs.borrow_mut();
+        let entry = logs.entry(ev.session_id);
+        let result = (|| -> Result<()> {
+            if entry.writer.is_none() {
+                entry.writer = Some(
+                    OpenOptions::new()
+                        .create(true)
+                        .read(true)
+                        .append(true)
+                        .open(&path)
+                        .with_context(|| format!("failed to open event log {}", path.display()))?,
+                );
+            }
+            let file = entry.writer.as_mut().unwrap();
+            if entry.len != Some(file.metadata()?.len()) {
+                drop_torn_tail(file, &path)?;
+                entry.len = Some(file.metadata()?.len());
+                entry.events = None;
+            }
+            file.write_all(line.as_bytes())
+                .with_context(|| format!("failed to append to {}", path.display()))?;
+            entry.len = entry.len.map(|len| len + line.len() as u64);
+            if let Some(events) = &mut entry.events {
+                let events = Arc::make_mut(events);
+                // Appends arrive in seq order; tolerate a racing writer's
+                // small reordering without re-sorting.
+                let at = events.partition_point(|e| e.seq <= ev.seq);
+                events.insert(at, ev.clone());
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            logs.forget(ev.session_id);
+        }
+        result
     }
 
     /// Read all persisted events of `session_id`, sorted by `seq`.
@@ -460,45 +565,100 @@ impl Store {
     /// for). A malformed *complete* line (anything before a `'\n'`) is a
     /// hard error rather than silently dropping history.
     pub fn read_events(&self, session_id: SessionId) -> Result<Vec<Event>> {
+        Ok(self.events(session_id)?.as_ref().clone())
+    }
+
+    /// Shared, cached view of [`read_events`](Self::read_events): parsed
+    /// once, then kept current by appends. Revalidated against the file
+    /// length on every call, so outside changes are always observed.
+    pub fn events(&self, session_id: SessionId) -> Result<Arc<Vec<Event>>> {
         let path = self.event_log_path(session_id);
-        let raw = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        let len = match std::fs::metadata(&path) {
+            Ok(meta) => meta.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.logs.borrow_mut().forget(session_id);
+                return Ok(Arc::new(Vec::new()));
+            }
             Err(e) => {
                 return Err(e)
                     .with_context(|| format!("failed to read event log {}", path.display()))
             }
         };
-
-        // `split` yields a trailing empty slice when the file ends with
-        // `'\n'`, so a non-blank element at `last` can only exist when the
-        // final line is unterminated — i.e. torn.
-        let lines: Vec<&[u8]> = raw.split(|&b| b == b'\n').collect();
-        let last = lines.len() - 1;
-
-        let mut events = Vec::new();
-        for (idx, bytes) in lines.iter().enumerate() {
-            if bytes.iter().all(|b| b.is_ascii_whitespace()) {
-                continue;
-            }
-            match serde_json::from_slice::<Event>(bytes) {
-                Ok(ev) => events.push(ev),
-                // Torn tail: partial write left by a crash; drop it.
-                Err(_) if idx == last => break,
-                Err(e) => {
-                    return Err(e).with_context(|| {
-                        format!("malformed event in {} line {}", path.display(), idx + 1)
-                    })
-                }
+        let mut logs = self.logs.borrow_mut();
+        let entry = logs.entry(session_id);
+        if let (Some(events), Some(cached)) = (&entry.events, entry.len) {
+            if cached == len {
+                return Ok(events.clone());
             }
         }
-        events.sort_by_key(|e| e.seq);
+        let raw = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                logs.forget(session_id);
+                return Ok(Arc::new(Vec::new()));
+            }
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("failed to read event log {}", path.display()))
+            }
+        };
+        let events = Arc::new(parse_log(&raw, &path)?);
+        let complete = raw.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let entry = logs.entry(session_id);
+        entry.len = Some(complete as u64);
+        entry.events = Some(events.clone());
+        logs.trim(session_id);
         Ok(events)
+    }
+
+    /// Highest persisted `seq` of `session_id` (0 for an empty or missing
+    /// log), read from the file's tail so a boot sweep over many large
+    /// logs stays cheap. Falls back to a full parse when one event is
+    /// larger than the probe window.
+    pub fn last_seq(&self, session_id: SessionId) -> Result<u64> {
+        let path = self.event_log_path(session_id);
+        let mut file = match File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("failed to read event log {}", path.display()))
+            }
+        };
+        let len = file.metadata()?.len();
+        let start = len.saturating_sub(TAIL_PROBE);
+        file.seek(SeekFrom::Start(start))?;
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail)?;
+        let mut lines = tail.split(|&b| b == b'\n');
+        if start > 0 {
+            lines.next(); // Partial first line.
+        }
+        // Appends are near seq order: the max lies within the last lines.
+        let seqs: Vec<u64> = lines
+            .filter_map(|bytes| serde_json::from_slice::<Event>(bytes).ok())
+            .map(|e| e.seq)
+            .collect();
+        match seqs.into_iter().max() {
+            Some(max) => Ok(max),
+            None if start > 0 => {
+                let mut raw = Vec::new();
+                file.seek(SeekFrom::Start(0))?;
+                file.read_to_end(&mut raw)?;
+                Ok(parse_log(&raw, &path)?
+                    .iter()
+                    .map(|e| e.seq)
+                    .max()
+                    .unwrap_or(0))
+            }
+            None => Ok(0),
+        }
     }
 
     /// Remove `session_id`'s JSONL event log, if present. A missing log is
     /// not an error (a session may have produced no events).
     pub fn delete_event_log(&self, session_id: SessionId) -> Result<()> {
+        self.logs.borrow_mut().forget(session_id);
         let path = self.event_log_path(session_id);
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
@@ -573,6 +733,35 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at     TEXT NOT NULL
 );
 ";
+
+/// Parse a JSONL log, sorted by `seq`; see [`Store::read_events`] for the
+/// torn-tail and corruption rules.
+fn parse_log(raw: &[u8], path: &Path) -> Result<Vec<Event>> {
+    // `split` yields a trailing empty slice when the file ends with
+    // `'\n'`, so a non-blank element at `last` can only exist when the
+    // final line is unterminated — i.e. torn.
+    let lines: Vec<&[u8]> = raw.split(|&b| b == b'\n').collect();
+    let last = lines.len() - 1;
+
+    let mut events = Vec::new();
+    for (idx, bytes) in lines.iter().enumerate() {
+        if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+            continue;
+        }
+        match serde_json::from_slice::<Event>(bytes) {
+            Ok(ev) => events.push(ev),
+            // Torn tail: partial write left by a crash; drop it.
+            Err(_) if idx == last => break,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("malformed event in {} line {}", path.display(), idx + 1)
+                })
+            }
+        }
+    }
+    events.sort_by_key(|e| e.seq);
+    Ok(events)
+}
 
 /// If `file` does not end with `'\n'`, a previous append was torn by a
 /// crash — truncate back to the last complete line so the next append

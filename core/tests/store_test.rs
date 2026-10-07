@@ -480,3 +480,109 @@ fn reopening_store_preserves_metadata_and_events() {
     assert_eq!(sessions[0].state, SessionState::Done);
     assert_eq!(store.read_events(session.id).unwrap(), events);
 }
+
+/// The cached view is reused while the file is unchanged, follows the
+/// store's own appends, and notices outside writes and deletion.
+#[test]
+fn cached_events_follow_appends_and_outside_changes() {
+    let (dir, store) = temp_store();
+    let (_p, _w, _a, session) = scaffold(&store);
+    let e1 = sample_event(session.id, 1);
+    store.append_event(&e1).unwrap();
+    let first = store.events(session.id).unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&first, &store.events(session.id).unwrap()),
+        "an unchanged log must not be re-parsed"
+    );
+    drop(first);
+
+    let e2 = sample_event(session.id, 2);
+    store.append_event(&e2).unwrap();
+    assert_eq!(
+        *store.events(session.id).unwrap(),
+        vec![e1.clone(), e2.clone()]
+    );
+
+    // Another writer appends a complete event behind the store's back.
+    let e3 = sample_event(session.id, 3);
+    let mut line = serde_json::to_vec(&e3).unwrap();
+    line.push(b'\n');
+    append_raw(dir.path(), session.id, &line);
+    assert_eq!(
+        store.read_events(session.id).unwrap(),
+        vec![e1.clone(), e2.clone(), e3.clone()]
+    );
+    // ...and the store's next append lands after it, still one per line.
+    let e4 = sample_event(session.id, 4);
+    store.append_event(&e4).unwrap();
+    assert_eq!(store.read_events(session.id).unwrap(), vec![e1, e2, e3, e4]);
+
+    store.delete_event_log(session.id).unwrap();
+    assert!(store.events(session.id).unwrap().is_empty());
+    let e5 = sample_event(session.id, 5);
+    store.append_event(&e5).unwrap();
+    assert_eq!(store.read_events(session.id).unwrap(), vec![e5]);
+}
+
+/// `last_seq` reads only the tail, ignores a torn final line, and falls
+/// back to a full parse when one event outgrows the probe window.
+#[test]
+fn last_seq_reads_the_tail_and_handles_torn_and_huge_events() {
+    let (dir, store) = temp_store();
+    let (_p, _w, _a, session) = scaffold(&store);
+    assert_eq!(store.last_seq(session.id).unwrap(), 0);
+    for seq in 1..=3000 {
+        store.append_event(&sample_event(session.id, seq)).unwrap();
+    }
+    append_raw(dir.path(), session.id, b"{\"session_id\":\"torn");
+    assert_eq!(store.last_seq(session.id).unwrap(), 3000);
+
+    let big = SessionId::new();
+    store
+        .append_event(&Event {
+            session_id: big,
+            seq: 7,
+            ts: Utc::now(),
+            kind: EventKind::Orchestrator("x".repeat(600 * 1024)),
+        })
+        .unwrap();
+    assert_eq!(store.last_seq(big).unwrap(), 7);
+}
+
+/// Manual benchmark: `cargo test -p agentmux-core --test store_test
+/// bench_event_log -- --ignored --nocapture`. Streams many events into one
+/// session, then times the reads a history pager and the boot sweep do.
+#[test]
+#[ignore = "manual event-log benchmark"]
+fn bench_event_log() {
+    let (_dir, store) = temp_store();
+    let (_p, _w, _a, session) = scaffold(&store);
+    let n = 20_000;
+    let start = std::time::Instant::now();
+    for seq in 1..=n {
+        store.append_event(&sample_event(session.id, seq)).unwrap();
+    }
+    let append = start.elapsed();
+    let start = std::time::Instant::now();
+    for _ in 0..20 {
+        assert_eq!(store.read_events(session.id).unwrap().len(), n as usize);
+    }
+    let reads = start.elapsed() / 20;
+    let start = std::time::Instant::now();
+    for _ in 0..20 {
+        assert_eq!(store.events(session.id).unwrap().len(), n as usize);
+    }
+    let shared = start.elapsed() / 20;
+    // A pager polling history while the agent streams.
+    let start = std::time::Instant::now();
+    for seq in n + 1..=n + 500 {
+        store.append_event(&sample_event(session.id, seq)).unwrap();
+        store.events(session.id).unwrap();
+    }
+    let interleaved = start.elapsed() / 500;
+    println!(
+        "append {n}: {append:?} ({:?}/event); read_events: {reads:?}; \
+         events: {shared:?}; append+events while streaming: {interleaved:?}",
+        append / n as u32
+    );
+}

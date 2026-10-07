@@ -746,9 +746,9 @@ impl Orchestrator {
             }
         };
         for session in sessions {
-            match self.sink.store.lock().unwrap().read_events(session.id) {
-                Ok(events) => {
-                    let max = events.iter().map(|e| e.seq).max().unwrap_or(0);
+            // Only the last seq is needed; read the log's tail, not all of it.
+            match self.sink.store.lock().unwrap().last_seq(session.id) {
+                Ok(max) => {
                     if max > 0 {
                         self.sink.seqs.lock().unwrap().insert(session.id, max);
                     }
@@ -803,6 +803,12 @@ impl Orchestrator {
     /// Replay a session's persisted event log (seq order).
     pub fn read_events(&self, session_id: SessionId) -> Result<Vec<Event>> {
         self.sink.store.lock().unwrap().read_events(session_id)
+    }
+
+    /// Shared, cached view of a session's persisted events (see
+    /// [`Store::events`]) — for read paths that page or search history.
+    pub fn events(&self, session_id: SessionId) -> Result<Arc<Vec<Event>>> {
+        self.sink.store.lock().unwrap().events(session_id)
     }
 
     pub fn set_session_title(&self, session_id: SessionId, title: String) -> Result<Event> {
