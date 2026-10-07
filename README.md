@@ -19,6 +19,11 @@ rework.
   (`claude-code-acp`), Codex (`codex-acp`), OpenCode (`opencode acp`) and pi
   (`pi --mode rpc`, translated internally). Any other ACP-compatible agent
   (kimi, auggie, …) plugs in via `[[agents]]` config — no code changes.
+- **Native hosting** — built-in `(native)` profiles run Claude Code, Codex,
+  OpenCode and Pi in their own interactive TUIs inside a daemon-owned PTY.
+  Attach full screen from the workbench, detach with `Ctrl+]` then `m`; the
+  agent keeps running. Resume reopens the original native conversation, and a
+  native history browser lists the agent's conversations for the directory.
 - **Client–server architecture** — `agentmux-server` owns all sessions and
   state and exposes a newline-delimited JSON-RPC 2.0 API over a Unix socket.
   `agentmux-tui` is a pure client: quit or crash it and your agents keep
@@ -48,8 +53,11 @@ rework.
   daemons.
 - **No auto-delegation** — you choose which agent gets which prompt; a
   coordinator/router is on the backlog.
-- Agents' own TUIs are not embedded (no PTY passthrough) — sessions are
-  driven purely through the structured ACP event stream.
+- **Native terminals are opaque to the workbench.** They attach full screen
+  (no split view) and produce no structured events, so transcript search,
+  relay, turn notices and file activity apply to structured (ACP / Pi RPC)
+  sessions only. Terminal output is never written to disk; one client holds
+  the input lease at a time.
 - Projects can be registered with `/project /absolute/repo/path` in the TUI.
   Custom agent profiles still use the config or JSON-RPC API.
 - Unsent prompt queues belong to the current TUI process. `/unqueue` restores
@@ -155,12 +163,16 @@ conversation. Adapter setup failures appear as failed agent conversations;
 
 The conversation and multiline editor occupy the main area. At 110 columns
 and wider, a right sidebar shows **Agents / Files / Context**; narrower terminals
-use a temporary sidebar. Below 90 columns or 24 rows, the compact workbench
-keeps the space and conversation in a two-line header and reduces the empty
-composer to three rows. Draft height follows the whole text rather than the
-cursor position. The header uses a single row of creation and navigation
-actions; **Menu → Show / hide sidebar** controls the panel and **Help** stays
-in the footer. Below 70 columns, **Menu → New space** starts another space.
+use a temporary sidebar. A one-row title bar shows `space › conversation` with
+**+ Space**, **+ Agent**, **Agents** and **Menu**; as the terminal narrows,
+actions fold into **Menu** before the title becomes unreadable (`+ Agent` stays
+down to 40 columns). Below 90 columns or 24 rows the workbench drops the spacer
+row and keeps the empty composer at three rows. The composer frame names the
+recipient on its top edge and carries **New line / Stop / Send** on its bottom
+edge; draft height follows the whole text rather than the cursor position. Each
+agent keeps one identity color across the list, reply headers and composer.
+**Menu → Show / hide sidebar** controls the panel; the footer shows key hints,
+view toggles and **Help**.
 Task names come from the
 first prompt and survive reopening through the persisted event log.
 
@@ -364,9 +376,10 @@ running in the daemon.
 ## Architecture
 
 The product direction is **native hosting for completeness, structured adapters
-for enhanced workflows**. Native PTY hosting and native history browsing are
-planned, not implemented yet. Current structured-mode limitations are tracked
-in [the capability preservation plan](docs/superpowers/plans/2026-09-30-agent-capability-preservation-plan.md).
+for enhanced workflows**. Native agents run their own TUI in a PTY owned by the
+daemon (`portable-pty`, with a `vt100` screen model for reattach snapshots);
+structured agents speak ACP or Pi RPC and feed the event store. Remaining gaps
+are tracked in [the capability preservation plan](docs/superpowers/plans/2026-09-30-agent-capability-preservation-plan.md).
 
 ```
 ┌──────────┐     ┌──────────┐
@@ -384,11 +397,11 @@ in [the capability preservation plan](docs/superpowers/plans/2026-09-30-agent-ca
      ┌────────┴────────┐
      │  agentmux-core  │   domain model, AgentAdapter, ACP client,
      └────────┬────────┘   WorktreeManager, EventStore
-              │  ACP (JSON-RPC over stdio)
-   ┌──────────┼───────────┬──────────┐
-   ▼          ▼           ▼          ▼
-claude-   codex-acp   opencode    pi --mode rpc
-code-acp               acp      (internal translator)
+              │  ACP / Pi RPC (JSON-RPC over stdio)   or   PTY (native)
+   ┌──────────┼───────────┬──────────┬───────────────┐
+   ▼          ▼           ▼          ▼               ▼
+claude-   codex-acp   opencode    pi --mode rpc   claude / codex /
+code-acp               acp      (translator)    opencode / pi TUIs
 ```
 
 Cargo workspace:
@@ -436,7 +449,7 @@ The optional TOML config registers agents. Resolution order:
 [[agents]]
 id = "kimi"            # `id`/`name` default to each other; one is enough
 name = "Kimi"
-kind = "acp"           # "acp" (default) or "pi-rpc"
+kind = "acp"           # "acp" (default), "pi-rpc" or "native"
 command = "kimi-acp"   # required — PATH name or path with a dir component
 args = ["--stdio"]
 
@@ -444,11 +457,28 @@ args = ["--stdio"]
 # SOME_VAR = "value"
 ```
 
+A `native` entry runs the agent's own TUI in a PTY. `resume_args` reopen a
+conversation (`{session_id}` / `{session_file}` are substituted) and
+`history_args` open the agent's own conversation picker:
+
+```toml
+[[agents]]
+id = "my-cli-native"
+kind = "native"
+command = "my-cli"
+resume_args = ["--resume", "{session_id}"]
+history_args = ["--resume"]
+```
+
 An entry whose `id` matches a built-in replaces it in place; other entries
 are appended. Built-ins:
 
 | id | command | kind |
 |---|---|---|
+| `claude-code-native` | `claude` | native |
+| `codex-native` | `codex` | native |
+| `opencode-native` | `opencode` | native |
+| `pi-native` | `pi` | native |
 | `claude-code` | `claude-code-acp` | acp |
 | `codex` | `codex-acp` | acp |
 | `opencode` | `opencode acp` | acp |
@@ -511,11 +541,19 @@ and the pi-rpc tests drive `core/tests/fake_pi.py` (python3 required). CI runs
 the same three commands — see `.github/workflows/ci.yml`. Real-agent smoke
 runs are manual and never run in CI.
 
+Terminal regressions drive the real TUI in a PTY against an isolated daemon
+and mock agents (CI runs them as a separate job):
+
+```bash
+cargo build --workspace
+python3 -m pip install pyte==0.8.2
+for t in tui/tests/*_pty.py; do python3 "$t" || echo "FAILED: $t"; done
+```
+
 ## Roadmap
 
 - Desktop app (Tauri v2) on the same daemon API — Phase 2
 - Agent auto-delegation / coordinator mode
-- PTY passthrough for agents' own TUIs
 - File-lock / conflict arbitration for shared worktrees
 - Remote daemon (SSH)
 - Headless adapters for `claude -p` / `codex exec`-style non-ACP CLIs
