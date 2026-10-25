@@ -6,7 +6,7 @@
 
 ## 1. 目标
 
-让用户在**其他设备**（手机、平板、另一台电脑）的浏览器里使用同一个 daemon：查看会话、收发消息、批准权限请求、审阅并批准委派计划、浏览文件与 diff。
+让用户在**任意网络下的其他设备**（手机、平板、另一台电脑）通过**一个公网 URL** 在浏览器里使用同一个 daemon：查看会话、收发消息、批准权限请求、审阅并批准委派计划、浏览文件与 diff。
 
 核心原则：
 - Web 端只是 daemon 的又一个客户端，与 TUI 并列；核心逻辑不为它改动。
@@ -15,7 +15,7 @@
 
 ## 2. 非目标（本期）
 
-- 公网直接暴露（不自带 TLS 终结与账号体系）；远程访问走反向代理 / Tailscale / SSH 隧道。
+- 多账号体系 / 第三方登录（OAuth）；本期是"单所有者"模型，外部 SSO 可由前置的 Cloudflare Access / oauth2-proxy 提供。
 - 多用户、多租户、细粒度权限（本期一个 token = 完全控制）。
 - 原生终端（native terminal）的网页内嵌；先只支持结构化 ACP 会话。
 - Tauri 桌面壳（后续复用同一前端）。
@@ -31,7 +31,24 @@ TUI / CLI ────── Unix socket ─────────────
 - 新增 `server/src/web.rs`：基于 `axum`（与现有 tokio 一致）。
 - **不新写一套 API**：WebSocket 上跑与 Unix socket 完全相同的 JSON-RPC 2.0（每帧一条消息）。复用 `handle_conn` 的逻辑——先把它从 `UnixStream` 泛化为任意 `AsyncRead + AsyncWrite` 的行协议，或抽出"收一条 / 发一条"的传输 trait，让 Unix 与 WebSocket 共享同一份分发、订阅、背压（有界出站队列、`Lagged` 合成事件）实现。
 - 静态资源：`GET /` 及 `/assets/*` 由 daemon 托管（`rust-embed` 嵌入 `web/dist`，开发期可用 `--web-dir` 指向目录）。
-- 默认**不监听**。需要显式 `--web <addr>`（或配置 `[web] listen = "..."`）才启用。
+- 默认**不监听**。需要显式 `--web`（或配置 `[web]`）才启用。
+
+## 3.1 公网可达（核心需求）
+
+用户期望"启动 web 后直接用 URL 从外网访问"。机器通常在 NAT 后、没有公网 IP，所以提供三种**暴露模式**，由 `--web-expose` 选择：
+
+| 模式 | 适用 | 做法 |
+|---|---|---|
+| `tunnel`（默认的推荐路径） | 家用 / 公司机器，在 NAT 后 | daemon 拉起 `cloudflared`（出站连接，无需开端口），解析并打印公网 URL 与二维码。临时隧道（trycloudflare）无需账号；配置了命名隧道 token 与域名则得到固定 URL |
+| `direct` | 有公网 IP / VPS | daemon 自己监听 `0.0.0.0:443`，用 rustls + ACME（Let's Encrypt）自动签发证书，需要 `--domain` |
+| `local` | 仅本机 / 已有反向代理 / Tailscale | 只绑 `127.0.0.1`，TLS 与暴露交给外部 |
+
+要点：
+- `tunnel` 与 `direct` 对外**强制 HTTPS**；daemon 不提供公网明文 HTTP。
+- 隧道只是传输：daemon 把它当作"不可信网络"，认证全部由 daemon 自己做（见 §4），不依赖隧道提供的保护。
+- 先做 `tunnel` + `local`（最快满足需求），`direct`（ACME）放第二批。
+- 调研提醒：Cloudflare 临时隧道文档注明仅用于测试（并发请求有限、不支持 SSE；URL 持有即可访问且曾被搜索引擎收录）。我们的事件流用 WebSocket 而非 SSE，所以可行，但文档与启动输出必须说明：**临时 URL 不是秘密，不能当作认证**；长期使用推荐命名隧道 + 固定域名。
+- 隧道进程由 daemon 监管：崩溃自动重启，URL 变化时更新并提示；daemon 退出时一并退出。
 
 ## 4. 认证与安全（本设计的重点）
 
@@ -44,7 +61,8 @@ TUI / CLI ────── Unix socket ─────────────
 
 ### 4.2 措施
 
-- **默认绑定 `127.0.0.1`**。绑定非回环地址时必须同时满足：已配置 token，且启动时打印醒目警告；未启用 TLS 且地址非回环时，除非 `--insecure-http` 显式确认，否则拒绝启动，并提示用反向代理或 Tailscale。
+- **URL 不含任何秘密，且被视为公开**：假设任何人都能发现并访问该 URL，所有保护来自认证本身。未认证时只能访问登录 / 配对页的静态资源。
+- **默认只绑 `127.0.0.1`**；只有 `--web-expose tunnel|direct` 才对外，且二者强制 HTTPS。直接绑非回环地址的明文 HTTP 只在 `--insecure-http` 显式确认下允许。
 - **配对流程**，避免把长期 token 放进 URL：
   1. 在本机运行 `agentmux pair`（或 TUI 菜单项），daemon 生成一次性配对码（8 位以上、5 分钟有效、仅可用一次），显示为文本 + 二维码（编码 `https://host/pair#code=...`，用 fragment 避免进入服务端日志与 Referer）。
   2. 新设备打开页面提交配对码到 `POST /api/pair`，daemon 校验后签发**设备 token**（256 位随机，只存哈希）并返回；前端存入 `localStorage`，并以 `Authorization`/子协议传递。
@@ -53,7 +71,9 @@ TUI / CLI ────── Unix socket ─────────────
 - **限速与锁定**：配对接口与失败的 token 校验按来源 IP 限速；配对码连续错误 5 次即作废。
 - **响应头**：严格 CSP（仅同源脚本，无内联）、`X-Content-Type-Options`、`Referrer-Policy: no-referrer`、`Cache-Control: no-store`（API）。
 - **审计**：设备配对、吊销、登录失败写入 daemon 日志；高风险 RPC（执行命令类的权限批准）在事件流里本来就有记录。
-- **TLS**：本期不内置。文档给出两种推荐部署：① Tailscale / WireGuard（零配置、不开公网）；② Caddy/nginx 反向代理终结 TLS。可选后续：`--tls-cert/--tls-key` 用 rustls 直接提供 HTTPS。
+- **TLS**：`tunnel` 模式由 Cloudflare 终结；`direct` 模式用 rustls + ACME 自动证书。使用反向代理时必须透传 `Host`（code-server 的经验：缺失会导致 Origin 校验把正常 WebSocket 全部拒绝），文档给出 Caddy / nginx 示例。
+- **公网暴露专项加固**（调研得出）：code-server 对公网暴露的官方立场是"绝不能无认证、无加密"，并对登录做每分钟 2 次 + 每小时 12 次的节流；OpenCode 的 web 服务不设密码就是裸奔，文档反复要求绑定非本地地址时必须设密码。因此我们：① 没有认证配置则 `--web-expose` 拒绝启动；② 首次启用必须先在本机完成配对（设备 token 才可用），远程设备永远不能自行"首次设置密码"；③ 登录 / 配对失败按 IP 与全局双重节流，全局失败过多时暂时关闭配对入口；④ 可选第二因素：把配对绑定为 passkey（WebAuthn），设备 token 泄露不足以接管；⑤ 可选前置 Cloudflare Access 做 SSO（我们只校验其注入的 JWT，作为额外一层，不作为唯一一层）。
+- **高风险操作二次确认**：通过 Web 通道批准“执行命令 / 写文件范围外”类权限时，默认需要在页面上显式确认（不提供“一律允许”的一键按钮），Web 来源在审计事件里标注设备名。
 - 控制面 RPC 在 Web 通道上做**方法白名单**：禁用 `server/shutdown` 等仅应由本机操作的方法（可由 `[web] allow_admin = true` 打开）。
 
 ## 5. 协议与事件
@@ -103,22 +123,34 @@ TUI / CLI ────── Unix socket ─────────────
 
 1. **传输泛化**：把连接处理抽成传输无关，Unix 通道行为不变，全部既有测试保持绿。
 2. **网关 + 认证**：`web.rs`、配对、设备 token、Origin 校验、限速、启动保护；用 Rust 集成测试（WebSocket 客户端）验证。
+2b. **公网暴露**：`--web-expose tunnel`（监管 cloudflared、解析 URL、二维码），随后 `direct`（rustls + ACME）。
 3. **最小前端 M1**：配对、会话列表、对话、权限批准；Playwright 冒烟。
 4. **M2**：计划审阅、文件 / diff。
-5. **M3**：搜索、上下文、设备管理、PWA；部署文档（Tailscale / Caddy 示例）。
+5. **M3**：搜索、上下文、设备管理、PWA；部署文档（Cloudflare 命名隧道、Tailscale、Caddy 示例）。
 
 每一步独立可合并；步骤 2 完成前不对外宣称"可远程访问"。
 
+## 9.1 业界做法调研摘要
+
+- code-server：默认密码登录 + 登录节流；官方明确不要无认证无加密暴露；4.10.1 起对 WebSocket 做 Origin 校验防跨站劫持，反向代理必须透传 `Host`。
+- OpenCode `web`：默认仅 localhost；`OPENCODE_SERVER_PASSWORD` 启用 HTTP Basic，绑 `0.0.0.0` 时要求必设密码；`attach` 可让 TUI 连远程服务。
+- VS Code 远程 agent 会话：走 dev tunnel，默认要求认证，并警告匿名隧道会让任何拿到 URL 的人启动 agent 会话。
+- Cloudflare 临时隧道：免账号即得公网 URL，但仅用于测试、URL 持有即访问；可用 `--allowed-mail` 加邮箱一次性口令，或用命名隧道 + Cloudflare Access。
+- 社区 agent 远程工具：多数是"回环绑定 + SSH 转发"（认证靠 SSH key），或"本地网关 + Cloudflare Tunnel + 前置身份层"；商业产品有端到端加密中继（配对时 X25519 交换密钥）。
+
+我们的取舍：采用"出站隧道获得 URL + daemon 自己做配对认证和设备吊销"，吸收 code-server 的节流与 Origin 校验、OpenCode 的"无认证拒绝对外"，端到端加密中继暂不做。
+
 ## 10. 风险
 
-- **安全面显著扩大**：这是最大的风险，因此默认关闭、默认回环、配对而非长期 URL token、同源校验。上线前需要一次专门的安全评审（`/security-review`）。
+- **安全面显著扩大**：直接面向公网，这是最大的风险，因此默认关闭、默认回环、对外强制 HTTPS 与配对认证、同源校验、节流。上线前需要一次专门的安全评审（`/security-review`）。
 - **前后端类型漂移**：靠类型生成 + CI 约束。
 - **移动端体验**：长对话与大 diff 的渲染性能，需虚拟列表与分页。
 - **嵌入资源增大二进制**：可接受；开发期用 `--web-dir` 热更新。
 
 ## 11. 待定问题
 
-- 是否需要内置 TLS（rustls）？取决于用户是否接受依赖 Tailscale / 反向代理。
+- `tunnel` 模式依赖外部 `cloudflared` 二进制：是要求用户自行安装，还是首次使用时提示下载？是否同时支持 Tailscale Funnel / frp 等可插拔实现？
+- passkey 是否本期做，还是作为 M3 增强。
 - 设备 token 过期默认值（30 天滑动）是否合适？
 - 是否允许 Web 端执行管理类操作（新增 Agent、修改配置）？建议 M3 之后再议，默认只读配置。
 - Web 端创建原生终端会话是否永远不支持？
