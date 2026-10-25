@@ -170,6 +170,10 @@ impl Store {
                 [],
             )?;
         }
+        let has_capabilities: bool = migration.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'capabilities_json')", [], |row| row.get(0))?;
+        if !has_capabilities {
+            migration.execute("ALTER TABLE sessions ADD COLUMN capabilities_json TEXT", [])?;
+        }
         migration
             .commit()
             .context("failed to migrate native session metadata")?;
@@ -426,6 +430,38 @@ impl Store {
     ///
     /// Fails if no row was updated — a state transition for a missing
     /// session is a caller bug, not a silent no-op.
+    /// Persist the session's latest capability snapshot.
+    pub fn set_capabilities(
+        &self,
+        session_id: SessionId,
+        caps: &crate::capabilities::AgentCapabilities,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET capabilities_json = ?1 WHERE id = ?2",
+            rusqlite::params![serde_json::to_string(caps)?, session_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// The last stored capability snapshot; `None` for sessions that never
+    /// handshook or whose stored JSON is unreadable.
+    pub fn get_capabilities(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<crate::capabilities::AgentCapabilities>> {
+        let raw: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT capabilities_json FROM sessions WHERE id = ?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(raw
+            .flatten()
+            .and_then(|json| serde_json::from_str(&json).ok()))
+    }
+
     pub fn update_session_state(&self, session_id: SessionId, state: &SessionState) -> Result<()> {
         let n = self
             .conn

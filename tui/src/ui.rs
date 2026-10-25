@@ -1181,7 +1181,9 @@ fn event_block(ev: &Event) -> EventBlock {
             Span::styled("✗ ", THEME.error),
             Span::styled(format!("agent exited (code {code:?})"), THEME.error),
         ])]),
-        EventKind::ConversationStarted => EventBlock::Static(vec![]),
+        EventKind::ConversationStarted | EventKind::CapabilitiesUpdated(_) => {
+            EventBlock::Static(vec![])
+        }
         EventKind::Orchestrator(msg) => EventBlock::Static(vec![Line::from(vec![
             ts_span(ev),
             Span::styled("· ", THEME.faint),

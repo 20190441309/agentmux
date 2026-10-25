@@ -60,9 +60,9 @@ use std::time::Instant;
 use agentmux_core::rpc::{
     self, RpcError, RpcNotification, RpcRequest, RpcResponse, M_AGENT_LIST, M_AGENT_REGISTER,
     M_PROJECT_LIST, M_PROJECT_REGISTER, M_PROJECT_REMOVE, M_SERVER_SHUTDOWN, M_SERVER_STATUS,
-    M_SESSION_CANCEL, M_SESSION_CREATE, M_SESSION_KILL, M_SESSION_LIST, M_SESSION_PERMISSION,
-    M_SESSION_PROMPT, M_SESSION_RESUME, M_SESSION_SUBSCRIBE, M_WORKSPACE_CREATE, M_WORKSPACE_LIST,
-    M_WORKSPACE_REMOVE, N_SESSION_EVENT,
+    M_SESSION_CANCEL, M_SESSION_CAPABILITIES, M_SESSION_CREATE, M_SESSION_KILL, M_SESSION_LIST,
+    M_SESSION_PERMISSION, M_SESSION_PROMPT, M_SESSION_RESUME, M_SESSION_SUBSCRIBE,
+    M_WORKSPACE_CREATE, M_WORKSPACE_LIST, M_WORKSPACE_REMOVE, N_SESSION_EVENT,
 };
 use agentmux_core::{
     AgentRegistry, Config, Event, EventKind, Orchestrator, Result, SessionId, Store,
@@ -1067,6 +1067,14 @@ pub async fn dispatch(orch: &Orchestrator, method: &str, params: Value) -> Resul
             orch.respond_permission(p.session_id, &p.request_id, p.outcome)
                 .map_err(RpcError::from)?;
             Ok(Value::Null)
+        }
+        M_SESSION_CAPABILITIES => {
+            let p: rpc::SessionCapabilitiesParams = parse_params(params)?;
+            to_value(&rpc::SessionCapabilitiesResult {
+                capabilities: orch
+                    .session_capabilities(p.session_id)
+                    .map_err(RpcError::from)?,
+            })
         }
         M_SESSION_KILL => {
             let p: rpc::SessionKillParams = parse_params(params)?;

@@ -925,6 +925,7 @@ pub(crate) fn event_summary(ev: &Event) -> String {
     let text = match &ev.kind {
         EventKind::TitleChanged { title } => format!("named: {title}"),
         EventKind::ConversationStarted => "new conversation".into(),
+        EventKind::CapabilitiesUpdated(_) => "capabilities updated".into(),
         EventKind::SessionUpdate(v) => {
             let update = v.get("update").unwrap_or(v);
             match update.get("sessionUpdate").and_then(|u| u.as_str()) {

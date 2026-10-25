@@ -1,0 +1,17 @@
+{
+  "sessionId": "sess-1",
+  "modes": {
+    "currentModeId": "code",
+    "availableModes": [
+      {"id": "code", "name": "Code"},
+      {"id": "plan", "name": "Plan", "description": "Read-only planning"}
+    ]
+  },
+  "models": {
+    "currentModelId": "m-large",
+    "availableModels": [
+      {"modelId": "m-small", "name": "Small"},
+      {"modelId": "m-large", "name": "Large"}
+    ]
+  }
+}

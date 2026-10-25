@@ -46,9 +46,10 @@ use std::time::{Duration, Instant};
 
 use agentmux_core::rpc::{
     self, RpcRequest, M_AGENT_LIST, M_AGENT_REGISTER, M_PROJECT_LIST, M_PROJECT_REGISTER,
-    M_PROJECT_REMOVE, M_SERVER_SHUTDOWN, M_SERVER_STATUS, M_SESSION_CANCEL, M_SESSION_CREATE,
-    M_SESSION_KILL, M_SESSION_LIST, M_SESSION_PERMISSION, M_SESSION_PROMPT, M_SESSION_RESUME,
-    M_SESSION_SUBSCRIBE, M_WORKSPACE_CREATE, M_WORKSPACE_LIST, M_WORKSPACE_REMOVE, N_SESSION_EVENT,
+    M_PROJECT_REMOVE, M_SERVER_SHUTDOWN, M_SERVER_STATUS, M_SESSION_CANCEL, M_SESSION_CAPABILITIES,
+    M_SESSION_CREATE, M_SESSION_KILL, M_SESSION_LIST, M_SESSION_PERMISSION, M_SESSION_PROMPT,
+    M_SESSION_RESUME, M_SESSION_SUBSCRIBE, M_WORKSPACE_CREATE, M_WORKSPACE_LIST,
+    M_WORKSPACE_REMOVE, N_SESSION_EVENT,
 };
 use agentmux_server::ServerPaths;
 use serde::de::DeserializeOwned;
@@ -864,6 +865,20 @@ impl DaemonClient {
             },
         )
         .await
+    }
+
+    /// `session/capabilities` → the session's last known adapter capabilities.
+    pub async fn capabilities(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<Option<agentmux_core::capabilities::AgentCapabilities>> {
+        Ok(self
+            .call_result::<rpc::SessionCapabilitiesResult>(
+                M_SESSION_CAPABILITIES,
+                rpc::SessionCapabilitiesParams { session_id },
+            )
+            .await?
+            .capabilities)
     }
 
     /// `session/kill` → kill the session's agent process.

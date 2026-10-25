@@ -210,7 +210,20 @@ impl acp::Agent for MockAgent {
             return Err(acp::Error::invalid_params());
         }
         self.send_commands(&acp::SessionId::new(SESSION_ID)).await?;
-        Ok(acp::NewSessionResponse::new(SESSION_ID))
+        let mut response = acp::NewSessionResponse::new(SESSION_ID);
+        // MOCK_MODES="code,plan" advertises session modes (first is current).
+        if let Ok(names) = std::env::var("MOCK_MODES") {
+            let modes: Vec<_> = names
+                .split(',')
+                .filter(|n| !n.is_empty())
+                .map(|n| acp::SessionMode::new(n.to_owned(), n.to_owned()))
+                .collect();
+            if let Some(first) = modes.first() {
+                let current = first.id.clone();
+                response = response.modes(acp::SessionModeState::new(current, modes));
+            }
+        }
+        Ok(response)
     }
 
     async fn load_session(

@@ -4,6 +4,7 @@ use crate::{
     interaction::{buttons, Target},
     theme::THEME,
 };
+use agentmux_core::capabilities::{AgentCapabilities, CapabilityProtocol};
 use agentmux_core::{AdapterKind, Event, EventKind, SessionId, SessionState};
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
@@ -36,6 +37,8 @@ pub struct Info {
     pub sessions: HashMap<SessionId, Metadata>,
     pub serial: u64,
     pub panel: Option<(SessionId, u16)>,
+    /// Latest adapter-reported capability snapshot per session.
+    pub capabilities: HashMap<SessionId, AgentCapabilities>,
 }
 
 fn string(value: Option<&Value>) -> Option<String> {
@@ -47,7 +50,64 @@ fn string(value: Option<&Value>) -> Option<String> {
     })
 }
 
+/// Human-readable capability summary lines; unknown means unsupported.
+pub fn capability_lines(caps: &AgentCapabilities) -> Vec<String> {
+    let yes = |b: bool| if b { "yes" } else { "no" };
+    let mut out = Vec::new();
+    let protocol = match &caps.protocol {
+        CapabilityProtocol::Acp { version } => format!(
+            "ACP{}",
+            version.map(|v| format!(" v{v}")).unwrap_or_default()
+        ),
+        CapabilityProtocol::PiRpc => "Pi RPC".into(),
+        CapabilityProtocol::NativeTerminal => "Native terminal".into(),
+    };
+    out.push(format!(
+        "Protocol: {protocol}{}",
+        if caps.stale {
+            " (last known; agent unreachable)"
+        } else {
+            ""
+        }
+    ));
+    if matches!(caps.protocol, CapabilityProtocol::NativeTerminal) {
+        out.push("Structured features: none — use the agent's own interface".into());
+        return out;
+    }
+    out.push(if caps.load_session {
+        "Resume history: supported".into()
+    } else {
+        "Resume history: not supported by this adapter — use native hosting to continue old conversations".into()
+    });
+    out.push(format!(
+        "Prompt input: images {} · audio {} · embedded context {}",
+        yes(caps.prompt.image),
+        yes(caps.prompt.audio),
+        yes(caps.prompt.embedded_context)
+    ));
+    if !caps.session_modes.is_empty() {
+        let names: Vec<_> = caps.session_modes.iter().map(|m| m.name.as_str()).collect();
+        out.push(format!("Modes: {}", names.join(", ")));
+    }
+    if !caps.session_models.is_empty() {
+        let names: Vec<_> = caps
+            .session_models
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect();
+        out.push(format!("Models: {}", names.join(", ")));
+    }
+    out
+}
+
 pub fn observe(app: &mut App, event: &Event) {
+    if let EventKind::CapabilitiesUpdated(caps) = &event.kind {
+        app.wb
+            .info
+            .capabilities
+            .insert(event.session_id, (**caps).clone());
+        return;
+    }
     let EventKind::SessionUpdate(value) = &event.kind else {
         return;
     };
@@ -242,10 +302,18 @@ pub fn draw(frame: &mut Frame, app: &App) {
                 .unwrap_or_else(|| "Unknown".into())
         )),
         Line::default(),
+        Line::styled("Capabilities · reported by the adapter", THEME.section),
+    ];
+    match app.wb.info.capabilities.get(&session) {
+        Some(caps) => lines.extend(capability_lines(caps).into_iter().map(Line::raw)),
+        None => lines.push(Line::raw("Not reported yet")),
+    }
+    lines.extend([
+        Line::default(),
         Line::styled("Workbench · /mux commands", THEME.section),
         Line::raw("new · add-agent · resume · attention · search · references"),
         Line::styled("Agent · unqualified commands", THEME.section),
-    ];
+    ]);
     if let Some((_, commands)) = app.wb.acp_commands.get(&session) {
         lines.extend(
             commands
@@ -306,5 +374,26 @@ mod tests {
         assert!(app.wb.info.sessions[&id].cost.is_none());
         assert!(app.wb.info.sessions[&id].usage.is_none());
         assert_eq!(execution(&app, id), "Unknown");
+    }
+
+    #[test]
+    fn capability_event_is_stored_and_summarised_without_guessing() {
+        let mut app = App::new(vec![], vec![], vec![], vec![]);
+        let id = SessionId::new();
+        let caps = AgentCapabilities::from_acp_initialize(&serde_json::json!({}));
+        let ev = Event {
+            session_id: id,
+            seq: 1,
+            ts: chrono::Utc::now(),
+            kind: EventKind::CapabilitiesUpdated(Box::new(caps)),
+        };
+        observe(&mut app, &ev);
+        let lines = capability_lines(&app.wb.info.capabilities[&id]);
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("Resume history: not supported")));
+        assert!(lines.iter().any(|l| l.contains("images no")));
+        let native = capability_lines(&AgentCapabilities::native(None));
+        assert!(native.iter().any(|l| l.contains("none")));
     }
 }

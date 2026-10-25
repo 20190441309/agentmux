@@ -46,6 +46,7 @@ use chrono::Utc;
 use tokio::sync::{broadcast, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 
+use crate::capabilities::AgentCapabilities;
 use crate::collab;
 use crate::config::{ConnTimeouts, SpawnOptions};
 use crate::id::{AgentId, ProjectId, SessionId, WorkspaceId};
@@ -794,6 +795,34 @@ impl Orchestrator {
         self.sink.store.lock().unwrap().get_session(session_id)
     }
 
+    /// The session's last known adapter capabilities, if it ever handshook.
+    pub fn session_capabilities(&self, session_id: SessionId) -> Result<Option<AgentCapabilities>> {
+        self.sink.store.lock().unwrap().get_capabilities(session_id)
+    }
+
+    /// Persist a fresh capability snapshot and announce it.
+    fn publish_capabilities(&self, session_id: SessionId, caps: AgentCapabilities) {
+        let mut ev = Event {
+            session_id,
+            seq: 0,
+            ts: Utc::now(),
+            kind: EventKind::CapabilitiesUpdated(Box::new(caps.clone())),
+        };
+        let store = self.sink.store.lock().unwrap();
+        if let Err(e) = store.set_capabilities(session_id, &caps) {
+            eprintln!("agentmux: failed to store capabilities for {session_id}: {e:#}");
+        }
+        self.sink.ingest_locked(&store, &mut ev);
+    }
+
+    /// A re-handshake failed: keep the previous snapshot, flagged outdated.
+    fn mark_capabilities_stale(&self, session_id: SessionId) {
+        let previous = self.session_capabilities(session_id).ok().flatten();
+        if let Some(prev) = previous.filter(|c| !c.stale) {
+            self.publish_capabilities(session_id, prev.into_stale());
+        }
+    }
+
     /// Fetch a workspace's persisted record.
     pub fn get_workspace(&self, workspace_id: WorkspaceId) -> Result<Option<Workspace>> {
         self.sink.store.lock().unwrap().get_workspace(workspace_id)
@@ -1358,6 +1387,7 @@ impl Orchestrator {
             timeouts: self.timeouts,
             stderr_log,
         };
+        let profile_name = profile.name.clone();
         let conn =
             tokio::task::spawn_blocking(move || SpawnedConn::spawn(&profile, &cwd, &options))
                 .await
@@ -1370,8 +1400,14 @@ impl Orchestrator {
 
         let restoring =
             previous.is_some_and(|s| s.acp_session_id.is_some() || s.native_session_file.is_some());
+        let mut caps: Option<AgentCapabilities> = None;
         let setup = async {
             let init = conn.initialize().await.context("agent initialize failed")?;
+            caps = Some(match conn.as_ref() {
+                SpawnedConn::Acp(_) => AgentCapabilities::from_acp_initialize(&init),
+                SpawnedConn::Pi(_) => AgentCapabilities::from_pi_state(&init),
+                SpawnedConn::Native(_) => AgentCapabilities::native(Some(profile_name.clone())),
+            });
             if matches!(conn.as_ref(), SpawnedConn::Native(_)) {
                 return Ok((record.acp_session_id.clone().unwrap_or_default(), record.native_session_file.clone()));
             }
@@ -1380,9 +1416,12 @@ impl Orchestrator {
                 let id = previous.acp_session_id.as_deref().context("native session identity is missing; original conversation was not replaced")?;
                 match conn.as_ref() {
                     SpawnedConn::Acp(acp) => {
-                        ensure!(init.pointer("/agentCapabilities/loadSession").and_then(serde_json::Value::as_bool) == Some(true),
+                        ensure!(caps.as_ref().is_some_and(|c| c.load_session),
                             "this ACP adapter does not support native session restoration; original conversation was not replaced. Create a new conversation explicitly with /mux new");
-                        acp.load_session(id, worktree).await?;
+                        let info = acp.load_session(id, worktree).await?;
+                        if let Some(c) = caps.as_mut() {
+                            c.merge_session_info(&info);
+                        }
                         Ok((id.to_owned(), None))
                     }
                     SpawnedConn::Pi(pi) => {
@@ -1407,7 +1446,13 @@ impl Orchestrator {
                             .map(|p| if p.is_absolute() { p } else { worktree.join(p) });
                         Ok((id, file))
                     }
-                    SpawnedConn::Acp(acp) => Ok((acp.new_session(worktree).await.context("agent session/new failed")?, None)),
+                    SpawnedConn::Acp(acp) => {
+                        let (id, info) = acp.new_session_with_info(worktree).await.context("agent session/new failed")?;
+                        if let Some(c) = caps.as_mut() {
+                            c.merge_session_info(&info);
+                        }
+                        Ok((id, None))
+                    }
                     SpawnedConn::Native(_) => unreachable!(),
                 }
             }
@@ -1415,10 +1460,14 @@ impl Orchestrator {
         let (acp_session_id, native_file) = match setup {
             Ok(identity) => identity,
             Err(e) => {
+                self.mark_capabilities_stale(session_id);
                 conn.close();
                 return Err(e);
             }
         };
+        if let Some(caps) = caps {
+            self.publish_capabilities(session_id, caps);
+        }
 
         // ACP load replays old messages. The persisted workbench history already
         // contains them; do not append a second copy on every reconnection.
@@ -2107,7 +2156,8 @@ fn describe_event(ev: &Event) -> Option<String> {
     match &ev.kind {
         EventKind::ConversationStarted
         | EventKind::TitleChanged { .. }
-        | EventKind::FileOverlap { .. } => None,
+        | EventKind::FileOverlap { .. }
+        | EventKind::CapabilitiesUpdated(_) => None,
         EventKind::SessionUpdate(v) => {
             // Unwrap the `{"sessionId", "update"}` notification envelope.
             let update = v.get("update").unwrap_or(v);

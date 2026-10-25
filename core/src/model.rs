@@ -197,6 +197,9 @@ pub enum EventKind {
         path: PathBuf,
         others: Vec<SessionId>,
     },
+    /// The session's adapter capabilities were (re)captured after a
+    /// handshake, or marked stale after a failed one.
+    CapabilitiesUpdated(Box<crate::capabilities::AgentCapabilities>),
 }
 
 /// One entry in a session's ordered, persistent event log.

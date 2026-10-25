@@ -149,6 +149,8 @@ pub const M_SESSION_SUBSCRIBE: &str = "session/subscribe";
 
 /// Read a page of persisted events, newest page when before_seq is absent.
 pub const M_SESSION_HISTORY: &str = "session/history";
+/// A session's last known adapter capabilities (`null` if never captured).
+pub const M_SESSION_CAPABILITIES: &str = "session/capabilities";
 /// Read a bounded UTF-8 chunk of one serialized persisted event.
 pub const M_SESSION_EVENT_READ: &str = "session/event/read";
 /// Inspect a file's aggregate worktree diff against HEAD.
@@ -512,6 +514,16 @@ pub struct SessionListResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionResumeParams {
     pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCapabilitiesParams {
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCapabilitiesResult {
+    pub capabilities: Option<crate::capabilities::AgentCapabilities>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

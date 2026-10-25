@@ -1,0 +1,12 @@
+{
+  "protocolVersion": 1,
+  "agentInfo": {"name": "example-agent", "version": "1.2.3"},
+  "agentCapabilities": {
+    "loadSession": true,
+    "promptCapabilities": {"image": true, "audio": false, "embeddedContext": true},
+    "mcpCapabilities": {"http": true, "sse": false},
+    "sessionCapabilities": {},
+    "vendorThing": {"x": 1}
+  },
+  "authMethods": [{"id": "oauth", "name": "OAuth"}]
+}

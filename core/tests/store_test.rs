@@ -586,3 +586,34 @@ fn bench_event_log() {
         append / n as u32
     );
 }
+
+#[test]
+fn capabilities_column_is_added_to_old_databases() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        // An old store: sessions table without the capabilities column.
+        let conn = rusqlite::Connection::open(dir.path().join("db.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, agent_id TEXT NOT NULL,
+             state TEXT NOT NULL, acp_session_id TEXT, refs TEXT NOT NULL, created_at TEXT NOT NULL);",
+        )
+        .unwrap();
+    }
+    let store = Store::open(dir.path()).expect("old database must open and migrate");
+    assert!(store
+        .get_capabilities(agentmux_core::SessionId::new())
+        .unwrap()
+        .is_none());
+    drop(store);
+    // Reopening an already-migrated database is a no-op.
+    Store::open(dir.path()).expect("second open");
+    let conn = rusqlite::Connection::open(dir.path().join("db.sqlite")).unwrap();
+    let has: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name='capabilities_json')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(has);
+}

@@ -188,12 +188,12 @@ enum Cmd {
     Initialize(oneshot::Sender<Result<serde_json::Value>>),
     NewSession {
         cwd: PathBuf,
-        reply: oneshot::Sender<Result<String>>,
+        reply: oneshot::Sender<Result<(String, serde_json::Value)>>,
     },
     LoadSession {
         session_id: String,
         cwd: PathBuf,
-        reply: oneshot::Sender<Result<()>>,
+        reply: oneshot::Sender<Result<serde_json::Value>>,
     },
     Prompt {
         session_id: String,
@@ -346,6 +346,12 @@ impl AcpConn {
     /// Unbounded: session/new cost is agent-defined (v1 keeps the
     /// pre-existing behavior rather than inventing a bound).
     pub async fn new_session(&self, cwd: &Path) -> Result<String> {
+        Ok(self.new_session_with_info(cwd).await?.0)
+    }
+
+    /// Like [`Self::new_session`], also returning the raw response JSON
+    /// (modes/models) for capability reporting.
+    pub async fn new_session_with_info(&self, cwd: &Path) -> Result<(String, serde_json::Value)> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::NewSession {
             cwd: cwd.to_path_buf(),
@@ -355,7 +361,7 @@ impl AcpConn {
     }
 
     /// Load an existing native conversation; callers must check loadSession.
-    pub async fn load_session(&self, session_id: &str, cwd: &Path) -> Result<()> {
+    pub async fn load_session(&self, session_id: &str, cwd: &Path) -> Result<serde_json::Value> {
         let (tx, rx) = oneshot::channel();
         self.send(Cmd::LoadSession {
             session_id: session_id.to_owned(),
@@ -770,7 +776,10 @@ async fn handle_cmd(
                 .new_session(acp::NewSessionRequest::new(cwd.clone()))
                 .await
                 .map_err(|e| anyhow!("acp session/new failed: {e}"))
-                .map(|resp| resp.session_id.to_string());
+                .map(|resp| {
+                    let info = serde_json::to_value(&resp).unwrap_or_default();
+                    (resp.session_id.to_string(), info)
+                });
             if result.is_ok() {
                 *session_cwd.lock().unwrap() = cwd;
             }
@@ -785,7 +794,7 @@ async fn handle_cmd(
             let result = conn
                 .load_session(acp::LoadSessionRequest::new(session_id, cwd))
                 .await
-                .map(|_| ())
+                .map(|resp| serde_json::to_value(&resp).unwrap_or_default())
                 .map_err(|e| anyhow!("acp session/load failed: {e}"));
             // The replay must reach the event channel before the caller
             // resumes and drains it (see `NotificationOrder`).

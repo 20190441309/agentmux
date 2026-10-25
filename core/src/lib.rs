@@ -9,6 +9,7 @@
 
 pub mod acp_conn;
 pub mod acp_terminals;
+pub mod capabilities;
 pub mod collab;
 pub mod config;
 pub mod id;

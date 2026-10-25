@@ -1729,3 +1729,47 @@ async fn overlapping_edits_are_noticed_and_shared_with_agents() {
     assert!(text.contains("Files several agents edited"), "{text}");
     assert!(text.contains("- src/lib.rs — "), "{text}");
 }
+
+#[tokio::test]
+async fn capabilities_are_captured_persisted_broadcast_and_survive_reopen() {
+    let env = setup();
+    let ws = env
+        .orch
+        .create_workspace(env.project_id, "caps", "main")
+        .await
+        .unwrap();
+    let mut events = env.orch.subscribe();
+    let id = env
+        .orch
+        .create_session(ws, &AgentId::new("mock"), None)
+        .await
+        .unwrap();
+
+    let caps = env
+        .orch
+        .session_capabilities(id)
+        .unwrap()
+        .expect("captured at handshake");
+    assert_eq!(caps.agent_name.as_deref(), Some("agentmux-mock-agent"));
+    assert!(caps.load_session && !caps.prompt.image && !caps.stale);
+
+    let seen = recv_until(&mut events, EVENT_TIMEOUT, |e| {
+        e.session_id == id && matches!(e.kind, EventKind::CapabilitiesUpdated(_))
+    })
+    .await;
+    assert!(seen
+        .iter()
+        .any(|e| matches!(e.kind, EventKind::CapabilitiesUpdated(_))));
+    assert!(env
+        .orch
+        .read_events(id)
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e.kind, EventKind::CapabilitiesUpdated(_))));
+    assert!(env
+        .orch
+        .session_capabilities(SessionId::new())
+        .unwrap()
+        .is_none());
+    env.orch.kill(id).await.unwrap();
+}

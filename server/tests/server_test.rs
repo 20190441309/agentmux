@@ -731,3 +731,27 @@ async fn session_permission_validates_params() {
 
     shutdown(td).await;
 }
+
+#[tokio::test]
+async fn session_capabilities_rpc_reports_the_handshake_snapshot() {
+    let td = start_daemon().await;
+    let repo = init_repo();
+    let mut client = Client::connect(&td.sock).await;
+    let session = create_session_via_rpc(&mut client, repo.path(), "caps").await;
+
+    let resp = client
+        .request("session/capabilities", json!({"session_id": session}))
+        .await;
+    let caps = &resp["result"]["capabilities"];
+    assert_eq!(caps["agent_name"], json!("agentmux-mock-agent"), "{resp}");
+    assert_eq!(caps["load_session"], json!(true));
+
+    let resp = client
+        .request(
+            "session/capabilities",
+            json!({"session_id": agentmux_core::SessionId::new()}),
+        )
+        .await;
+    assert_eq!(resp["result"]["capabilities"], json!(null), "{resp}");
+    shutdown(td).await;
+}
