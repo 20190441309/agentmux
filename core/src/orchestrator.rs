@@ -429,7 +429,12 @@ pub struct Orchestrator {
     timeouts: ConnTimeouts,
     native_ownership: AsyncMutex<()>,
     native_socket: Mutex<Option<PathBuf>>,
+    /// Delegation plans, authoritative in memory and persisted on every
+    /// change. Lock order: `plans` before `sink.store`.
+    plans: Mutex<HashMap<crate::PlanId, crate::plan::Plan>>,
 }
+
+mod coordinator;
 
 impl Orchestrator {
     pub fn set_native_socket(&self, path: PathBuf) {
@@ -718,8 +723,10 @@ impl Orchestrator {
             timeouts,
             native_ownership: AsyncMutex::new(()),
             native_socket: Mutex::new(None),
+            plans: Mutex::new(HashMap::new()),
         };
         orch.sweep_restarted_sessions();
+        orch.recover_plans();
         orch
     }
 
@@ -2157,7 +2164,8 @@ fn describe_event(ev: &Event) -> Option<String> {
         EventKind::ConversationStarted
         | EventKind::TitleChanged { .. }
         | EventKind::FileOverlap { .. }
-        | EventKind::CapabilitiesUpdated(_) => None,
+        | EventKind::CapabilitiesUpdated(_)
+        | EventKind::PlanUpdated(_) => None,
         EventKind::SessionUpdate(v) => {
             // Unwrap the `{"sessionId", "update"}` notification envelope.
             let update = v.get("update").unwrap_or(v);

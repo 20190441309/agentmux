@@ -26,7 +26,7 @@ use crate::model::EventKind;
 use crate::Result;
 
 /// Directory (relative to the worktree root) holding the shared blackboard.
-const SHARED_DIR: &str = ".agentmux";
+pub const SHARED_DIR: &str = ".agentmux";
 
 /// How many recent activity lines the preamble includes.
 const ACTIVITY_TAIL: usize = 20;

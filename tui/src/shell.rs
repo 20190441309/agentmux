@@ -154,6 +154,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     crate::transcript::draw(frame, app);
     crate::references::draw(frame, app);
     crate::agent_info::draw(frame, app);
+    crate::plans::draw(frame, app);
     crate::context::draw_panel(frame, app);
     if let Some(target) = &app.wb.control_focus {
         if let Some(h) = crate::interaction::focusable(app)
@@ -1153,6 +1154,7 @@ pub(crate) fn menu_actions() -> Vec<(&'static str, Target)> {
         ("Workspace context", Target::Command("/context")),
         ("Draft references", Target::Command("/references")),
         ("Show / hide sidebar", Target::Command("/sidebar")),
+        ("Delegation plan", Target::Command("/plans")),
         ("Help", Target::Command("/help")),
         ("Pending items", Target::Command("/attention")),
         ("Error details", Target::Command("/error")),

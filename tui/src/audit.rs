@@ -4,7 +4,7 @@ mod tests {
     use crate::{
         agent_info,
         app::{App, SessionView},
-        context, references, transcript,
+        context, plans, references, transcript,
     };
     use agentmux_core::{AgentId, Event, EventKind, Session, SessionId, SessionState, WorkspaceId};
     use chrono::Utc;
@@ -81,6 +81,7 @@ mod tests {
                 "context",
                 "references",
                 "diff",
+                "plan",
             ] {
                 let mut app = fixture();
                 app.wb.columns = width;
@@ -90,6 +91,22 @@ mod tests {
                     "messages" => transcript::open(&mut app),
                     "reader" => transcript::choose(&mut app, id, 2),
                     "info" => agent_info::open(&mut app),
+                    "plan" => {
+                        let ws = app.sessions[0].session.workspace_id;
+                        let mut plan =
+                            agentmux_core::plan::Plan::new(ws, id, "拆分任务 goal".into());
+                        plan.state = agentmux_core::plan::PlanState::Paused;
+                        plan.error = Some("task t1 failed: 中文错误".into());
+                        let mut t1 = agentmux_core::plan::PlanTask::new("t1", "第一步", "do it");
+                        t1.assignee = Some(id);
+                        t1.state = agentmux_core::plan::TaskState::Failed;
+                        t1.error = Some("boom".into());
+                        let mut t2 = agentmux_core::plan::PlanTask::new("t2", "second", "then");
+                        t2.depends_on = vec!["t1".into()];
+                        plan.tasks = vec![t1, t2];
+                        plans::upsert(&mut app, plan);
+                        let _ = plans::open(&mut app);
+                    }
                     "context" => context::open(&mut app),
                     "references" => references::open(&mut app),
                     "diff" => {

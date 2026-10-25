@@ -200,6 +200,8 @@ pub enum EventKind {
     /// The session's adapter capabilities were (re)captured after a
     /// handshake, or marked stale after a failed one.
     CapabilitiesUpdated(Box<crate::capabilities::AgentCapabilities>),
+    /// A delegation plan this session proposed or runs a task of changed.
+    PlanUpdated(Box<crate::plan::Plan>),
 }
 
 /// One entry in a session's ordered, persistent event log.

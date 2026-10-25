@@ -110,7 +110,8 @@ fn mock_profile() -> AgentProfile {
             command: mock_agent_binary(),
             args: vec![],
         },
-        env: Default::default(),
+        // Only affects prompts carrying the coordinator's plan marker.
+        env: [("MOCK_PLAN".to_string(), "1".to_string())].into(),
         available: true,
     }
 }
@@ -753,5 +754,83 @@ async fn session_capabilities_rpc_reports_the_handshake_snapshot() {
         )
         .await;
     assert_eq!(resp["result"]["capabilities"], json!(null), "{resp}");
+    shutdown(td).await;
+}
+
+#[tokio::test]
+async fn plan_rpc_flow_propose_edit_approve_to_done() {
+    let td = start_daemon().await;
+    let repo = init_repo();
+    let mut client = Client::connect(&td.sock).await;
+    let session = create_session_via_rpc(&mut client, repo.path(), "plans").await;
+    let ws = {
+        let projects = client.request("project/list", Value::Null).await;
+        let pid = projects["result"]["projects"][0]["id"].clone();
+        let wss = client
+            .request("workspace/list", json!({"project_id": pid}))
+            .await;
+        wss["result"]["workspaces"][0]["id"].clone()
+    };
+
+    // Bad requests are rejected.
+    let resp = client
+        .request(
+            "plan/propose",
+            json!({"workspace_id": ws, "session_id": session, "goal": "  "}),
+        )
+        .await;
+    assert!(resp["error"].is_object(), "{resp}");
+    let resp = client.request("plan/get", json!({"plan_id": "nope"})).await;
+    assert_eq!(resp["error"]["code"], json!(-32602), "{resp}");
+
+    let resp = client
+        .request(
+            "plan/propose",
+            json!({"workspace_id": ws, "session_id": session, "goal": "ship it"}),
+        )
+        .await;
+    let plan_id = resp["result"]["plan"]["id"].clone();
+    assert_eq!(
+        resp["result"]["plan"]["state"],
+        json!("proposing"),
+        "{resp}"
+    );
+
+    async fn wait_state(client: &mut Client, plan_id: &Value, want: &str) -> Value {
+        for _ in 0..300 {
+            let r = client
+                .request("plan/get", json!({"plan_id": plan_id}))
+                .await;
+            if r["result"]["plan"]["state"] == json!(want) {
+                return r["result"]["plan"].clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("plan never reached {want}");
+    }
+    let plan = wait_state(&mut client, &plan_id, "proposed").await;
+    assert_eq!(plan["tasks"].as_array().unwrap().len(), 2);
+
+    let listed = client
+        .request("plan/list", json!({"workspace_id": ws}))
+        .await;
+    assert_eq!(listed["result"]["plans"].as_array().unwrap().len(), 1);
+
+    let resp = client
+        .request("plan/approve", json!({"plan_id": plan_id}))
+        .await;
+    assert!(resp["result"]["plan"].is_object(), "{resp}");
+    let done = wait_state(&mut client, &plan_id, "done").await;
+    assert!(done["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|t| t["state"] == json!("done")));
+
+    // Ended plans reject further control.
+    let resp = client
+        .request("plan/cancel", json!({"plan_id": plan_id}))
+        .await;
+    assert!(resp["error"].is_object(), "{resp}");
     shutdown(td).await;
 }

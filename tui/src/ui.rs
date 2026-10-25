@@ -1184,6 +1184,25 @@ fn event_block(ev: &Event) -> EventBlock {
         EventKind::ConversationStarted | EventKind::CapabilitiesUpdated(_) => {
             EventBlock::Static(vec![])
         }
+        EventKind::PlanUpdated(plan) => {
+            let done = plan
+                .tasks
+                .iter()
+                .filter(|t| t.state.satisfies_dependents())
+                .count();
+            EventBlock::Static(vec![Line::from(vec![
+                ts_span(ev),
+                Span::styled("⇉ ", THEME.accent),
+                Span::styled(
+                    format!(
+                        "plan {:?} · {done}/{} tasks · /plans",
+                        plan.state,
+                        plan.tasks.len()
+                    ),
+                    THEME.dim,
+                ),
+            ])])
+        }
         EventKind::Orchestrator(msg) => EventBlock::Static(vec![Line::from(vec![
             ts_span(ev),
             Span::styled("· ", THEME.faint),

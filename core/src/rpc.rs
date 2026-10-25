@@ -151,6 +151,18 @@ pub const M_SESSION_SUBSCRIBE: &str = "session/subscribe";
 pub const M_SESSION_HISTORY: &str = "session/history";
 /// A session's last known adapter capabilities (`null` if never captured).
 pub const M_SESSION_CAPABILITIES: &str = "session/capabilities";
+/// Coordinator: ask a session to split a goal into a reviewable plan.
+pub const M_PLAN_PROPOSE: &str = "plan/propose";
+pub const M_PLAN_GET: &str = "plan/get";
+pub const M_PLAN_LIST: &str = "plan/list";
+/// Replace the tasks of a plan awaiting approval.
+pub const M_PLAN_EDIT: &str = "plan/edit";
+pub const M_PLAN_APPROVE: &str = "plan/approve";
+pub const M_PLAN_CANCEL: &str = "plan/cancel";
+/// Continue a paused plan.
+pub const M_PLAN_RESUME: &str = "plan/resume";
+/// Retry / skip / reassign one task.
+pub const M_PLAN_TASK_ACTION: &str = "plan/task_action";
 /// Read a bounded UTF-8 chunk of one serialized persisted event.
 pub const M_SESSION_EVENT_READ: &str = "session/event/read";
 /// Inspect a file's aggregate worktree diff against HEAD.
@@ -514,6 +526,48 @@ pub struct SessionListResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionResumeParams {
     pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanProposeParams {
+    pub workspace_id: WorkspaceId,
+    /// The structured session asked to produce the plan.
+    pub session_id: SessionId,
+    pub goal: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanIdParams {
+    pub plan_id: crate::PlanId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanListParams {
+    pub workspace_id: WorkspaceId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanEditParams {
+    pub plan_id: crate::PlanId,
+    pub tasks: Vec<crate::plan::PlanTaskSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanTaskActionParams {
+    pub plan_id: crate::PlanId,
+    pub task_id: String,
+    #[serde(flatten)]
+    pub action: crate::plan::TaskAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanResult {
+    pub plan: crate::plan::Plan,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanListResult {
+    pub plans: Vec<crate::plan::Plan>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

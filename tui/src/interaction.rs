@@ -183,7 +183,9 @@ pub fn activate(app: &mut App, target: Target) -> AppAction {
                 crate::context::close(app);
                 return AppAction::None;
             }
-            if app.wb.info.panel.is_some() {
+            if app.wb.plans.panel.is_some() {
+                crate::plans::close(app);
+            } else if app.wb.info.panel.is_some() {
                 crate::agent_info::close(app);
             } else if app.wb.references.panel.is_some() {
                 crate::references::close(app);

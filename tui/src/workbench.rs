@@ -50,6 +50,7 @@ pub struct Prompt {
 
 pub struct Workbench {
     pub info: crate::agent_info::Info,
+    pub plans: crate::plans::Plans,
     pub context: crate::context::Context,
     pub references: crate::references::References,
     pub transcript: crate::transcript::Transcript,
@@ -116,6 +117,7 @@ impl Default for Workbench {
     fn default() -> Self {
         Self {
             info: Default::default(),
+            plans: Default::default(),
             context: Default::default(),
             references: Default::default(),
             transcript: Default::default(),
@@ -681,6 +683,15 @@ impl App {
                 return AppAction::RegisterProject(arg.trim().into())
             }
             "/tasks" => self.open_picker(),
+            "/delegate" if !arg.trim().is_empty() => {
+                return crate::plans::delegate(self, arg.trim())
+            }
+            "/delegate" => self.set_status("Usage: /delegate <goal to split across the agents>"),
+            "/plans" => return crate::plans::open(self),
+            "/plan-approve" | "/plan-cancel" | "/plan-resume" | "/plan-retry" | "/plan-skip"
+            | "/plan-reassign" | "/plan-delete" | "/plan-title" | "/plan-prompt" => {
+                return crate::plans::command(self, name)
+            }
             "/info" => crate::agent_info::open(self),
             "/refresh-info" => return AppAction::RefreshInfo,
             "/search" | "/messages" => crate::transcript::open(self),

@@ -79,6 +79,29 @@ impl fmt::Display for SessionId {
     }
 }
 
+/// Unique identifier of a delegation [`Plan`](crate::plan::Plan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PlanId(pub Uuid);
+
+impl PlanId {
+    /// Generate a new random (UUID v4) plan id.
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for PlanId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl fmt::Display for PlanId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// Identifier of an [`AgentProfile`](crate::model::AgentProfile).
 ///
 /// Unlike the UUID-backed ids, this is a human-assigned string coming from

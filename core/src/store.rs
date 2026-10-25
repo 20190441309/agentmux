@@ -430,6 +430,36 @@ impl Store {
     ///
     /// Fails if no row was updated — a state transition for a missing
     /// session is a caller bug, not a silent no-op.
+    /// Insert or replace a delegation plan.
+    pub fn upsert_plan(&self, plan: &crate::plan::Plan) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO plans (id, workspace_id, json, updated_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(id) DO UPDATE SET json = excluded.json, updated_at = excluded.updated_at",
+            params![
+                plan.id.to_string(),
+                plan.workspace_id.to_string(),
+                serde_json::to_string(plan)?,
+                plan.updated_at.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every stored plan, oldest first; unreadable rows are skipped.
+    pub fn list_plans(&self) -> Result<Vec<crate::plan::Plan>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT json FROM plans ORDER BY updated_at ASC, rowid ASC")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut out = Vec::new();
+        for json in rows {
+            if let Ok(plan) = serde_json::from_str(&json?) {
+                out.push(plan);
+            }
+        }
+        Ok(out)
+    }
+
     /// Persist the session's latest capability snapshot.
     pub fn set_capabilities(
         &self,
@@ -756,6 +786,12 @@ CREATE TABLE IF NOT EXISTS agents (
     adapter   TEXT NOT NULL,  -- serde_json of AdapterKind
     env       TEXT NOT NULL,  -- serde_json of BTreeMap<String, String>
     available INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS plans (
+    id           TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    json         TEXT NOT NULL,  -- serde_json of plan::Plan
+    updated_at   TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS sessions (
     id             TEXT PRIMARY KEY,

@@ -355,6 +355,7 @@ impl Daemon {
                 parse_params::<rpc::ServerShutdownParams>(params)?;
                 Ok(Value::Null)
             }
+            m if m.starts_with("plan/") => plan_dispatch(&self.orchestrator, m, params).await,
             _ => dispatch(&self.orchestrator, method, params).await,
         }
     }
@@ -667,6 +668,59 @@ fn to_value<T: serde::Serialize>(v: &T) -> Result<Value, RpcError> {
 ///
 /// `session/subscribe` is acked here with `null`; the caller upgrades the
 /// connection afterwards.
+/// `plan/*`: the coordinator needs the shared `Arc` to run tasks in the
+/// background, so these are routed separately from [`dispatch`].
+async fn plan_dispatch(
+    orch: &Arc<Orchestrator>,
+    method: &str,
+    params: Value,
+) -> Result<Value, RpcError> {
+    let plan = |plan: agentmux_core::plan::Plan| to_value(&rpc::PlanResult { plan });
+    match method {
+        rpc::M_PLAN_PROPOSE => {
+            let p: rpc::PlanProposeParams = parse_params(params)?;
+            plan(
+                orch.plan_propose(p.workspace_id, p.session_id, p.goal)
+                    .map_err(RpcError::from)?,
+            )
+        }
+        rpc::M_PLAN_GET => {
+            let p: rpc::PlanIdParams = parse_params(params)?;
+            plan(orch.plan_get(p.plan_id).map_err(RpcError::from)?)
+        }
+        rpc::M_PLAN_LIST => {
+            let p: rpc::PlanListParams = parse_params(params)?;
+            to_value(&rpc::PlanListResult {
+                plans: orch.plan_list(p.workspace_id),
+            })
+        }
+        rpc::M_PLAN_EDIT => {
+            let p: rpc::PlanEditParams = parse_params(params)?;
+            plan(orch.plan_edit(p.plan_id, p.tasks).map_err(RpcError::from)?)
+        }
+        rpc::M_PLAN_APPROVE => {
+            let p: rpc::PlanIdParams = parse_params(params)?;
+            plan(orch.plan_approve(p.plan_id).map_err(RpcError::from)?)
+        }
+        rpc::M_PLAN_RESUME => {
+            let p: rpc::PlanIdParams = parse_params(params)?;
+            plan(orch.plan_resume(p.plan_id).map_err(RpcError::from)?)
+        }
+        rpc::M_PLAN_CANCEL => {
+            let p: rpc::PlanIdParams = parse_params(params)?;
+            plan(orch.plan_cancel(p.plan_id).await.map_err(RpcError::from)?)
+        }
+        rpc::M_PLAN_TASK_ACTION => {
+            let p: rpc::PlanTaskActionParams = parse_params(params)?;
+            plan(
+                orch.plan_task_action(p.plan_id, &p.task_id, p.action)
+                    .map_err(RpcError::from)?,
+            )
+        }
+        _ => Err(RpcError::method_not_found(method)),
+    }
+}
+
 pub async fn dispatch(orch: &Orchestrator, method: &str, params: Value) -> Result<Value, RpcError> {
     match method {
         M_PROJECT_REGISTER => {

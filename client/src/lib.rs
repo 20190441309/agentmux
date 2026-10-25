@@ -881,6 +881,88 @@ impl DaemonClient {
             .capabilities)
     }
 
+    /// `plan/propose` → start a plan proposal; the plan arrives `Proposing`
+    /// and updates via `PlanUpdated` events.
+    pub async fn plan_propose(
+        &mut self,
+        workspace_id: WorkspaceId,
+        session_id: SessionId,
+        goal: String,
+    ) -> Result<agentmux_core::plan::Plan> {
+        Ok(self
+            .call_result::<rpc::PlanResult>(
+                rpc::M_PLAN_PROPOSE,
+                rpc::PlanProposeParams {
+                    workspace_id,
+                    session_id,
+                    goal,
+                },
+            )
+            .await?
+            .plan)
+    }
+
+    /// `plan/list` → a workspace's plans.
+    pub async fn plan_list(
+        &mut self,
+        workspace_id: WorkspaceId,
+    ) -> Result<Vec<agentmux_core::plan::Plan>> {
+        Ok(self
+            .call_result::<rpc::PlanListResult>(
+                rpc::M_PLAN_LIST,
+                rpc::PlanListParams { workspace_id },
+            )
+            .await?
+            .plans)
+    }
+
+    /// `plan/edit` → replace the tasks of a plan awaiting approval.
+    pub async fn plan_edit(
+        &mut self,
+        plan_id: agentmux_core::PlanId,
+        tasks: Vec<agentmux_core::plan::PlanTaskSpec>,
+    ) -> Result<agentmux_core::plan::Plan> {
+        Ok(self
+            .call_result::<rpc::PlanResult>(
+                rpc::M_PLAN_EDIT,
+                rpc::PlanEditParams { plan_id, tasks },
+            )
+            .await?
+            .plan)
+    }
+
+    /// `plan/approve`, `plan/cancel` or `plan/resume`.
+    pub async fn plan_control(
+        &mut self,
+        method: &'static str,
+        plan_id: agentmux_core::PlanId,
+    ) -> Result<agentmux_core::plan::Plan> {
+        Ok(self
+            .call_result::<rpc::PlanResult>(method, rpc::PlanIdParams { plan_id })
+            .await?
+            .plan)
+    }
+
+    /// `plan/task_action` → retry / skip / reassign one task.
+    pub async fn plan_task_action(
+        &mut self,
+        plan_id: agentmux_core::PlanId,
+        task_id: String,
+        action: agentmux_core::plan::TaskAction,
+    ) -> Result<agentmux_core::plan::Plan> {
+        Ok(self
+            .call_result::<rpc::PlanResult>(
+                rpc::M_PLAN_TASK_ACTION,
+                rpc::PlanTaskActionParams {
+                    plan_id,
+                    task_id,
+                    action,
+                },
+            )
+            .await?
+            .plan)
+    }
+
     /// `session/kill` → kill the session's agent process.
     pub async fn kill(&mut self, session_id: SessionId) -> Result<()> {
         self.call_unit(M_SESSION_KILL, rpc::SessionKillParams { session_id })

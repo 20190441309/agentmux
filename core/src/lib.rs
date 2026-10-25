@@ -18,6 +18,7 @@ pub mod orchestrator;
 pub mod pi_rpc;
 pub mod pi_sessions;
 pub mod pi_shape;
+pub mod plan;
 pub mod registry;
 pub mod rpc;
 pub mod stderr;
@@ -30,7 +31,7 @@ pub mod worktree;
 pub use acp_conn::AcpConn;
 pub use anyhow::Result;
 pub use config::{Config, ConnTimeouts, SpawnOptions};
-pub use id::{AgentId, ProjectId, SessionId, WorkspaceId};
+pub use id::{AgentId, PlanId, ProjectId, SessionId, WorkspaceId};
 pub use model::{
     AdapterKind, AgentProfile, Event, EventKind, NativeSessionBackend, PermissionDecision, Project,
     Session, SessionRef, SessionState, Workspace,

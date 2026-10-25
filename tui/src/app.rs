@@ -44,6 +44,7 @@ pub enum InputMode {
 /// actions and `main.rs` performs the matching `DaemonClient` calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppAction {
+    Plan(crate::plans::PlanCall),
     RefreshInfo,
     RefreshContext,
     SaveContext(agentmux_core::rpc::WorkspaceContextSaveParams),
@@ -321,6 +322,7 @@ impl App {
         crate::commands::observe_acp_commands(self, &ev);
         crate::transcript::observe(self, &ev);
         crate::agent_info::observe(self, &ev);
+        crate::plans::observe(self, &ev);
         self.wb
             .reasoning
             .entry(ev.session_id)
@@ -486,6 +488,9 @@ impl App {
         if let Some(action) = crate::attention::keyboard(self, key) {
             return action;
         }
+        if let Some(action) = crate::plans::keyboard(self, key) {
+            return action;
+        }
         if let Some(action) = crate::agent_info::keyboard(self, key) {
             return action;
         }
@@ -558,7 +563,9 @@ impl App {
             return;
         }
         self.wb.interaction_epoch += 1;
-        if self.wb.naming.is_some() {
+        if self.wb.plans.panel.is_some() {
+            crate::plans::paste(self, text);
+        } else if self.wb.naming.is_some() {
             crate::naming::paste(self, text);
         } else if let Some(panel) = self.wb.pi_panel.as_mut() {
             panel.query.push_str(text.trim());
@@ -926,6 +933,7 @@ pub(crate) fn event_summary(ev: &Event) -> String {
         EventKind::TitleChanged { title } => format!("named: {title}"),
         EventKind::ConversationStarted => "new conversation".into(),
         EventKind::CapabilitiesUpdated(_) => "capabilities updated".into(),
+        EventKind::PlanUpdated(plan) => format!("plan {:?}: {}", plan.state, plan.goal),
         EventKind::SessionUpdate(v) => {
             let update = v.get("update").unwrap_or(v);
             match update.get("sessionUpdate").and_then(|u| u.as_str()) {

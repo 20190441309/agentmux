@@ -277,6 +277,30 @@ impl acp::Agent for MockAgent {
             std::future::pending::<()>().await;
         }
 
+        // `MOCK_PLAN=1`: answer a coordinator plan request with a two-task
+        // chain assigned to the first listed session.
+        if std::env::var_os("MOCK_PLAN").is_some() && text.contains("<agentmux-plan-request/>") {
+            let session = text
+                .lines()
+                .filter_map(|l| l.strip_prefix("- "))
+                .filter_map(|l| l.split_whitespace().next())
+                .next()
+                .unwrap_or("");
+            let reply = format!(
+                "```json\n{{\"tasks\":[\
+                 {{\"id\":\"t1\",\"title\":\"first\",\"prompt\":\"do the first part\",\"assignee\":\"{session}\",\"scope_paths\":[\"a/\"]}},\
+                 {{\"id\":\"t2\",\"title\":\"second\",\"prompt\":\"do the second part\",\"assignee\":\"{session}\",\"depends_on\":[\"t1\"]}}]}}\n```"
+            );
+            self.send_update(
+                &args.session_id,
+                acp::SessionUpdate::AgentMessageChunk(acp::ContentChunk::new(
+                    acp::ContentBlock::from(reply),
+                )),
+            )
+            .await?;
+            return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+        }
+
         // 1) Echo the prompt back as an agent message chunk.
         self.send_update(
             &args.session_id,

@@ -55,8 +55,10 @@ rework.
   daemon run only.
 - **Linux / macOS only** (Unix sockets), local machine only — no remote
   daemons.
-- **No auto-delegation** — you choose which agent gets which prompt; a
-  coordinator/router is on the backlog.
+- **Delegation is human-approved** — `/mux delegate <goal>` asks an agent
+  for a plan; nothing runs until you approve it (`/mux plans` to review).
+  Native-terminal sessions can't take delegated tasks, and plan prompts are
+  edited one line at a time in the TUI.
 - **Native terminals are opaque to the workbench.** They attach full screen
   (no split view) and produce no structured events, so transcript search,
   relay, turn notices and file activity apply to structured (ACP / Pi RPC)
@@ -557,7 +559,7 @@ for t in tui/tests/*_pty.py; do python3 "$t" || echo "FAILED: $t"; done
 ## Roadmap
 
 - Desktop app (Tauri v2) on the same daemon API — Phase 2
-- Agent auto-delegation / coordinator mode
+- Fully automatic (unapproved) delegation
 - File locks / edit arbitration for shared worktrees (overlap notices exist)
 - Remote daemon (SSH)
 - Headless adapters for `claude -p` / `codex exec`-style non-ACP CLIs

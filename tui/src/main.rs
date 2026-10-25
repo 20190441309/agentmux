@@ -28,6 +28,7 @@ mod markdown;
 mod naming;
 mod native;
 mod newsession;
+mod plans;
 mod reasoning;
 mod recovery;
 mod references;
@@ -57,6 +58,8 @@ use crate::newsession::WorkspacePick;
 
 /// Result of a spawned daemon call, reported back to the UI loop.
 enum UiMsg {
+    /// Result of a `plan/*` call: the plans it returned (or the error).
+    Plans(Result<Vec<agentmux_core::plan::Plan>, String>),
     Info {
         session: SessionId,
         request: u64,
@@ -158,6 +161,7 @@ enum UiMsg {
 
 /// A daemon operation the loop can run on a background task.
 enum DaemonCall {
+    Plan(plans::PlanCall),
     Info {
         session: SessionId,
         request: u64,
@@ -691,6 +695,13 @@ fn dispatch(
     socket_path: &Path,
 ) -> bool {
     match action {
+        AppAction::Plan(call) => {
+            if !app.wb.connected {
+                app.set_error("Daemon disconnected. Reopen the TUI to reconnect.");
+                return false;
+            }
+            spawn_call(ui_tx, socket_path, DaemonCall::Plan(call));
+        }
         AppAction::RefreshInfo => {
             if let Some((session, request)) = app.info_refresh(true) {
                 spawn_call(ui_tx, socket_path, DaemonCall::Info { session, request });
@@ -1099,6 +1110,38 @@ fn dispatch(
 /// report back through `ui_tx`. Fresh connections matter: the daemon
 /// dispatches sequentially per connection, so a `prompt` blocking for a
 /// whole turn can't be interrupted by a `cancel` on the same socket.
+async fn run_plan_call(
+    client: &mut DaemonClient,
+    call: plans::PlanCall,
+) -> Result<Vec<agentmux_core::plan::Plan>, String> {
+    use agentmux_core::rpc;
+    use plans::PlanCall;
+    fn one<E: ToString>(
+        r: Result<agentmux_core::plan::Plan, E>,
+    ) -> Result<Vec<agentmux_core::plan::Plan>, String> {
+        r.map(|p| vec![p]).map_err(|e| e.to_string())
+    }
+    match call {
+        PlanCall::Propose {
+            workspace,
+            session,
+            goal,
+        } => one(client.plan_propose(workspace, session, goal).await),
+        PlanCall::List(workspace) => client.plan_list(workspace).await.map_err(|e| e.to_string()),
+        PlanCall::Control { method, plan } => {
+            debug_assert!(matches!(
+                method,
+                rpc::M_PLAN_APPROVE | rpc::M_PLAN_CANCEL | rpc::M_PLAN_RESUME
+            ));
+            one(client.plan_control(method, plan).await)
+        }
+        PlanCall::Task { plan, task, action } => {
+            one(client.plan_task_action(plan, task, action).await)
+        }
+        PlanCall::Edit { plan, tasks } => one(client.plan_edit(plan, tasks).await),
+    }
+}
+
 fn spawn_call(ui_tx: &mpsc::Sender<UiMsg>, socket_path: &Path, call: DaemonCall) {
     let ui_tx = ui_tx.clone();
     let socket_path: PathBuf = socket_path.to_path_buf();
@@ -1233,6 +1276,7 @@ fn spawn_call(ui_tx: &mpsc::Sender<UiMsg>, socket_path: &Path, call: DaemonCall)
                         .await
                         .map_err(|error| error.to_string()),
                 },
+                DaemonCall::Plan(call) => UiMsg::Plans(run_plan_call(&mut client, call).await),
                 DaemonCall::Project(path) => UiMsg::Project(
                     client
                         .register_project(path, None)
@@ -1318,6 +1362,7 @@ fn spawn_call(ui_tx: &mpsc::Sender<UiMsg>, socket_path: &Path, call: DaemonCall)
                     source: params.session_id,
                     result: Err(e.to_string()),
                 },
+                DaemonCall::Plan(_) => UiMsg::Plans(Err(e.to_string())),
                 DaemonCall::Rename { session_id, .. } => UiMsg::Renamed {
                     session_id,
                     result: Err(e.to_string()),
@@ -1757,6 +1802,14 @@ fn apply_msg(app: &mut App, msg: UiMsg) {
                 }
             }
         }
+        UiMsg::Plans(result) => match result {
+            Ok(plans) => {
+                for plan in plans {
+                    plans::upsert(app, plan);
+                }
+            }
+            Err(e) => app.set_error(format!("Plan request failed: {e}")),
+        },
         UiMsg::Project(result) => match result {
             Ok(project) => {
                 let id = project.id;
