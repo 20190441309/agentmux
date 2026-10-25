@@ -182,3 +182,19 @@ TUI / CLI ────── Unix socket ─────────────
 - 设备 token 过期默认值（30 天滑动）是否合适？
 - 是否允许 Web 端执行管理类操作（新增 Agent、修改配置）？建议 M3 之后再议，默认只读配置。
 - Web 端创建原生终端会话是否永远不支持？
+
+## 12. MVP 实现状态（2026-10-25）
+
+已实现：
+- 传输泛化：`handle_conn_io` 对任意字节流工作，`ConnScope::{Local,Remote}` 限制远程可调用的方法（`server/shutdown`、`web/*` 仅本地）。
+- 网关：axum，`/ws`（设备 token 经 WebSocket 子协议传递、同源 Origin 校验、撤销检测）、`/api/pair`、`/api/whoami`、静态资源（嵌入或 `--web-dir`）、安全响应头。
+- 认证：一次性配对码（5 分钟）、设备 token 仅存哈希、按 IP 与全局节流、撤销；CLI `--pair/--devices/--revoke`。
+- 暴露：`--web-expose local|tunnel`（监管 `cloudflared`、解析 trycloudflare URL、自动重启、打印配对链接）；非回环明文 HTTP 需 `--insecure-http`。
+- 前端（React + Vite + TS）：配对、工作区/会话列表（状态点）、对话流（Markdown、可折叠工具卡片、滚动纪律）、权限批准（Web 不提供“始终允许”）、收件箱、委派计划（提议/改派/批准/恢复/重试/跳过/取消）、手机底部标签栏。
+- 测试：Rust 单元与集成测试、Vitest 单元测试、Playwright 端到端（手机 / 桌面视口）。
+
+与设计的差异 / 未做：
+- 未做：`direct`（rustls + ACME）、passkey、文件树与 diff、搜索、上下文编辑、设备管理页（仅 CLI）、PWA、`ts-rs` 类型生成（现为手写 `types.ts`）、二维码输出、计划任务的标题/提示词编辑。
+- 对话流目前每个会话只拉取最新一页历史，较早内容通过“加载更早消息”分页。
+- 吊销对已打开的连接在 ≤5 秒内生效。
+- `cloudflared` 隧道未在真实网络上验证（环境中无该二进制）；URL 解析有单元测试。

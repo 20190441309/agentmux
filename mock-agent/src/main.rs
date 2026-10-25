@@ -284,7 +284,8 @@ impl acp::Agent for MockAgent {
                 .lines()
                 .filter_map(|l| l.strip_prefix("- "))
                 .filter_map(|l| l.split_whitespace().next())
-                .next()
+                // Skip other "- " lines (e.g. activity.md entries in the preamble).
+                .find(|id| id.len() == 36 && id.matches('-').count() == 4)
                 .unwrap_or("");
             let reply = format!(
                 "```json\n{{\"tasks\":[\

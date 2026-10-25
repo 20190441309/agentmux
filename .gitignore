@@ -14,3 +14,7 @@ __pycache__/
 .env.*
 !.env.example
 /config.toml
+web/dist/
+web/node_modules/
+web/test-results/
+web/playwright-report/

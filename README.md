@@ -556,6 +556,44 @@ python3 -m pip install pyte==0.8.2
 for t in tui/tests/*_pty.py; do python3 "$t" || echo "FAILED: $t"; done
 ```
 
+## Web access
+
+`agentmux-server` can serve a browser UI (sessions, chat, permission
+approvals, delegation plans) from the same daemon. It is **off by default**.
+
+```sh
+# build the UI once (embedded into the server binary on the next cargo build)
+(cd web && npm ci --include=dev && npm run build) && cargo build --release
+
+# local only: http://127.0.0.1:8787
+agentmux-server --serve --web
+
+# reachable from anywhere: starts `cloudflared` and prints a public https URL
+agentmux-server --serve --web-expose tunnel
+```
+
+On start the server prints a pairing link such as
+`https://….trycloudflare.com/#pair=ABCDEFGHJK` (single use, 5 minutes). Open it
+on the device you want to authorize; the device gets its own revocable token.
+Mint another link with `agentmux-server --pair`, list devices with
+`--devices`, revoke with `--revoke <id>`.
+
+Security notes:
+- The URL is treated as public. Nothing works without a paired device token;
+  pairing codes are single-use, short-lived and rate limited, and the
+  WebSocket requires a same-origin `Origin`.
+- Remote devices cannot shut the daemon down or mint pairing codes; those
+  stay on the local unix socket.
+- Plain HTTP on a non-loopback address is refused unless `--insecure-http`.
+- Temporary `trycloudflare.com` URLs change on every start. For a stable URL
+  use a named Cloudflare tunnel: set `AGENTMUX_TUNNEL_TOKEN` and
+  `AGENTMUX_PUBLIC_URL`.
+- `cloudflared` must be installed separately.
+- Anyone holding a device token can run agents on your machine — revoke
+  devices you no longer use.
+
+Design: `docs/superpowers/specs/2026-10-25-web-client-design.md`.
+
 ## Roadmap
 
 - Desktop app (Tauri v2) on the same daemon API — Phase 2

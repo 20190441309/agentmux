@@ -4,8 +4,11 @@
 //! handling and method dispatch; `main.rs` is only CLI plumbing.
 
 pub mod rpc_server;
+pub mod web;
+pub mod web_auth;
 
 pub use rpc_server::{
     bind_unix_listener, build_daemon, default_config_path, default_data_dir, dispatch,
     lock_data_dir, Daemon, ServerPaths,
 };
+pub use web::{serve_web, WebOptions};

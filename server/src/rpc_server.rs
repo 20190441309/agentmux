@@ -70,8 +70,7 @@ use agentmux_core::{
 use chrono::Utc;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 use tokio::task::JoinHandle;
@@ -93,6 +92,11 @@ const ENV_CONFIG: &str = "AGENTMUX_CONFIG";
 /// One inbound line may be at most this large; longer lines get a
 /// `-32700` and are drained to their terminating newline so the
 /// connection stays usable.
+/// Local-only: mint a one-time web pairing code.
+pub const M_WEB_PAIR_CREATE: &str = "web/pair_create";
+pub const M_WEB_DEVICE_LIST: &str = "web/device_list";
+pub const M_WEB_DEVICE_REVOKE: &str = "web/device_revoke";
+
 const MAX_LINE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Per-connection outbound queue depth. A client that stops reading
@@ -193,6 +197,9 @@ pub fn build_daemon(paths: &ServerPaths) -> Result<Arc<Daemon>> {
     );
     orch.set_native_socket(std::path::absolute(&paths.socket_path)?);
     let mut daemon = Daemon::new(orch);
+    Arc::get_mut(&mut daemon)
+        .expect("new daemon has one owner")
+        .web = Arc::new(crate::web_auth::WebAuth::open(&paths.data_dir));
     Arc::get_mut(&mut daemon)
         .expect("new daemon has one owner")
         .paths = Some(ServerPaths {
@@ -310,6 +317,8 @@ pub struct Daemon {
     paths: Option<ServerPaths>,
     started: Instant,
     shutdown: Notify,
+    web: Arc<crate::web_auth::WebAuth>,
+    web_url: std::sync::Mutex<Option<String>>,
 }
 
 impl Daemon {
@@ -319,12 +328,28 @@ impl Daemon {
             paths: None,
             started: Instant::now(),
             shutdown: Notify::new(),
+            web: Arc::new(crate::web_auth::WebAuth::in_memory()),
+            web_url: std::sync::Mutex::new(None),
         })
     }
 
     /// The shared orchestrator.
     pub fn orchestrator(&self) -> &Arc<Orchestrator> {
         &self.orchestrator
+    }
+
+    /// Device pairing / token store behind the web gateway.
+    pub fn web_auth(&self) -> &Arc<crate::web_auth::WebAuth> {
+        &self.web
+    }
+
+    /// Publish the gateway's public URL (shown by `web/pair_create`).
+    pub fn set_web_url(&self, url: Option<String>) {
+        *self.web_url.lock().unwrap() = url;
+    }
+
+    pub fn web_url(&self) -> Option<String> {
+        self.web_url.lock().unwrap().clone()
     }
 
     /// Signal the accept loop to stop (see module docs for ordering).
@@ -354,6 +379,19 @@ impl Daemon {
             M_SERVER_SHUTDOWN => {
                 parse_params::<rpc::ServerShutdownParams>(params)?;
                 Ok(Value::Null)
+            }
+            M_WEB_PAIR_CREATE => Ok(serde_json::json!({
+                "code": self.web.create_code(),
+                "url": self.web_url(),
+                "expires_in_secs": 300,
+            })),
+            M_WEB_DEVICE_LIST => Ok(serde_json::json!({ "devices": self.web.list() })),
+            M_WEB_DEVICE_REVOKE => {
+                let id = params
+                    .get("device_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| RpcError::invalid_params("device_id required"))?;
+                Ok(serde_json::json!({ "revoked": self.web.revoke(id) }))
             }
             m if m.starts_with("plan/") => plan_dispatch(&self.orchestrator, m, params).await,
             _ => dispatch(&self.orchestrator, method, params).await,
@@ -430,7 +468,7 @@ async fn enqueue<M: serde::Serialize>(
 
 /// The connection's sole writer: drains the outbound queue, one line at a
 /// time. Exits when the queue closes or the socket write fails.
-async fn write_loop(mut writer: OwnedWriteHalf, mut rx: mpsc::Receiver<Outbound>) {
+async fn write_loop<W: AsyncWrite + Unpin>(mut writer: W, mut rx: mpsc::Receiver<Outbound>) {
     while let Some(Outbound { mut text, ack }) = rx.recv().await {
         text.push('\n');
         // OwnedWriteHalf::shutdown/flush are no-ops for a socket;
@@ -462,8 +500,8 @@ enum LineRead {
 /// valid UTF-8 comes back as bytes and is rejected downstream as a
 /// `-32700` parse error instead of surfacing here as an I/O error that
 /// would silently drop the connection.
-async fn read_limited_line(
-    reader: &mut BufReader<OwnedReadHalf>,
+async fn read_limited_line<R: AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
     out: &mut Vec<u8>,
 ) -> io::Result<LineRead> {
     // `take(cap).read_until` returns after `cap` bytes or the newline —
@@ -526,9 +564,41 @@ fn spawn_event_forwarder(orch: Arc<Orchestrator>, tx: mpsc::Sender<Outbound>) ->
     })
 }
 
-/// Serve one accepted connection until EOF, a write failure, or shutdown.
+/// What a connection may do. The unix socket is the local owner's
+/// channel (`Local`); the web gateway serves remote devices (`Remote`),
+/// which must not shut the daemon down or mint pairing codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConnScope {
+    Local,
+    Remote,
+}
+
+impl ConnScope {
+    fn allows(self, method: &str) -> bool {
+        self == ConnScope::Local
+            || !matches!(
+                method,
+                M_SERVER_SHUTDOWN | M_WEB_PAIR_CREATE | M_WEB_DEVICE_LIST | M_WEB_DEVICE_REVOKE
+            )
+    }
+}
+
 async fn handle_conn(stream: UnixStream, daemon: Arc<Daemon>) {
-    let (read_half, write_half) = stream.into_split();
+    let (r, w) = stream.into_split();
+    handle_conn_io(r, w, daemon, ConnScope::Local).await;
+}
+
+/// Serve one connection (any byte stream carrying newline-delimited
+/// JSON-RPC) until EOF, a write failure, or shutdown.
+pub async fn handle_conn_io<R, W>(
+    read_half: R,
+    write_half: W,
+    daemon: Arc<Daemon>,
+    scope: ConnScope,
+) where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let (tx, rx) = mpsc::channel::<Outbound>(OUTBOUND_QUEUE);
     let writer = tokio::spawn(write_loop(write_half, rx));
     let mut forwarder: Option<JoinHandle<()>> = None;
@@ -575,7 +645,12 @@ async fn handle_conn(stream: UnixStream, daemon: Arc<Daemon>) {
             Ok(req) => {
                 let method = req.method.clone();
                 let id = req.id.clone();
-                match daemon.dispatch(&req.method, req.params).await {
+                let outcome = if scope.allows(&method) {
+                    daemon.dispatch(&req.method, req.params).await
+                } else {
+                    Err(RpcError::method_not_found(&method))
+                };
+                match outcome {
                     Ok(result) => {
                         if method == M_SERVER_SHUTDOWN {
                             // Flush the ack before signalling shutdown —
@@ -619,7 +694,9 @@ async fn handle_conn(stream: UnixStream, daemon: Arc<Daemon>) {
                     // ordering), so nothing connection-scoped runs here.
                     let method = value["method"].as_str().unwrap_or_default().to_string();
                     let params = value.get("params").cloned().unwrap_or(Value::Null);
-                    if daemon.dispatch(&method, params).await.is_ok() && method == M_SERVER_SHUTDOWN
+                    if scope.allows(&method)
+                        && daemon.dispatch(&method, params).await.is_ok()
+                        && method == M_SERVER_SHUTDOWN
                     {
                         daemon.request_shutdown();
                     }
