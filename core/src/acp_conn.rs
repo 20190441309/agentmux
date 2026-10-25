@@ -47,6 +47,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, Notify};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use uuid::Uuid;
 
+use crate::acp_terminals::TerminalRegistry;
 use crate::config::SpawnOptions;
 use crate::stderr::{self, StderrCapture};
 use crate::{Event, EventKind, PermissionDecision, Result, SessionId};
@@ -632,6 +633,7 @@ fn actor_main(
             pending,
             commands,
             order: order.clone(),
+            terminals: TerminalRegistry::default(),
         };
 
         // The returned io future and the `spawn` callback are `!Send`; both
@@ -834,6 +836,8 @@ struct AcpClientHandler {
     pending: PendingPermissions,
     commands: CommandCatalog,
     order: Arc<NotificationOrder>,
+    /// Commands started via `terminal/*`; killed when the handler drops.
+    terminals: TerminalRegistry,
 }
 
 /// How long `session/load` waits for its replayed notifications to be
@@ -1140,9 +1144,49 @@ impl acp::Client for AcpClientHandler {
         Ok(acp::WriteTextFileResponse::new())
     }
 
-    // terminal/* is intentionally unimplemented for v1: the trait's default
-    // methods return `method_not_found`, which agents treat as "unsupported".
-    // TODO: implement a terminal registry (bounded output, wait_for_exit).
+    async fn create_terminal(
+        &self,
+        args: acp::CreateTerminalRequest,
+    ) -> acp::Result<acp::CreateTerminalResponse> {
+        // A requested cwd is confined to the session cwd like `fs/*` paths.
+        let cwd = match &args.cwd {
+            Some(dir) => self.resolve_in_cwd(dir)?,
+            None => self.cwd.lock().unwrap().clone(),
+        };
+        let id = self.terminals.create(&args, cwd)?;
+        Ok(acp::CreateTerminalResponse::new(id))
+    }
+
+    async fn terminal_output(
+        &self,
+        args: acp::TerminalOutputRequest,
+    ) -> acp::Result<acp::TerminalOutputResponse> {
+        self.terminals.output(&args.terminal_id)
+    }
+
+    async fn wait_for_terminal_exit(
+        &self,
+        args: acp::WaitForTerminalExitRequest,
+    ) -> acp::Result<acp::WaitForTerminalExitResponse> {
+        let status = self.terminals.wait_for_exit(&args.terminal_id).await?;
+        Ok(acp::WaitForTerminalExitResponse::new(status))
+    }
+
+    async fn kill_terminal(
+        &self,
+        args: acp::KillTerminalRequest,
+    ) -> acp::Result<acp::KillTerminalResponse> {
+        self.terminals.kill(&args.terminal_id)?;
+        Ok(acp::KillTerminalResponse::new())
+    }
+
+    async fn release_terminal(
+        &self,
+        args: acp::ReleaseTerminalRequest,
+    ) -> acp::Result<acp::ReleaseTerminalResponse> {
+        self.terminals.release(&args.terminal_id)?;
+        Ok(acp::ReleaseTerminalResponse::new())
+    }
 }
 
 /// Remove `.`/`..` components lexically (no filesystem access).
@@ -1190,10 +1234,43 @@ mod tests {
                 pending: pending.clone(),
                 commands: Arc::new(Mutex::new(None)),
                 order: Arc::default(),
+                terminals: TerminalRegistry::default(),
             },
             rx,
             pending,
         )
+    }
+
+    #[tokio::test]
+    async fn terminal_cwd_is_confined_to_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = handler(dir.path());
+        let sid = acp::SessionId::new("s");
+        let mut req = acp::CreateTerminalRequest::new(sid.clone(), "true");
+        req.cwd = Some(PathBuf::from("/"));
+        assert!(h.create_terminal(req).await.is_err());
+
+        let mut req = acp::CreateTerminalRequest::new(sid.clone(), "pwd");
+        req.cwd = None;
+        let id = h.create_terminal(req).await.unwrap().terminal_id;
+        h.wait_for_terminal_exit(acp::WaitForTerminalExitRequest::new(
+            sid.clone(),
+            id.clone(),
+        ))
+        .await
+        .unwrap();
+        let out = h
+            .terminal_output(acp::TerminalOutputRequest::new(sid.clone(), id.clone()))
+            .await
+            .unwrap();
+        let real = dir.path().canonicalize().unwrap();
+        assert_eq!(
+            PathBuf::from(out.output.trim()).canonicalize().unwrap(),
+            real
+        );
+        h.release_terminal(acp::ReleaseTerminalRequest::new(sid, id))
+            .await
+            .unwrap();
     }
 
     /// A `RequestPermissionRequest` offering allow-once, allow-always,

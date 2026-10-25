@@ -8,6 +8,7 @@
 //! maintains the `.agentmux/` blackboard shared by sessions in a worktree.
 
 pub mod acp_conn;
+pub mod acp_terminals;
 pub mod collab;
 pub mod config;
 pub mod id;
