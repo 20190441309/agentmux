@@ -59,7 +59,7 @@
     （`SessionUpdate` 先包 `serde_json::Value`，Task 5 接 ACP crate 后可在内部转换为强类型）
   - `pub struct Event { session_id: SessionId, seq: u64, ts: DateTime<Utc>, kind: EventKind }`
 
-- [ ] **Step 1: 初始化仓库**
+- [x] **Step 1: 初始化仓库**
 
 ```bash
 mkdir -p /home/agentmux && cd /home/agentmux && git init
@@ -67,7 +67,7 @@ mkdir -p /home/agentmux && cd /home/agentmux && git init
 cargo new core --lib --name agentmux-core
 ```
 
-- [ ] **Step 2: 写失败测试**
+- [x] **Step 2: 写失败测试**
 
 ```rust
 #[test]
@@ -79,13 +79,13 @@ fn session_state_roundtrips_and_error_carries_message() {
 }
 ```
 
-- [ ] **Step 3: 确认失败** — `cargo test -p agentmux-core` → 编译错误（类型不存在）
+- [x] **Step 3: 确认失败** — `cargo test -p agentmux-core` → 编译错误（类型不存在）
 
-- [ ] **Step 4: 实现 `id.rs` + `model.rs`**（按 Interfaces 定义，加 `#[derive]`、uuid/serde/chrono 依赖）
+- [x] **Step 4: 实现 `id.rs` + `model.rs`**（按 Interfaces 定义，加 `#[derive]`、uuid/serde/chrono 依赖）
 
-- [ ] **Step 5: 测试通过** — `cargo test -p agentmux-core` PASS
+- [x] **Step 5: 测试通过** — `cargo test -p agentmux-core` PASS
 
-- [ ] **Step 6: Commit** — `git add -A && git commit -m "feat(core): domain model types"`
+- [x] **Step 6: Commit** — `git add -A && git commit -m "feat(core): domain model types"`
 
 ---
 
@@ -103,15 +103,15 @@ fn session_state_roundtrips_and_error_carries_message() {
     - `create` 执行 `git worktree add -b agentmux/<name> <repo_root>/.agentmux/worktrees/<name> <base>`，返回 `(worktree_path, branch)`
     - `remove` 执行 `git worktree remove --force <path>` 并删除对应 `agentmux/` 分支
 
-- [ ] **Step 1: 写失败测试** — tempfile + `git init` 一个仓库，调用 `create("demo","main")`，断言返回路径存在且 `git worktree list` 含新条目；对重复 `name` 二次调用断言返回 Err 且 `worktrees/` 下无残留半成品目录。
+- [x] **Step 1: 写失败测试** — tempfile + `git init` 一个仓库，调用 `create("demo","main")`，断言返回路径存在且 `git worktree list` 含新条目；对重复 `name` 二次调用断言返回 Err 且 `worktrees/` 下无残留半成品目录。
 
-- [ ] **Step 2: 跑测试确认失败** — `cargo test -p agentmux-core --test worktree_test` → FAIL（`WorktreeManager` 不存在）
+- [x] **Step 2: 跑测试确认失败** — `cargo test -p agentmux-core --test worktree_test` → FAIL（`WorktreeManager` 不存在）
 
-- [ ] **Step 3: 实现** — `std::process::Command` 调 git；非零退出码时捕获 stderr 进 Err；失败时 `git worktree remove --force` 清理残留。
+- [x] **Step 3: 实现** — `std::process::Command` 调 git；非零退出码时捕获 stderr 进 Err；失败时 `git worktree remove --force` 清理残留。
 
-- [ ] **Step 4: 测试通过** — 同上命令 PASS
+- [x] **Step 4: 测试通过** — 同上命令 PASS
 
-- [ ] **Step 5: Commit** — `git commit -m "feat(core): git worktree manager"`
+- [x] **Step 5: Commit** — `git commit -m "feat(core): git worktree manager"`
 
 ---
 
@@ -130,13 +130,13 @@ fn session_state_roundtrips_and_error_carries_message() {
   - `append_event(&self, ev: &Event) -> Result<()>` — 追加 `<data_dir>/sessions/<session_id>.jsonl`
   - `read_events(&self, session_id: SessionId) -> Result<Vec<Event>>` — 按 seq 排序
 
-- [ ] **Step 1: 写失败测试** — 打开临时 Store，insert+get roundtrip 各实体；`append_event` 3 条后 `read_events` 返回同序同内容；`update_session_state` 后 list 反映新状态。
+- [x] **Step 1: 写失败测试** — 打开临时 Store，insert+get roundtrip 各实体；`append_event` 3 条后 `read_events` 返回同序同内容；`update_session_state` 后 list 反映新状态。
 
-- [ ] **Step 2: 确认失败** — `cargo test -p agentmux-core --test store_test` FAIL
+- [x] **Step 2: 确认失败** — `cargo test -p agentmux-core --test store_test` FAIL
 
-- [ ] **Step 3: 实现** — rusqlite `bundled`，启动时 `CREATE TABLE IF NOT EXISTS`；枚举列存 serde_json 字符串。
+- [x] **Step 3: 实现** — rusqlite `bundled`，启动时 `CREATE TABLE IF NOT EXISTS`；枚举列存 serde_json 字符串。
 
-- [ ] **Step 4: PASS + Commit** — `git commit -m "feat(core): sqlite + jsonl event store"`
+- [x] **Step 4: PASS + Commit** — `git commit -m "feat(core): sqlite + jsonl event store"`
 
 ---
 
@@ -158,11 +158,11 @@ fn session_state_roundtrips_and_error_carries_message() {
   - `AgentRegistry::get(&self, id: &AgentId) -> Option<&AgentProfile>`
 - 内置默认表：`claude-code`→`claude-code-acp`(Acp)、`codex`→`codex-acp`(Acp)、`opencode`→`["acp"]`(Acp)、`pi`→`["--mode","rpc"]`(PiRpc)
 
-- [ ] **Step 1: 写失败测试** — ① 无 config 文件时 `from_config` 产出 4 个内置 profile；② 写一份含自定义 `[[agents]] name="myagent" command="/bin/true"` 的 toml，load 后 registry 含该项；③ 对一个 `command="/definitely/not/exist"` 的 profile `probe()` 返回 `available=false`。
+- [x] **Step 1: 写失败测试** — ① 无 config 文件时 `from_config` 产出 4 个内置 profile；② 写一份含自定义 `[[agents]] name="myagent" command="/bin/true"` 的 toml，load 后 registry 含该项；③ 对一个 `command="/definitely/not/exist"` 的 profile `probe()` 返回 `available=false`。
 
-- [ ] **Step 2: 确认失败 → Step 3: 实现 → Step 4: PASS**
+- [x] **Step 2: 确认失败 → Step 3: 实现 → Step 4: PASS**
 
-- [ ] **Step 5: Commit** — `git commit -m "feat(core): agent registry + config loading"`
+- [x] **Step 5: Commit** — `git commit -m "feat(core): agent registry + config loading"`
 
 ---
 
@@ -186,11 +186,11 @@ fn session_state_roundtrips_and_error_carries_message() {
   - `async fn shutdown(&mut self) -> Result<()>`
   - Client trait 实现：`session/request_permission` 转发为 `EventKind::Orchestrator("permission-request")` + oneshot 等待 daemon 决策（v1 默认拒绝的安全实现也可接受，但接口留好）；`fs/read_text_file`、`fs/write_text_file`、`terminal/*` 按 cwd 内实现或返回不支持
 
-- [ ] **Step 1: 写失败测试** — 单测：① 对 `AcpConn` 的 spawn 参数构造（env 传递、cwd 设置）与 fake 命令（`/bin/cat`）验证进程起来、events receiver 存活；② `initialize` 用 `tokio::time::timeout` 包裹（默认 10s，可由 `Config` 覆盖），对 `/bin/cat`（永不应答）断言在缩短后的超时窗口内返回 Err。
+- [x] **Step 1: 写失败测试** — 单测：① 对 `AcpConn` 的 spawn 参数构造（env 传递、cwd 设置）与 fake 命令（`/bin/cat`）验证进程起来、events receiver 存活；② `initialize` 用 `tokio::time::timeout` 包裹（默认 10s，可由 `Config` 覆盖），对 `/bin/cat`（永不应答）断言在缩短后的超时窗口内返回 Err。
 
-- [ ] **Step 2: 确认失败 → Step 3: 实现 → Step 4: PASS**
+- [x] **Step 2: 确认失败 → Step 3: 实现 → Step 4: PASS**
 
-- [ ] **Step 5: Commit** — `git commit -m "feat(core): acp client connection wrapper"`
+- [x] **Step 5: Commit** — `git commit -m "feat(core): acp client connection wrapper"`
 
 ---
 
@@ -210,13 +210,13 @@ fn session_state_roundtrips_and_error_carries_message() {
   - 若 prompt 文本含 `"crash"` → 直接 `std::process::exit(1)`
 - 供 Task 5/9/11/13 的测试使用
 
-- [ ] **Step 1: 写失败 e2e 测试** — `AcpConn::spawn` 拉起 `cargo run -p agentmux-mock-agent`，initialize→new_session→prompt，断言收到 `SessionUpdate` 事件至少 2 条、prompt 正常返回。
+- [x] **Step 1: 写失败 e2e 测试** — `AcpConn::spawn` 拉起 `cargo run -p agentmux-mock-agent`，initialize→new_session→prompt，断言收到 `SessionUpdate` 事件至少 2 条、prompt 正常返回。
 
-- [ ] **Step 2: 确认失败**（binary 不存在）
+- [x] **Step 2: 确认失败**（binary 不存在）
 
-- [ ] **Step 3: 实现 mock-agent** — 按 crate 的 `examples/agent.rs` 模式实现 `Agent` trait。
+- [x] **Step 3: 实现 mock-agent** — 按 crate 的 `examples/agent.rs` 模式实现 `Agent` trait。
 
-- [ ] **Step 4: e2e PASS + Commit** — `git commit -m "test: mock acp agent + e2e prompt flow"`
+- [x] **Step 4: e2e PASS + Commit** — `git commit -m "test: mock acp agent + e2e prompt flow"`
 
 ---
 
@@ -233,11 +233,11 @@ fn session_state_roundtrips_and_error_carries_message() {
   - 行分割规则：**只按 `\n` 切**，不用通用 line reader（pi 文档明确 U+2028/U+2029 会误切）
   - 翻译规则：pi `event` JSON → `EventKind::SessionUpdate(原始 json)`；`response` → 对应 pending 命令的应答；`new_session` 命令 → pi session 名作为 session id
 
-- [ ] **Step 1: 写失败测试** — 不依赖真 pi：写一个本地 stub 脚本/mini binary 模拟 pi rpc 输入输出（或直接单测 `translate_line(json_line) -> Option<Event>` 纯函数，覆盖 event/response/含 U+2028 的 payload 三种行）。
+- [x] **Step 1: 写失败测试** — 不依赖真 pi：写一个本地 stub 脚本/mini binary 模拟 pi rpc 输入输出（或直接单测 `translate_line(json_line) -> Option<Event>` 纯函数，覆盖 event/response/含 U+2028 的 payload 三种行）。
 
-- [ ] **Step 2: 确认失败 → Step 3: 实现 → Step 4: PASS**
+- [x] **Step 2: 确认失败 → Step 3: 实现 → Step 4: PASS**
 
-- [ ] **Step 5: Commit** — `git commit -m "feat(core): pi rpc→event translator"`
+- [x] **Step 5: Commit** — `git commit -m "feat(core): pi rpc→event translator"`
 
 ---
 
@@ -255,11 +255,11 @@ fn session_state_roundtrips_and_error_carries_message() {
   - `pub fn summarize_event(kind: &EventKind) -> Option<String>` — `FileEdited`→`"edited <path>"`，其余→None
   - `pub fn shared_context_preamble(worktree_path: &Path, session_count: usize) -> Result<Option<String>>` — `session_count >= 2` 且（context.md 非空或 activity.md 非空）时返回拼好的 preamble 文本；否则 None
 
-- [ ] **Step 1: 写失败测试** — ① init 后两文件存在；② append_activity 追加成行；③ `session_count=1` 时 preamble 为 None；④ `session_count=2` 且有内容时 preamble 含 context.md 文本与 activity 行。
+- [x] **Step 1: 写失败测试** — ① init 后两文件存在；② append_activity 追加成行；③ `session_count=1` 时 preamble 为 None；④ `session_count=2` 且有内容时 preamble 含 context.md 文本与 activity 行。
 
-- [ ] **Step 2-4: 失败 → 实现 → PASS**
+- [x] **Step 2-4: 失败 → 实现 → PASS**
 
-- [ ] **Step 5: Commit** — `git commit -m "feat(core): shared workspace collab layer"`
+- [x] **Step 5: Commit** — `git commit -m "feat(core): shared workspace collab layer"`
 
 ---
 
@@ -284,7 +284,7 @@ fn session_state_roundtrips_and_error_carries_message() {
   - `fn subscribe(&self) -> broadcast::Receiver<Event>` — 全局事件总线订阅（client 侧自行按 session_id 过滤）
   - 内部：adapter 的 events receiver → 归一化转发到总线；`FileEdited` 事件同时 `append_activity`；conn 事件流结束/进程死 → `AgentExited` + `Error`
 
-- [ ] **Step 1: 写失败测试**（用 mock-agent 内置 profile + tempfile git repo）：
+- [x] **Step 1: 写失败测试**（用 mock-agent 内置 profile + tempfile git repo）：
   ① `create_workspace`→`create_session(mock)`→`prompt("hi")` → subscribe 收到 `SessionUpdate` 流 + state 最终回 Ready；
   ② prompt 进行中再次 `prompt` → `session busy` Err；
   ③ prompt 文本 `"crash"` → 收到 `AgentExited`、session state Error、JSONL 文件存在且非空；
@@ -292,9 +292,9 @@ fn session_state_roundtrips_and_error_carries_message() {
   ⑤ `agent_id` 不存在 → Err；
   ⑥ `Done` 状态的 session 调 `resume` → 重新 spawn、state 回 `Ready`。
 
-- [ ] **Step 2: 确认失败 → Step 3: 实现 → Step 4: PASS**
+- [x] **Step 2: 确认失败 → Step 3: 实现 → Step 4: PASS**
 
-- [ ] **Step 5: Commit** — `git commit -m "feat(core): session orchestrator with shared-context injection"`
+- [x] **Step 5: Commit** — `git commit -m "feat(core): session orchestrator with shared-context injection"`
 
 ---
 
@@ -310,9 +310,9 @@ fn session_state_roundtrips_and_error_carries_message() {
   - 各方法的 `XxxParams`/`XxxResult` serde 类型（字段与 spec §7 对应）
   - `pub struct RpcError { pub code: i64, pub message: String }`
 
-- [ ] **Step 1: 写失败测试** — params/result serde roundtrip 抽查 2-3 个。
+- [x] **Step 1: 写失败测试** — params/result serde roundtrip 抽查 2-3 个。
 
-- [ ] **Step 2-4: 失败 → 实现 → PASS → Commit** — `git commit -m "feat(core): json-rpc wire types"`
+- [x] **Step 2-4: 失败 → 实现 → PASS → Commit** — `git commit -m "feat(core): json-rpc wire types"`
 
 ---
 
@@ -332,11 +332,11 @@ fn session_state_roundtrips_and_error_carries_message() {
   - 畸形 JSON → `-32700` parse error 响应且连接保持
   - 启动时 socket 文件若 stale（无进程监听）则先 unlink
 
-- [ ] **Step 1: 写失败测试** — 起 server 于临时 socket 路径：① `server/status` 返回 ok；② 发非 JSON 字节 → `-32700`；③ `session/subscribe` 后用 mock agent create_session+prompt → 连接上收到 `session/event` 通知流；④ 第二个连接同时 subscribe 收到相同事件。
+- [x] **Step 1: 写失败测试** — 起 server 于临时 socket 路径：① `server/status` 返回 ok；② 发非 JSON 字节 → `-32700`；③ `session/subscribe` 后用 mock agent create_session+prompt → 连接上收到 `session/event` 通知流；④ 第二个连接同时 subscribe 收到相同事件。
 
-- [ ] **Step 2: 确认失败 → Step 3: 实现 → Step 4: PASS**
+- [x] **Step 2: 确认失败 → Step 3: 实现 → Step 4: PASS**
 
-- [ ] **Step 5: Commit** — `git commit -m "feat(server): unix-socket json-rpc daemon"`
+- [x] **Step 5: Commit** — `git commit -m "feat(server): unix-socket json-rpc daemon"`
 
 ---
 
@@ -355,11 +355,11 @@ fn session_state_roundtrips_and_error_carries_message() {
   - `async fn subscribe_events(&mut self) -> Result<impl Stream<Item = Event>>` — `session/subscribe` 的通知流
   - `fn ensure_daemon() -> Result<()>` — socket 不通时 spawn `agentmux-server --daemon`，轮询等待可连接（超时 5s）
 
-- [ ] **Step 1: 写失败测试** — socket 不存在时 `DaemonClient::connect()` 自动拉起 server 后 `server/status` 成功；`call("agent/list")` 返回内置 4 项。
+- [x] **Step 1: 写失败测试** — socket 不存在时 `DaemonClient::connect()` 自动拉起 server 后 `server/status` 成功；`call("agent/list")` 返回内置 4 项。
 
-- [ ] **Step 2: 确认失败 → Step 3: 实现 → Step 4: PASS**
+- [x] **Step 2: 确认失败 → Step 3: 实现 → Step 4: PASS**
 
-- [ ] **Step 5: Commit** — `git commit -m "feat(client): daemon client sdk + auto-spawn"`
+- [x] **Step 5: Commit** — `git commit -m "feat(client): daemon client sdk + auto-spawn"`
 
 ---
 
@@ -380,13 +380,13 @@ fn session_state_roundtrips_and_error_carries_message() {
   - `pub enum AppAction { None, Quit, Submit(String), NewSession, CancelPrompt, Relay }`
   - 布局：左栏会话列表（workspace 分组 + 状态徽标）、右栏事件流、底部输入框
 
-- [ ] **Step 1: 写失败测试** — App 状态机单测：`handle_event(StateChanged)` 更新徽标；`j/k` 移动 selected；Normal 模式 `q`→Quit、`i`→Editing；Editing 模式 Enter→Submit(内容)。
+- [x] **Step 1: 写失败测试** — App 状态机单测：`handle_event(StateChanged)` 更新徽标；`j/k` 移动 selected；Normal 模式 `q`→Quit、`i`→Editing；Editing 模式 Enter→Submit(内容)。
 
-- [ ] **Step 2: 确认失败 → Step 3: 实现**（ratatui+crossterm 主循环：client.subscribe_events() 与 crossterm event 流 select! 合并）
+- [x] **Step 2: 确认失败 → Step 3: 实现**（ratatui+crossterm 主循环：client.subscribe_events() 与 crossterm event 流 select! 合并）
 
-- [ ] **Step 4: PASS + 手动跑通** — `cargo run -p agentmux-tui` 连上 daemon 显示内置 agent/空会话列表
+- [x] **Step 4: PASS + 手动跑通** — `cargo run -p agentmux-tui` 连上 daemon 显示内置 agent/空会话列表
 
-- [ ] **Step 5: Commit** — `git commit -m "feat(tui): app skeleton with session list"`
+- [x] **Step 5: Commit** — `git commit -m "feat(tui): app skeleton with session list"`
 
 ---
 
@@ -405,13 +405,13 @@ fn session_state_roundtrips_and_error_carries_message() {
   - Normal 模式 `@` → RelayPick：选当前会话某事件 → 选目标 session → 其内容格式化为引用文本放入输入框
   - `n` → 新建会话向导（三步选择）；`ctrl-c` → `session/cancel`；`Tab` → 预览/diff 切换（diff 面板渲染 FileEdited 路径列表即可，真 diff 高亮可简化）
 
-- [ ] **Step 1: 写失败测试** — ① Submit 路径产生正确 RPC params（含 references）；② RelayPick 流程：选中事件后 App 内部生成引用文本进输入缓冲；③ 权限事件到达 → mode 切到确认态。
+- [x] **Step 1: 写失败测试** — ① Submit 路径产生正确 RPC params（含 references）；② RelayPick 流程：选中事件后 App 内部生成引用文本进输入缓冲；③ 权限事件到达 → mode 切到确认态。
 
-- [ ] **Step 2: 确认失败 → Step 3: 实现 → Step 4: PASS**
+- [x] **Step 2: 确认失败 → Step 3: 实现 → Step 4: PASS**
 
-- [ ] **Step 5: 手动冒烟** — 用 mock-agent profile 全链路：`n` 建会话 → 发 prompt → 看事件流 → `@` 接力到第二个会话 → `ctrl-c` 中断。
+- [x] **Step 5: 手动冒烟** — 用 mock-agent profile 全链路：`n` 建会话 → 发 prompt → 看事件流 → `@` 接力到第二个会话 → `ctrl-c` 中断。
 
-- [ ] **Step 6: Commit** — `git commit -m "feat(tui): prompt flow, permission dialog, manual relay"`
+- [x] **Step 6: Commit** — `git commit -m "feat(tui): prompt flow, permission dialog, manual relay"`
 
 ---
 
@@ -424,13 +424,13 @@ fn session_state_roundtrips_and_error_carries_message() {
 **Interfaces:**
 - Consumes: 全部
 
-- [ ] **Step 1: README** — 项目简介、架构图（spec §3）、安装前置（需已认证的各 agent CLI）、`cargo install`、快速开始、对标项目致谢
+- [x] **Step 1: README** — 项目简介、架构图（spec §3）、安装前置（需已认证的各 agent CLI）、`cargo install`、快速开始、对标项目致谢
 
-- [ ] **Step 2: CI** — fmt + clippy(`-D warnings`) + `cargo test --workspace`
+- [x] **Step 2: CI** — fmt + clippy(`-D warnings`) + `cargo test --workspace`
 
-- [ ] **Step 3: 全量验证** — `cargo test --workspace` 绿；`cargo build --release` 绿；clippy 无警告
+- [x] **Step 3: 全量验证** — `cargo test --workspace` 绿；`cargo build --release` 绿；clippy 无警告
 
-- [ ] **Step 4: Commit** — `git commit -m "chore: docs, license, ci"`
+- [x] **Step 4: Commit** — `git commit -m "chore: docs, license, ci"`
 
 ---
 
